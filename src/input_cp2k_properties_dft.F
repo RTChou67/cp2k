@@ -135,6 +135,10 @@ CONTAINS
       CALL section_add_subsection(section, subsection)
       CALL section_release(subsection)
 
+      CALL create_ecd_section(subsection)
+      CALL section_add_subsection(section, subsection)
+      CALL section_release(subsection)
+
       CALL create_rixs_section(subsection)
       CALL section_add_subsection(section, subsection)
       CALL section_release(subsection)
@@ -2186,6 +2190,151 @@ CONTAINS
       CALL section_release(subsection)
 
    END SUBROUTINE create_tddfpt2_section
+
+! **************************************************************************************************
+!> \brief creates the input section for electronic circular dichroism spectra
+!> \param section section to create
+! **************************************************************************************************
+   SUBROUTINE create_ecd_section(section)
+      TYPE(section_type), POINTER                        :: section
+
+      TYPE(keyword_type), POINTER                        :: keyword
+      TYPE(section_type), POINTER                        :: print_key, subsection
+
+      CPASSERT(.NOT. ASSOCIATED(section))
+      CALL section_create(section, __LOCATION__, name="ECD", &
+                          description="Parameters needed to set up electronic circular dichroism spectra.", &
+                          n_keywords=10, n_subsections=3, repeats=.FALSE.)
+
+      NULLIFY (keyword, print_key, subsection)
+      CALL keyword_create(keyword, __LOCATION__, name="_SECTION_PARAMETERS_", &
+                          description="Controls the activation of the electronic circular dichroism calculation.", &
+                          default_l_val=.FALSE., lone_keyword_l_val=.TRUE.)
+      CALL section_add_keyword(section, keyword)
+      CALL keyword_release(keyword)
+
+      CALL keyword_create(keyword, __LOCATION__, name="PSEUDOPOTENTIAL_COMMUTATOR", &
+                          description="Controls the GTH non-local contribution to the molecular magnetic operator.", &
+                          usage="PSEUDOPOTENTIAL_COMMUTATOR {logical}", &
+                          type_of_var=logical_t, default_l_val=.TRUE., lone_keyword_l_val=.TRUE.)
+      CALL section_add_keyword(section, keyword)
+      CALL keyword_release(keyword)
+
+      CALL keyword_create(keyword, __LOCATION__, name="IDENTITY_BAND_RANGE", &
+                          description="Band range reserved for periodic ECD identity-resolution paths. "// &
+                          "PERIODIC NONE direct AO operators ignore this setting.", &
+                          usage="IDENTITY_BAND_RANGE -1 -1", &
+                          n_var=2, type_of_var=integer_t, default_i_vals=[-1, -1])
+      CALL section_add_keyword(section, keyword)
+      CALL keyword_release(keyword)
+
+      CALL keyword_create(keyword, __LOCATION__, name="REFERENCE", &
+                          description="Reference point used consistently by molecular ECD operators.", &
+                          usage="REFERENCE COM", &
+                          enum_c_vals=s2a("COM", "COAC", "USER_DEFINED", "ZERO"), &
+                          enum_desc=s2a("Use Center of Mass", &
+                                        "Use Center of Atomic Charges", &
+                                        "Use User-defined Point (Keyword: REF_POINT)", &
+                                        "Use Origin of Coordinate System"), &
+                          enum_i_vals=[use_mom_ref_com, use_mom_ref_coac, &
+                                       use_mom_ref_user, use_mom_ref_zero], &
+                          default_i_val=use_mom_ref_com)
+      CALL section_add_keyword(section, keyword)
+      CALL keyword_release(keyword)
+
+      CALL keyword_create(keyword, __LOCATION__, name="REF_POINT", &
+                          description="User-defined molecular ECD reference point.", &
+                          usage="REF_POINT x y z", repeats=.FALSE., n_var=3, &
+                          type_of_var=real_t, unit_str="angstrom")
+      CALL section_add_keyword(section, keyword)
+      CALL keyword_release(keyword)
+
+      CALL keyword_create(keyword, __LOCATION__, name="BROADENING", &
+                          description="Selects the broadening kernel for the ECD spectrum.", &
+                          usage="BROADENING GAUSSIAN", &
+                          enum_c_vals=s2a("NONE", "GAUSSIAN", "LORENTZIAN"), &
+                          enum_i_vals=[1, 2, 3], default_i_val=2)
+      CALL section_add_keyword(section, keyword)
+      CALL keyword_release(keyword)
+
+      CALL keyword_create(keyword, __LOCATION__, name="FWHM", &
+                          description="Full width at half maximum for the ECD spectrum broadening kernel.", &
+                          usage="FWHM 0.20", &
+                          n_var=1, type_of_var=real_t, unit_str="hartree", &
+                          default_r_val=cp_unit_to_cp2k(0.20_dp, "eV"))
+      CALL section_add_keyword(section, keyword)
+      CALL keyword_release(keyword)
+
+      CALL section_create(subsection, __LOCATION__, name="IPA", &
+                          description="Controls independent-particle ECD spectra.", &
+                          n_keywords=3, repeats=.FALSE.)
+      CALL keyword_create(keyword, __LOCATION__, name="_SECTION_PARAMETERS_", &
+                          description="Controls the activation of the independent-particle ECD source.", &
+                          default_l_val=.FALSE., lone_keyword_l_val=.TRUE.)
+      CALL section_add_keyword(subsection, keyword)
+      CALL keyword_release(keyword)
+      CALL keyword_create(keyword, __LOCATION__, name="NTRANSITIONS", &
+                          description="Number of lowest-energy independent-particle transitions to print.", &
+                          usage="NTRANSITIONS 50", n_var=1, type_of_var=integer_t, default_i_val=50)
+      CALL section_add_keyword(subsection, keyword)
+      CALL keyword_release(keyword)
+      CALL keyword_create(keyword, __LOCATION__, name="TRANSITION_BAND_RANGE", &
+                          description="Band range used to generate independent-particle candidate transitions. "// &
+                          "-1 -1 selects all available occupied and virtual bands.", &
+                          usage="TRANSITION_BAND_RANGE -1 -1", &
+                          n_var=2, type_of_var=integer_t, default_i_vals=[-1, -1])
+      CALL section_add_keyword(subsection, keyword)
+      CALL keyword_release(keyword)
+      CALL section_add_subsection(section, subsection)
+      CALL section_release(subsection)
+
+      CALL section_create(subsection, __LOCATION__, name="LR_TDDFT", &
+                          description="Controls ECD spectra assembled from an existing TDDFPT calculation.", &
+                          n_keywords=2, repeats=.FALSE.)
+      CALL keyword_create(keyword, __LOCATION__, name="_SECTION_PARAMETERS_", &
+                          description="Controls the activation of the TDDFT ECD source.", &
+                          default_l_val=.FALSE., lone_keyword_l_val=.TRUE.)
+      CALL section_add_keyword(subsection, keyword)
+      CALL keyword_release(keyword)
+      CALL keyword_create(keyword, __LOCATION__, name="STATE_LIST", &
+                          description="TDDFT excited states to include in the ECD stick table. -1 selects all "// &
+                          "states produced by TDDFPT.", &
+                          usage="STATE_LIST -1", n_var=-1, type_of_var=integer_t, default_i_vals=[-1])
+      CALL section_add_keyword(subsection, keyword)
+      CALL keyword_release(keyword)
+      CALL section_add_subsection(section, subsection)
+      CALL section_release(subsection)
+
+      CALL section_create(subsection, __LOCATION__, name="PRINT", &
+                          description="Controls printing of electronic circular dichroism data.", repeats=.FALSE.)
+      CALL cp_print_key_section_create(print_key, __LOCATION__, name="ROTATORY_STRENGTHS", &
+                                       description="Controls the printing of ECD stick rotatory strengths.", &
+                                       print_level=low_print_level, filename="__STD_OUT__")
+      CALL section_add_subsection(subsection, print_key)
+      CALL section_release(print_key)
+      CALL cp_print_key_section_create(print_key, __LOCATION__, name="SPECTRUM", &
+                                       description="Controls the printing of the broadened ECD spectrum.", &
+                                       print_level=low_print_level)
+      CALL keyword_create(keyword, __LOCATION__, name="X_UNIT", &
+                          description="Unit used for the broadened ECD spectrum horizontal axis.", &
+                          usage="X_UNIT EV", &
+                          enum_c_vals=s2a("EV", "NM", "CM-1"), &
+                          enum_i_vals=[1, 2, 3], default_i_val=1)
+      CALL section_add_keyword(print_key, keyword)
+      CALL keyword_release(keyword)
+      CALL keyword_create(keyword, __LOCATION__, name="Y_UNIT", &
+                          description="Unit used for the ECD rotatory-strength density column.", &
+                          usage="Y_UNIT AU", &
+                          enum_c_vals=s2a("AU", "CGS_1E40"), &
+                          enum_i_vals=[1, 2], default_i_val=1)
+      CALL section_add_keyword(print_key, keyword)
+      CALL keyword_release(keyword)
+      CALL section_add_subsection(subsection, print_key)
+      CALL section_release(print_key)
+      CALL section_add_subsection(section, subsection)
+      CALL section_release(subsection)
+
+   END SUBROUTINE create_ecd_section
 
 ! **************************************************************************************************
 !> \brief creates the stda input section (simplified Tamm Dancoff Approximation)
