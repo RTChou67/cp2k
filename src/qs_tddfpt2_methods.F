@@ -83,6 +83,7 @@ MODULE qs_tddfpt2_methods
    USE physcon,                         ONLY: evolt
    USE qs_environment_types,            ONLY: get_qs_env,&
                                               qs_environment_type
+   USE qs_ecd_methods,                  ONLY: ecd_lr_tddfpt_spectra_none
    USE qs_kernel_methods,               ONLY: create_fxc_kernel,&
                                               create_kernel_env
    USE qs_kernel_types,                 ONLY: full_kernel_env_type,&
@@ -1650,6 +1651,8 @@ CONTAINS
                                 mult, &
                                 dipole_op_mos_occ, &
                                 tddfpt_control%dipole_form)
+      CALL ecd_lr_tddfpt_spectra_none(qs_env, evects, evals, gs_mos, tddfpt_control%kernel, &
+                                      mult, do_soc, tddfpt_control%spinflip)
       CALL tddfpt_print_excitation_analysis( &
          log_unit, &
          evects, &

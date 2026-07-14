@@ -43,6 +43,7 @@ MODULE qs_energy_utils
    USE qs_core_matrices,                ONLY: core_matrices
    USE qs_dispersion_types,             ONLY: qs_dispersion_type
    USE qs_energy_types,                 ONLY: qs_energy_type
+   USE qs_ecd_methods,                  ONLY: ecd_spectra
    USE qs_environment_types,            ONLY: get_qs_env,&
                                               qs_environment_type
    USE qs_integrate_potential,          ONLY: integrate_v_core_rspace,&
@@ -99,7 +100,7 @@ CONTAINS
       CHARACTER(len=*), PARAMETER :: routineN = 'qs_energies_properties'
 
       INTEGER                                            :: handle, natom
-      LOGICAL                                            :: do_et, do_et_proj, &
+      LOGICAL                                            :: do_ecd, do_et, do_et_proj, &
                                                             do_post_scf_bandstructure, do_tip_scan
       REAL(KIND=dp)                                      :: ekts
       TYPE(atprop_type), POINTER                         :: atprop
@@ -108,7 +109,7 @@ CONTAINS
       TYPE(pw_env_type), POINTER                         :: pw_env
       TYPE(pw_r3d_rs_type), POINTER                      :: v_hartree_rspace
       TYPE(qs_energy_type), POINTER                      :: energy
-      TYPE(section_vals_type), POINTER                   :: input, post_scf_bands_section, &
+      TYPE(section_vals_type), POINTER                   :: ecd_section, input, post_scf_bands_section, &
                                                             proj_section, rest_b_section, &
                                                             tip_scan_section
 
@@ -200,6 +201,14 @@ CONTAINS
       ! Calculates the energy, response vector and some contributions to the force
       IF (dft_control%tddfpt2_control%enabled) THEN
          CALL tddfpt(qs_env, calc_forces)
+      END IF
+
+      ! electronic circular dichroism spectra
+      NULLIFY (ecd_section)
+      ecd_section => section_vals_get_subs_vals(input, "PROPERTIES%ECD")
+      CALL section_vals_get(ecd_section, explicit=do_ecd)
+      IF (do_ecd) THEN
+         CALL ecd_spectra(qs_env, ecd_section)
       END IF
 
       ! stand-alone RIXS, does not depend on previous xas_tdp and/or tddfpt2 calculations
