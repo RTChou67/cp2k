@@ -2230,7 +2230,7 @@ CONTAINS
 
       CALL keyword_create(keyword, __LOCATION__, name="REFERENCE", &
                           description="Reference point used consistently by molecular ECD operators.", &
-                          usage="REFERENCE COM", &
+                          usage="REFERENCE COAC", &
                           enum_c_vals=s2a("COM", "COAC", "USER_DEFINED", "ZERO"), &
                           enum_desc=s2a("Use Center of Mass", &
                                         "Use Center of Atomic Charges", &
@@ -2238,7 +2238,7 @@ CONTAINS
                                         "Use Origin of Coordinate System"), &
                           enum_i_vals=[use_mom_ref_com, use_mom_ref_coac, &
                                        use_mom_ref_user, use_mom_ref_zero], &
-                          default_i_val=use_mom_ref_com)
+                          default_i_val=use_mom_ref_coac)
       CALL section_add_keyword(section, keyword)
       CALL keyword_release(keyword)
 
