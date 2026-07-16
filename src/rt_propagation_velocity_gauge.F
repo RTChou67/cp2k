@@ -80,7 +80,7 @@ MODULE rt_propagation_velocity_gauge
 
    CHARACTER(len=*), PARAMETER, PRIVATE :: moduleN = 'rt_propagation_velocity_gauge'
 
-   PUBLIC :: velocity_gauge_ks_matrix, update_vector_potential, velocity_gauge_nl_force
+   PUBLIC :: velocity_gauge_ks_matrix, velocity_gauge_nl_term, update_vector_potential, velocity_gauge_nl_force
 
 CONTAINS
 

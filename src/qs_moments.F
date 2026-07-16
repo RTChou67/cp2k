@@ -138,7 +138,7 @@ MODULE qs_moments
    PUBLIC :: qs_moment_kpoints_deep
    PUBLIC :: qs_moment_kpoints_scf_mos
    PUBLIC :: dipole_deriv_ao
-   PUBLIC :: build_local_moments_der_matrix
+   PUBLIC :: build_local_moments_der_matrix, build_local_moments_der_matrix_rs_img
    PUBLIC :: build_dsdv_moments
    PUBLIC :: dipole_velocity_deriv
    PUBLIC :: calculate_commutator_nl_terms, op_orbbas, op_orbbas_rtp, &
@@ -804,6 +804,243 @@ CONTAINS
       CALL timestop(handle)
 
    END SUBROUTINE build_local_moment_matrix
+
+! **************************************************************************************************
+!> \brief Calculate image-resolved right derivatives of local multipole moments.
+!> \param qs_env Quickstep environment
+!> \param moments_der_rs Image-resolved multipole derivative matrices
+!> \param moments_rs Optional image-resolved ordinary multipole matrices
+!> \param nmoments_der Maximum Cartesian multipole order
+!> \param ref_point Origin of all multipole factors
+!> \param cell_to_index_out Optional owned copy of the image-cell map
+! **************************************************************************************************
+   SUBROUTINE build_local_moments_der_matrix_rs_img(qs_env, moments_der_rs, nmoments_der, ref_point, &
+                                                    moments_rs, cell_to_index_out)
+      TYPE(qs_environment_type), POINTER                 :: qs_env
+      TYPE(dbcsr_p_type), DIMENSION(:, :, :), POINTER    :: moments_der_rs
+      INTEGER, INTENT(IN)                                :: nmoments_der
+      REAL(KIND=dp), DIMENSION(3), INTENT(IN)            :: ref_point
+      TYPE(dbcsr_p_type), DIMENSION(:, :), OPTIONAL, &
+         POINTER                                          :: moments_rs
+      INTEGER, DIMENSION(:, :, :), OPTIONAL, POINTER     :: cell_to_index_out
+
+      CHARACTER(LEN=*), PARAMETER                        :: routineN = 'build_local_moments_der_matrix_rs_img'
+
+      INTEGER                                            :: handle, i, iatom, ic, ider, ikind, iimage, iset, &
+                                                            jatom, jkind, jset, maxco, maxsgf, M_dim, ncoa, &
+                                                            ncob, nimages, nkind, nseta, nsetb, sgfa, sgfb
+      INTEGER, DIMENSION(3)                              :: image_cell
+      INTEGER, DIMENSION(:, :, :), POINTER               :: cell_to_index
+      LOGICAL                                            :: found
+      REAL(KIND=dp)                                      :: dab
+      REAL(KIND=dp), ALLOCATABLE, DIMENSION(:, :)        :: work
+      REAL(KIND=dp), ALLOCATABLE, DIMENSION(:, :, :, :)  :: difmab
+      REAL(KIND=dp), DIMENSION(3)                        :: ra, rab, rac, rb, rbc
+      REAL(KIND=dp), DIMENSION(:), POINTER               :: set_radius_a, set_radius_b
+      REAL(KIND=dp), DIMENSION(:, :), POINTER            :: rpgfa, rpgfb, sphi_a, sphi_b, zeta, zetb
+      INTEGER, DIMENSION(:, :), POINTER                  :: first_sgfa, first_sgfb
+      INTEGER, DIMENSION(:), POINTER                     :: la_max, la_min, lb_max, lb_min, npgfa, npgfb, &
+                                                            nsgfa, nsgfb
+      REAL(KIND=dp), DIMENSION(:, :, :), POINTER         :: mab_tmp
+      TYPE(block_p_type), ALLOCATABLE, DIMENSION(:, :)   :: moment_block
+      TYPE(block_p_type), ALLOCATABLE, DIMENSION(:)      :: moment_value_block
+      TYPE(cell_type), POINTER                           :: cell
+      TYPE(gto_basis_set_p_type), DIMENSION(:), POINTER  :: basis_set_list
+      TYPE(gto_basis_set_type), POINTER                  :: basis_set_a, basis_set_b
+      TYPE(dbcsr_p_type), DIMENSION(:, :), POINTER       :: matrix_ks_kp
+      TYPE(kpoint_type), POINTER                         :: kpoints_all
+      TYPE(mp_para_env_type), POINTER                    :: para_env
+      TYPE(neighbor_list_iterator_p_type), &
+         DIMENSION(:), POINTER                           :: nl_iterator
+      TYPE(neighbor_list_set_p_type), DIMENSION(:), &
+         POINTER                                         :: sab_all
+      TYPE(particle_type), DIMENSION(:), POINTER         :: particle_set
+      TYPE(qs_kind_type), DIMENSION(:), POINTER          :: qs_kind_set
+      TYPE(qs_kind_type), POINTER                        :: qs_kind
+
+      IF (nmoments_der < 1) THEN
+         CPABORT("build_local_moments_der_matrix_rs_img requires a positive moment order")
+      END IF
+      CALL timeset(routineN, handle)
+
+      NULLIFY (basis_set_list, cell, cell_to_index, kpoints_all, matrix_ks_kp, para_env, particle_set, qs_kind_set, sab_all)
+      CALL get_qs_env(qs_env=qs_env, qs_kind_set=qs_kind_set, particle_set=particle_set, &
+                      matrix_ks_kp=matrix_ks_kp, para_env=para_env, sab_all=sab_all, cell=cell)
+      CALL kpoint_create(kpoints_all)
+      CALL kpoint_init_cell_index(kpoints_all, sab_all, para_env, nimages)
+      CALL get_kpoint_info(kpoints_all, cell_to_index=cell_to_index)
+      IF (PRESENT(cell_to_index_out)) THEN
+         ALLOCATE (cell_to_index_out(LBOUND(cell_to_index, 1):UBOUND(cell_to_index, 1), &
+                                     LBOUND(cell_to_index, 2):UBOUND(cell_to_index, 2), &
+                                     LBOUND(cell_to_index, 3):UBOUND(cell_to_index, 3)))
+         cell_to_index_out = cell_to_index
+      END IF
+
+      M_dim = ncoset(nmoments_der) - 1
+      CALL dbcsr_allocate_matrix_set(moments_der_rs, M_dim, 3, nimages)
+      DO iimage = 1, nimages
+         DO ider = 1, 3
+            DO i = 1, M_dim
+               ALLOCATE (moments_der_rs(i, ider, iimage)%matrix)
+               CALL dbcsr_create(moments_der_rs(i, ider, iimage)%matrix, &
+                                 template=matrix_ks_kp(1, 1)%matrix, &
+                                 matrix_type=dbcsr_type_no_symmetry, name="ECD LOCAL CURRENT MOMENT")
+               CALL cp_dbcsr_alloc_block_from_nbl(moments_der_rs(i, ider, iimage)%matrix, sab_all)
+               CALL dbcsr_set(moments_der_rs(i, ider, iimage)%matrix, 0.0_dp)
+            END DO
+         END DO
+      END DO
+      IF (PRESENT(moments_rs)) THEN
+         CALL dbcsr_allocate_matrix_set(moments_rs, M_dim, nimages)
+         DO iimage = 1, nimages
+            DO i = 1, M_dim
+               ALLOCATE (moments_rs(i, iimage)%matrix)
+               CALL dbcsr_create(moments_rs(i, iimage)%matrix, template=matrix_ks_kp(1, 1)%matrix, &
+                                 matrix_type=dbcsr_type_no_symmetry, name="ECD LOCAL MOMENT")
+               CALL cp_dbcsr_alloc_block_from_nbl(moments_rs(i, iimage)%matrix, sab_all)
+               CALL dbcsr_set(moments_rs(i, iimage)%matrix, 0.0_dp)
+            END DO
+         END DO
+      END IF
+
+      CALL get_qs_kind_set(qs_kind_set=qs_kind_set, maxco=maxco, maxsgf=maxsgf)
+      nkind = SIZE(qs_kind_set)
+      ALLOCATE (difmab(maxco, maxco, M_dim, 3), work(maxco, maxsgf), moment_block(M_dim, 3), &
+                basis_set_list(nkind))
+      IF (PRESENT(moments_rs)) ALLOCATE (moment_value_block(M_dim))
+      difmab = 0.0_dp
+      work = 0.0_dp
+      DO i = 1, M_dim
+         DO ider = 1, 3
+            NULLIFY (moment_block(i, ider)%block)
+         END DO
+      END DO
+      IF (PRESENT(moments_rs)) THEN
+         DO i = 1, M_dim
+            NULLIFY (moment_value_block(i)%block)
+         END DO
+      END IF
+
+      DO ikind = 1, nkind
+         qs_kind => qs_kind_set(ikind)
+         CALL get_qs_kind(qs_kind=qs_kind, basis_set=basis_set_a)
+         IF (ASSOCIATED(basis_set_a)) THEN
+            basis_set_list(ikind)%gto_basis_set => basis_set_a
+         ELSE
+            NULLIFY (basis_set_list(ikind)%gto_basis_set)
+         END IF
+      END DO
+
+      CALL neighbor_list_iterator_create(nl_iterator, sab_all)
+      DO WHILE (neighbor_list_iterate(nl_iterator) == 0)
+         CALL get_iterator_info(nl_iterator, ikind=ikind, jkind=jkind, iatom=iatom, jatom=jatom, &
+                                r=rab, cell=image_cell)
+         basis_set_a => basis_set_list(ikind)%gto_basis_set
+         basis_set_b => basis_set_list(jkind)%gto_basis_set
+         IF (.NOT. ASSOCIATED(basis_set_a) .OR. .NOT. ASSOCIATED(basis_set_b)) CYCLE
+
+         first_sgfa => basis_set_a%first_sgf
+         la_max => basis_set_a%lmax
+         la_min => basis_set_a%lmin
+         npgfa => basis_set_a%npgf
+         nsgfa => basis_set_a%nsgf_set
+         rpgfa => basis_set_a%pgf_radius
+         set_radius_a => basis_set_a%set_radius
+         sphi_a => basis_set_a%sphi
+         zeta => basis_set_a%zet
+         nseta = basis_set_a%nset
+         first_sgfb => basis_set_b%first_sgf
+         lb_max => basis_set_b%lmax
+         lb_min => basis_set_b%lmin
+         npgfb => basis_set_b%npgf
+         nsgfb => basis_set_b%nsgf_set
+         rpgfb => basis_set_b%pgf_radius
+         set_radius_b => basis_set_b%set_radius
+         sphi_b => basis_set_b%sphi
+         zetb => basis_set_b%zet
+         nsetb = basis_set_b%nset
+
+         ra = ref_point + pbc(particle_set(iatom)%r - ref_point, cell)
+         rb = ra + rab
+         rac = ra - ref_point
+         rbc = rb - ref_point
+         dab = NORM2(rab)
+         ic = cell_to_index(image_cell(1), image_cell(2), image_cell(3))
+
+         DO i = 1, M_dim
+            DO ider = 1, 3
+               CALL dbcsr_get_block_p(moments_der_rs(i, ider, ic)%matrix, iatom, jatom, &
+                                      moment_block(i, ider)%block, found)
+               CPASSERT(found)
+            END DO
+         END DO
+         IF (PRESENT(moments_rs)) THEN
+            DO i = 1, M_dim
+               CALL dbcsr_get_block_p(moments_rs(i, ic)%matrix, iatom, jatom, moment_value_block(i)%block, found)
+               CPASSERT(found)
+            END DO
+         END IF
+
+         DO iset = 1, nseta
+            ncoa = npgfa(iset)*ncoset(la_max(iset))
+            sgfa = first_sgfa(1, iset)
+            DO jset = 1, nsetb
+               IF (set_radius_a(iset) + set_radius_b(jset) < dab) CYCLE
+               ncob = npgfb(jset)*ncoset(lb_max(jset))
+               sgfb = first_sgfb(1, jset)
+
+               NULLIFY (mab_tmp)
+               ALLOCATE (mab_tmp(npgfa(iset)*ncoset(la_max(iset) + 1), &
+                                 npgfb(jset)*ncoset(lb_max(jset) + 1), ncoset(nmoments_der) - 1))
+               CALL moment(la_max(iset) + 1, npgfa(iset), zeta(:, iset), rpgfa(:, iset), la_min(iset), &
+                           lb_max(jset) + 1, npgfb(jset), zetb(:, jset), rpgfb(:, jset), &
+                           nmoments_der, rac, rbc, mab_tmp)
+               CALL diff_momop(la_max(iset), npgfa(iset), zeta(:, iset), rpgfa(:, iset), la_min(iset), &
+                               lb_max(jset), npgfb(jset), zetb(:, jset), rpgfb(:, jset), lb_min(jset), &
+                               nmoments_der, rac, rbc, difmab, mab_ext=mab_tmp)
+
+               DO i = 1, M_dim
+                  DO ider = 1, 3
+                     CALL dgemm("N", "N", ncoa, nsgfb(jset), ncob, 1.0_dp, &
+                                difmab(1, 1, i, ider), SIZE(difmab, 1), sphi_b(1, sgfb), &
+                                SIZE(sphi_b, 1), 0.0_dp, work(1, 1), SIZE(work, 1))
+                     CALL dgemm("T", "N", nsgfa(iset), nsgfb(jset), ncoa, 1.0_dp, &
+                                sphi_a(1, sgfa), SIZE(sphi_a, 1), work(1, 1), SIZE(work, 1), 1.0_dp, &
+                                moment_block(i, ider)%block(sgfa, sgfb), SIZE(moment_block(i, ider)%block, 1))
+                  END DO
+               END DO
+               IF (PRESENT(moments_rs)) THEN
+                  DO i = 1, M_dim
+                     CALL dgemm("N", "N", ncoa, nsgfb(jset), ncob, 1.0_dp, mab_tmp(1, 1, i), &
+                                SIZE(mab_tmp, 1), sphi_b(1, sgfb), SIZE(sphi_b, 1), 0.0_dp, &
+                                work(1, 1), SIZE(work, 1))
+                     CALL dgemm("T", "N", nsgfa(iset), nsgfb(jset), ncoa, 1.0_dp, sphi_a(1, sgfa), &
+                                SIZE(sphi_a, 1), work(1, 1), SIZE(work, 1), 1.0_dp, &
+                                moment_value_block(i)%block(sgfa, sgfb), SIZE(moment_value_block(i)%block, 1))
+                  END DO
+               END IF
+               DEALLOCATE (mab_tmp)
+            END DO
+         END DO
+         DO i = 1, M_dim
+            DO ider = 1, 3
+               NULLIFY (moment_block(i, ider)%block)
+            END DO
+         END DO
+         IF (PRESENT(moments_rs)) THEN
+            DO i = 1, M_dim
+               NULLIFY (moment_value_block(i)%block)
+            END DO
+         END IF
+      END DO
+      CALL neighbor_list_iterator_release(nl_iterator)
+
+      DEALLOCATE (basis_set_list, difmab, moment_block, work)
+      IF (PRESENT(moments_rs)) DEALLOCATE (moment_value_block)
+      CALL kpoint_release(kpoints_all)
+      CALL timestop(handle)
+
+   END SUBROUTINE build_local_moments_der_matrix_rs_img
 
 ! **************************************************************************************************
 !> \brief Calculate right-hand sided derivatives of multipole moments, e. g. < a | xy d/dz | b >

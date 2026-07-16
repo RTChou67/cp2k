@@ -40,21 +40,24 @@ MODULE qs_ecd_methods
    USE cp_output_handling,              ONLY: cp_print_key_finished_output,&
                                               cp_print_key_generate_filename,&
                                               cp_print_key_unit_nr
-   USE input_section_types,             ONLY: section_vals_get,&
-                                              section_vals_get_subs_vals,&
-                                              section_vals_type,&
-                                              section_vals_val_get
    USE input_constants,                 ONLY: no_sf_tddfpt,&
                                               tddfpt_kernel_full,&
                                               tddfpt_kernel_none,&
                                               use_mom_ref_user
+   USE input_section_types,             ONLY: section_vals_get,&
+                                              section_vals_get_subs_vals,&
+                                              section_vals_type,&
+                                              section_vals_val_get
    USE kinds,                           ONLY: default_path_length,&
                                               default_string_length,&
                                               dp
    USE mathconstants,                   ONLY: pi
    USE moments_utils,                   ONLY: get_reference_point
    USE parallel_gemm_api,               ONLY: parallel_gemm
+   USE particle_types,                  ONLY: particle_type
    USE physcon,                         ONLY: evolt
+   USE qs_ecd_operators,                ONLY: ecd_project_real_operator_to_mo
+   USE qs_ecd_periodic,                 ONLY: ecd_periodic_ipa_response
    USE qs_environment_types,            ONLY: get_qs_env,&
                                               qs_environment_type
    USE qs_kind_types,                   ONLY: qs_kind_type
@@ -64,7 +67,6 @@ MODULE qs_ecd_methods
                                               build_local_moment_matrix
    USE qs_neighbor_list_types,          ONLY: neighbor_list_set_p_type
    USE qs_tddfpt2_types,                ONLY: tddfpt_ground_state_mos
-   USE particle_types,                  ONLY: particle_type
    USE scf_control_types,               ONLY: scf_control_type
    USE util,                            ONLY: sort
 #include "./base/base_uses.f90"
@@ -103,22 +105,25 @@ CONTAINS
       CHARACTER(LEN=*), PARAMETER                        :: routineN = 'ecd_spectra'
 
       CHARACTER(LEN=default_string_length)               :: broadening_label
-      INTEGER                                            :: broadening, handle, iounit, ntransitions, reference
-      INTEGER, DIMENSION(2)                              :: identity_band_range, transition_band_range
-      INTEGER, DIMENSION(:), POINTER                     :: identity_band_range_ptr, &
-                                                            transition_band_range_ptr
-      LOGICAL                                            :: do_ecd, do_hfx, do_ipa, do_lr_tddft, pseudopotential_commutator
-      LOGICAL                                            :: ref_point_explicit
+      INTEGER                                            :: broadening, handle, iounit, &
+                                                            ntransitions, reference
+      INTEGER, DIMENSION(2)                              :: transition_band_range
+      INTEGER, DIMENSION(:), POINTER                     :: transition_band_range_ptr
+      LOGICAL                                            :: do_ecd, do_hfx, do_ipa, do_lr_tddft, &
+                                                            is_periodic, &
+                                                            pseudopotential_commutator, &
+                                                            ref_point_explicit
       REAL(KIND=dp)                                      :: fwhm
       REAL(KIND=dp), DIMENSION(3)                        :: rcc
       REAL(KIND=dp), DIMENSION(:), POINTER               :: ref_point
+      TYPE(cell_type), POINTER                           :: cell
       TYPE(cp_logger_type), POINTER                      :: logger
-      TYPE(section_vals_type), POINTER                   :: hfx_section, ipa_section, lr_tddft_section, &
-                                                            tddfpt_section
+      TYPE(section_vals_type), POINTER                   :: hfx_section, ipa_section, &
+                                                            lr_tddft_section, tddfpt_section
 
       CALL timeset(routineN, handle)
 
-      NULLIFY (hfx_section, identity_band_range_ptr, logger, ipa_section, lr_tddft_section, ref_point, &
+      NULLIFY (cell, hfx_section, logger, ipa_section, lr_tddft_section, ref_point, &
                tddfpt_section, transition_band_range_ptr)
       logger => cp_get_default_logger()
       iounit = cp_logger_get_default_io_unit(logger)
@@ -142,7 +147,6 @@ CONTAINS
 
       CALL section_vals_val_get(ecd_section, "PSEUDOPOTENTIAL_COMMUTATOR", &
                                 l_val=pseudopotential_commutator)
-      CALL section_vals_val_get(ecd_section, "IDENTITY_BAND_RANGE", i_vals=identity_band_range_ptr)
       CALL section_vals_val_get(ecd_section, "REFERENCE", i_val=reference)
       CALL section_vals_val_get(ecd_section, "REF_POINT", explicit=ref_point_explicit)
       IF (ref_point_explicit) THEN
@@ -155,13 +159,9 @@ CONTAINS
       CALL section_vals_val_get(ipa_section, "TRANSITION_BAND_RANGE", &
                                 i_vals=transition_band_range_ptr)
 
-      IF (SIZE(identity_band_range_ptr) /= 2) THEN
-         CPABORT("ECD| IDENTITY_BAND_RANGE expects two integers")
-      END IF
       IF (SIZE(transition_band_range_ptr) /= 2) THEN
          CPABORT("ECD| TRANSITION_BAND_RANGE expects two integers")
       END IF
-      identity_band_range = identity_band_range_ptr(1:2)
       transition_band_range = transition_band_range_ptr(1:2)
 
       SELECT CASE (broadening)
@@ -179,7 +179,10 @@ CONTAINS
          IF (.NOT. ref_point_explicit) THEN
             CPABORT("ECD| REFERENCE USER_DEFINED requires REF_POINT")
          END IF
-         IF (.NOT. ASSOCIATED(ref_point) .OR. SIZE(ref_point) /= ncart) THEN
+         IF (.NOT. ASSOCIATED(ref_point)) THEN
+            CPABORT("ECD| REF_POINT data are unavailable")
+         END IF
+         IF (SIZE(ref_point) /= ncart) THEN
             CPABORT("ECD| REF_POINT expects three coordinates")
          END IF
          CALL get_reference_point(rcc, qs_env=qs_env, reference=reference, ref_point=ref_point)
@@ -190,14 +193,17 @@ CONTAINS
          CALL get_reference_point(rcc, qs_env=qs_env, reference=reference)
       END IF
 
+      CALL get_qs_env(qs_env, cell=cell)
+      CPASSERT(ASSOCIATED(cell))
+      is_periodic = ANY(cell%perd /= 0)
+
       IF (iounit > 0 .AND. .NOT. do_lr_tddft) THEN
          WRITE (iounit, '(/,T2,A)') "ECD| Electronic circular dichroism spectra"
          WRITE (iounit, '(T2,A,T55,L1)') "ECD| IPA source", do_ipa
          WRITE (iounit, '(T2,A,T55,L1)') "ECD| LR-TDDFT source", do_lr_tddft
          WRITE (iounit, '(T2,A,T55,L1)') "ECD| GTH non-local magnetic correction", &
             pseudopotential_commutator
-         WRITE (iounit, '(T2,A,T55,2I8)') "ECD| Identity band range", identity_band_range
-         WRITE (iounit, '(T2,A,T55,3F12.6)') "ECD| Molecular reference point [bohr]", rcc
+         WRITE (iounit, '(T2,A,T55,3F12.6)') "ECD| Reference point [bohr]", rcc
          WRITE (iounit, '(T2,A,T55,A)') "ECD| Broadening", TRIM(broadening_label)
          WRITE (iounit, '(T2,A,T55,ES14.6)') "ECD| FWHM [a.u.]", fwhm
          WRITE (iounit, '(T2,A,T55,I8)') "ECD| IPA transitions", ntransitions
@@ -205,15 +211,14 @@ CONTAINS
             transition_band_range
       END IF
 
-      CALL ecd_require_nonperiodic(qs_env)
-
       hfx_section => section_vals_get_subs_vals(qs_env%input, "DFT%XC%HF")
       CALL section_vals_get(hfx_section, explicit=do_hfx)
       IF (do_hfx) THEN
-         CPABORT("ECD| Molecular ECD with HFX requires a non-local magnetic correction")
+         CPABORT("ECD| HFX is unsupported until its current commutator is implemented")
       END IF
 
       IF (do_lr_tddft) THEN
+         CALL ecd_require_molecular_boundary(qs_env)
          tddfpt_section => section_vals_get_subs_vals(qs_env%input, "PROPERTIES%TDDFPT")
          CALL section_vals_get(tddfpt_section, explicit=do_lr_tddft)
          IF (.NOT. do_lr_tddft) THEN
@@ -221,10 +226,14 @@ CONTAINS
          END IF
          CALL timestop(handle)
          RETURN
+      ELSE IF (is_periodic) THEN
+         CALL ecd_periodic_ipa_response(qs_env, ecd_section, ipa_section, ntransitions, &
+                                        transition_band_range, pseudopotential_commutator, &
+                                        rcc, broadening, fwhm)
       ELSE
+         CALL ecd_require_molecular_ipa(qs_env)
          CALL ecd_ipa_spectra_none(qs_env, ntransitions, transition_band_range, &
-                                   identity_band_range, pseudopotential_commutator, &
-                                   rcc, broadening, fwhm, ecd_section)
+                                   pseudopotential_commutator, rcc, broadening, fwhm, ecd_section)
       END IF
 
       CALL timestop(handle)
@@ -232,23 +241,22 @@ CONTAINS
    END SUBROUTINE ecd_spectra
 
 ! **************************************************************************************************
-!> \brief Enforce the currently supported non-periodic ECD calculation domain.
+!> \brief Enforce the boundary conditions required by direct molecular ECD operators.
 !> \param qs_env Quickstep environment
 ! **************************************************************************************************
-   SUBROUTINE ecd_require_nonperiodic(qs_env)
+   SUBROUTINE ecd_require_molecular_boundary(qs_env)
       TYPE(qs_environment_type), POINTER                 :: qs_env
 
-      CHARACTER(LEN=*), PARAMETER                        :: routineN = 'ecd_require_nonperiodic'
+      CHARACTER(LEN=*), PARAMETER :: routineN = 'ecd_require_molecular_boundary'
 
       INTEGER                                            :: handle, poisson_periodic
-      LOGICAL                                            :: do_kpoints
       TYPE(cell_type), POINTER                           :: cell
       TYPE(section_vals_type), POINTER                   :: input, poisson_section
 
       CALL timeset(routineN, handle)
 
       NULLIFY (cell, input, poisson_section)
-      CALL get_qs_env(qs_env, cell=cell, do_kpoints=do_kpoints, input=input)
+      CALL get_qs_env(qs_env, cell=cell, input=input)
 
       CPASSERT(ASSOCIATED(cell))
       CPASSERT(ASSOCIATED(input))
@@ -263,51 +271,68 @@ CONTAINS
          CPABORT("ECD| Current implementation supports only POISSON%PERIODIC NONE")
       END IF
 
+      CALL timestop(handle)
+
+   END SUBROUTINE ecd_require_molecular_boundary
+
+! **************************************************************************************************
+!> \brief Require the ordinary Gamma MO layout used by molecular IPA ECD.
+!> \param qs_env Quickstep environment
+! **************************************************************************************************
+   SUBROUTINE ecd_require_molecular_ipa(qs_env)
+      TYPE(qs_environment_type), POINTER                 :: qs_env
+
+      CHARACTER(LEN=*), PARAMETER :: routineN = 'ecd_require_molecular_ipa'
+
+      INTEGER                                            :: handle
+      LOGICAL                                            :: do_kpoints
+
+      CALL timeset(routineN, handle)
+
+      CALL ecd_require_molecular_boundary(qs_env)
+      CALL get_qs_env(qs_env, do_kpoints=do_kpoints)
       IF (do_kpoints) THEN
-         CPABORT("ECD| Current implementation supports only Gamma-only PERIODIC NONE")
+         CPABORT("ECD| Molecular IPA requires the ordinary Gamma MO layout")
       END IF
 
       CALL timestop(handle)
 
-   END SUBROUTINE ecd_require_nonperiodic
+   END SUBROUTINE ecd_require_molecular_ipa
 
 ! **************************************************************************************************
 !> \brief Independent-particle ECD entry point for non-periodic molecular calculations.
 !> \param qs_env Quickstep environment
 !> \param ntransitions Number of requested transitions
 !> \param transition_band_range Occupied and virtual band range selector
-!> \param identity_band_range Periodic-only identity window, ignored for molecular operators
 !> \param pseudopotential_commutator Explicit GTH non-local magnetic correction switch
 !> \param rcc Molecular operator reference point
 ! **************************************************************************************************
    SUBROUTINE ecd_ipa_spectra_none(qs_env, ntransitions, transition_band_range, &
-                                   identity_band_range, pseudopotential_commutator, &
-                                   rcc, broadening, fwhm, ecd_section)
+                                   pseudopotential_commutator, rcc, broadening, fwhm, ecd_section)
       TYPE(qs_environment_type), POINTER                 :: qs_env
       INTEGER, INTENT(IN)                                :: ntransitions
-      INTEGER, DIMENSION(2), INTENT(IN)                  :: transition_band_range, &
-                                                            identity_band_range
+      INTEGER, DIMENSION(2), INTENT(IN)                  :: transition_band_range
       LOGICAL, INTENT(IN)                                :: pseudopotential_commutator
-      INTEGER, INTENT(IN)                                :: broadening
       REAL(KIND=dp), DIMENSION(ncart), INTENT(IN)        :: rcc
+      INTEGER, INTENT(IN)                                :: broadening
       REAL(KIND=dp), INTENT(IN)                          :: fwhm
       TYPE(section_vals_type), POINTER                   :: ecd_section
 
-      CHARACTER(LEN=*), PARAMETER                        :: routineN = 'ecd_ipa_spectra_none'
+      CHARACTER(LEN=*), PARAMETER :: routineN = 'ecd_ipa_spectra_none'
 
-      INTEGER                                            :: handle, homo, iocc, &
-                                                            ispin, istate, itrans, ivirt, nao, nmo, nspins, &
-                                                            nstates, ntrans_total, occ_first, occ_last, &
-                                                            stick_unit, virt_first, virt_last
-      INTEGER, ALLOCATABLE, DIMENSION(:)                 :: inds, trans_iocc, trans_ispin, trans_ivirt
+      INTEGER :: handle, homo, iocc, ispin, istate, itrans, ivirt, nao, nmo, nspins, nstates, &
+         ntrans_total, occ_first, occ_last, stick_unit, virt_first, virt_last
+      INTEGER, ALLOCATABLE, DIMENSION(:)                 :: inds, trans_iocc, trans_ispin, &
+                                                            trans_ivirt
       LOGICAL                                            :: added_mos_explicit
-      REAL(KIND=dp)                                      :: energy_checksum, fsum, oscillator_strength, &
-                                                            rotatory_strength, rsum, transition_weight
-      REAL(KIND=dp), ALLOCATABLE, DIMENSION(:)           :: oscillator_stick, &
-                                                            rotatory_stick, spectrum_energy, &
-                                                            transition_energy
-      REAL(KIND=dp), DIMENSION(ncart)                    :: magnetic, position
+      REAL(KIND=dp)                                      :: energy_checksum, fsum, &
+                                                            oscillator_strength, &
+                                                            rotatory_strength, rsum, &
+                                                            transition_weight
+      REAL(KIND=dp), ALLOCATABLE, DIMENSION(:)           :: oscillator_stick, rotatory_stick, &
+                                                            spectrum_energy, transition_energy
       REAL(KIND=dp), DIMENSION(:), POINTER               :: eigenvalues, occupation_numbers
+      REAL(KIND=dp), DIMENSION(ncart)                    :: magnetic, position
       TYPE(cp_fm_type), ALLOCATABLE, DIMENSION(:, :)     :: magnetic_mo, position_mo
       TYPE(cp_fm_type), POINTER                          :: mo_coeff
       TYPE(cp_logger_type), POINTER                      :: logger
@@ -396,17 +421,13 @@ CONTAINS
       oscillator_stick = 0.0_dp
       rotatory_stick = 0.0_dp
 
-      IF (ANY(identity_band_range /= -1)) THEN
-         CPWARN("ECD| IDENTITY_BAND_RANGE is ignored for PERIODIC NONE direct molecular operators")
-      END IF
-
       ALLOCATE (magnetic_mo(ncart, nspins), position_mo(ncart, nspins))
       DO ispin = 1, nspins
          CALL get_mo_set(mos(ispin), mo_coeff=mo_coeff, nao=nao, nmo=nmo)
          CPASSERT(ASSOCIATED(mo_coeff))
          CALL ecd_build_molecular_operators_none(qs_env, mo_coeff, nao, nmo, &
-                                                  pseudopotential_commutator, rcc, &
-                                                  position_mo(:, ispin), magnetic_mo(:, ispin))
+                                                 pseudopotential_commutator, rcc, &
+                                                 position_mo(:, ispin), magnetic_mo(:, ispin))
       END DO
 
       logger => cp_get_default_logger()
@@ -486,24 +507,27 @@ CONTAINS
       REAL(KIND=dp), DIMENSION(:), INTENT(IN)            :: evals
       TYPE(tddfpt_ground_state_mos), DIMENSION(:), &
          POINTER                                         :: gs_mos
-      INTEGER, INTENT(IN)                                :: mult, spinflip, tddfpt_kernel
+      INTEGER, INTENT(IN)                                :: tddfpt_kernel, mult
       LOGICAL, INTENT(IN)                                :: do_soc
+      INTEGER, INTENT(IN)                                :: spinflip
 
-      CHARACTER(LEN=*), PARAMETER                        :: routineN = 'ecd_lr_tddfpt_spectra_none'
+      CHARACTER(LEN=*), PARAMETER :: routineN = 'ecd_lr_tddfpt_spectra_none'
 
-      INTEGER                                            :: broadening, handle, idir, ispin, istate, iout, &
-                                                            nactive, nocc, nspins, nstates, nstates_out, &
-                                                            reference, state
+      INTEGER                                            :: broadening, handle, idir, iout, ispin, &
+                                                            istate, nactive, nocc, nspins, &
+                                                            nstates, nstates_out, reference, state
       INTEGER, DIMENSION(:), POINTER                     :: state_list
-      LOGICAL                                            :: do_ecd, do_hfx, do_ipa, do_lr_tddft, pseudopotential_commutator
-      LOGICAL, DIMENSION(:), ALLOCATABLE                 :: selected
-      LOGICAL                                            :: ref_point_explicit
+      LOGICAL                                            :: do_ecd, do_hfx, do_ipa, do_lr_tddft, &
+                                                            pseudopotential_commutator, &
+                                                            ref_point_explicit
+      LOGICAL, ALLOCATABLE, DIMENSION(:)                 :: selected
       REAL(KIND=dp)                                      :: energy_checksum, fsum, fwhm, rsum
-      REAL(KIND=dp), DIMENSION(ncart)                    :: rcc
-      REAL(KIND=dp), DIMENSION(:, :, :), ALLOCATABLE     :: magnetic_spin, position_spin
-      REAL(KIND=dp), DIMENSION(:, :), ALLOCATABLE        :: magnetic_state, position_state
-      REAL(KIND=dp), DIMENSION(:), ALLOCATABLE           :: oscillator_stick, rotatory_stick, spectrum_energy
+      REAL(KIND=dp), ALLOCATABLE, DIMENSION(:)           :: oscillator_stick, rotatory_stick, &
+                                                            spectrum_energy
+      REAL(KIND=dp), ALLOCATABLE, DIMENSION(:, :)        :: magnetic_state, position_state
+      REAL(KIND=dp), ALLOCATABLE, DIMENSION(:, :, :)     :: magnetic_spin, position_spin
       REAL(KIND=dp), DIMENSION(:), POINTER               :: ref_point
+      REAL(KIND=dp), DIMENSION(ncart)                    :: rcc
       TYPE(cp_fm_struct_type), POINTER                   :: fm_struct
       TYPE(cp_fm_type), ALLOCATABLE, DIMENSION(:)        :: magnetic_active, position_active
       TYPE(cp_fm_type), ALLOCATABLE, DIMENSION(:, :)     :: magnetic_occ, position_occ
@@ -536,7 +560,7 @@ CONTAINS
          CPABORT("ECD| LR_TDDFT ECD supports TDDFPT KERNEL FULL and KERNEL NONE")
       END IF
 
-      CALL ecd_require_nonperiodic(qs_env)
+      CALL ecd_require_molecular_boundary(qs_env)
       hfx_section => section_vals_get_subs_vals(qs_env%input, "DFT%XC%HF")
       CALL section_vals_get(hfx_section, explicit=do_hfx)
       IF (do_hfx) THEN
@@ -688,7 +712,7 @@ CONTAINS
          POINTER                                         :: gs_mos
       LOGICAL, INTENT(IN)                                :: pseudopotential_commutator
       REAL(KIND=dp), DIMENSION(ncart), INTENT(IN)        :: rcc
-      TYPE(cp_fm_type), DIMENSION(:, :), INTENT(INOUT)   :: magnetic_occ, position_occ
+      TYPE(cp_fm_type), DIMENSION(:, :), INTENT(INOUT)   :: position_occ, magnetic_occ
 
       INTEGER                                            :: idir, ispin, nocc
       TYPE(cp_fm_struct_type), POINTER                   :: fm_struct
@@ -696,7 +720,7 @@ CONTAINS
 
       NULLIFY (fm_struct, magnetic_ao, position_ao)
       CALL ecd_build_molecular_operators_ao_none(qs_env, pseudopotential_commutator, rcc, &
-                                                  position_ao, magnetic_ao)
+                                                 position_ao, magnetic_ao)
       DO ispin = 1, SIZE(gs_mos)
          CALL cp_fm_get_info(gs_mos(ispin)%mos_occ, matrix_struct=fm_struct, ncol_global=nocc)
          DO idir = 1, ncart
@@ -718,18 +742,19 @@ CONTAINS
 !> \brief Print PERIODIC NONE LR-TDDFT ECD sticks and checksums.
 ! **************************************************************************************************
    SUBROUTINE ecd_print_lr_tddft(ecd_section, pseudopotential_commutator, rcc, evals, selected, &
-                                  position_state, magnetic_state, rotatory_stick, oscillator_stick, &
-                                  energy_checksum, oscillator_checksum, rotatory_checksum)
+                                 position_state, magnetic_state, rotatory_stick, oscillator_stick, &
+                                 energy_checksum, oscillator_checksum, rotatory_checksum)
       TYPE(section_vals_type), POINTER                   :: ecd_section
       LOGICAL, INTENT(IN)                                :: pseudopotential_commutator
       REAL(KIND=dp), DIMENSION(ncart), INTENT(IN)        :: rcc
-      REAL(KIND=dp), DIMENSION(:), INTENT(IN)            :: evals, oscillator_stick, rotatory_stick
+      REAL(KIND=dp), DIMENSION(:), INTENT(IN)            :: evals
       LOGICAL, DIMENSION(:), INTENT(IN)                  :: selected
-      REAL(KIND=dp), DIMENSION(:, :), INTENT(IN)         :: magnetic_state, position_state
+      REAL(KIND=dp), DIMENSION(:, :), INTENT(IN)         :: position_state, magnetic_state
+      REAL(KIND=dp), DIMENSION(:), INTENT(IN)            :: rotatory_stick, oscillator_stick
       REAL(KIND=dp), INTENT(IN)                          :: energy_checksum, oscillator_checksum, &
                                                             rotatory_checksum
 
-      INTEGER                                            :: iout, istate, iounit
+      INTEGER                                            :: iounit, iout, istate
       TYPE(cp_logger_type), POINTER                      :: logger
 
       logger => cp_get_default_logger()
@@ -780,7 +805,7 @@ CONTAINS
    SUBROUTINE ecd_decode_transition_range(band_range, nmo, homo, occ_first, occ_last, &
                                           virt_first, virt_last)
       INTEGER, DIMENSION(2), INTENT(IN)                  :: band_range
-      INTEGER, INTENT(IN)                                :: homo, nmo
+      INTEGER, INTENT(IN)                                :: nmo, homo
       INTEGER, INTENT(OUT)                               :: occ_first, occ_last, virt_first, &
                                                             virt_last
 
@@ -820,25 +845,25 @@ CONTAINS
 !> \param magnetic_mo Three MO-space angular-momentum matrices
 ! **************************************************************************************************
    SUBROUTINE ecd_build_molecular_operators_none(qs_env, mo_coeff, nao, nmo, &
-                                                  pseudopotential_commutator, rcc, &
-                                                  position_mo, magnetic_mo)
+                                                 pseudopotential_commutator, rcc, &
+                                                 position_mo, magnetic_mo)
       TYPE(qs_environment_type), POINTER                 :: qs_env
       TYPE(cp_fm_type), POINTER                          :: mo_coeff
       INTEGER, INTENT(IN)                                :: nao, nmo
       LOGICAL, INTENT(IN)                                :: pseudopotential_commutator
       REAL(KIND=dp), DIMENSION(ncart), INTENT(IN)        :: rcc
-      TYPE(cp_fm_type), DIMENSION(ncart), INTENT(INOUT)  :: magnetic_mo, position_mo
+      TYPE(cp_fm_type), DIMENSION(ncart), INTENT(INOUT)  :: position_mo, magnetic_mo
 
       INTEGER                                            :: idir
       TYPE(dbcsr_p_type), DIMENSION(:), POINTER          :: magnetic_ao, position_ao
 
       NULLIFY (magnetic_ao, position_ao)
       CALL ecd_build_molecular_operators_ao_none(qs_env, pseudopotential_commutator, rcc, &
-                                                  position_ao, magnetic_ao)
+                                                 position_ao, magnetic_ao)
 
       DO idir = 1, ncart
-         CALL ecd_project_operator_to_mo(position_ao(idir), mo_coeff, nao, nmo, position_mo(idir))
-         CALL ecd_project_operator_to_mo(magnetic_ao(idir), mo_coeff, nao, nmo, magnetic_mo(idir))
+         CALL ecd_project_real_operator_to_mo(position_ao(idir), mo_coeff, nao, nmo, position_mo(idir))
+         CALL ecd_project_real_operator_to_mo(magnetic_ao(idir), mo_coeff, nao, nmo, magnetic_mo(idir))
       END DO
       CALL dbcsr_deallocate_matrix_set(magnetic_ao)
       CALL dbcsr_deallocate_matrix_set(position_ao)
@@ -854,17 +879,17 @@ CONTAINS
 !> \param magnetic_ao Three direct AO-space angular-momentum matrices
 ! **************************************************************************************************
    SUBROUTINE ecd_build_molecular_operators_ao_none(qs_env, pseudopotential_commutator, rcc, &
-                                                     position_ao, magnetic_ao)
+                                                    position_ao, magnetic_ao)
       TYPE(qs_environment_type), POINTER                 :: qs_env
       LOGICAL, INTENT(IN)                                :: pseudopotential_commutator
       REAL(KIND=dp), DIMENSION(ncart), INTENT(IN)        :: rcc
-      TYPE(dbcsr_p_type), DIMENSION(:), POINTER, &
-         INTENT(INOUT)                                   :: magnetic_ao, position_ao
+      TYPE(dbcsr_p_type), DIMENSION(:), INTENT(INOUT), &
+         POINTER                                         :: position_ao, magnetic_ao
 
       INTEGER                                            :: idir
       TYPE(cell_type), POINTER                           :: cell
-      TYPE(dft_control_type), POINTER                    :: dft_control
       TYPE(dbcsr_p_type), DIMENSION(:), POINTER          :: magnetic_nl, matrix_s
+      TYPE(dft_control_type), POINTER                    :: dft_control
       TYPE(neighbor_list_set_p_type), DIMENSION(:), &
          POINTER                                         :: sab_orb, sap_ppnl
       TYPE(particle_type), DIMENSION(:), POINTER         :: particle_set
@@ -922,41 +947,6 @@ CONTAINS
    END SUBROUTINE ecd_build_molecular_operators_ao_none
 
 ! **************************************************************************************************
-!> \brief Project a sparse AO operator to the full MO space.
-!> \param operator_ao AO-space sparse operator
-!> \param mo_coeff MO coefficient matrix
-!> \param nao Number of AOs
-!> \param nmo Number of MOs
-!> \param operator_mo Full MO-space operator
-! **************************************************************************************************
-   SUBROUTINE ecd_project_operator_to_mo(operator_ao, mo_coeff, nao, nmo, operator_mo)
-      TYPE(dbcsr_p_type), INTENT(IN)                     :: operator_ao
-      TYPE(cp_fm_type), POINTER                          :: mo_coeff
-      INTEGER, INTENT(IN)                                :: nao, nmo
-      TYPE(cp_fm_type), INTENT(INOUT)                    :: operator_mo
-
-      TYPE(cp_fm_struct_type), POINTER                   :: coeff_struct, mo_struct
-      TYPE(cp_fm_type)                                   :: operator_coeff
-
-      NULLIFY (coeff_struct, mo_struct)
-
-      CALL cp_fm_get_info(mo_coeff, matrix_struct=coeff_struct)
-      CALL cp_fm_create(operator_coeff, coeff_struct, name="ECD operator C", set_zero=.TRUE.)
-      CALL cp_fm_struct_create(fmstruct=mo_struct, template_fmstruct=coeff_struct, &
-                               nrow_global=nmo, ncol_global=nmo)
-      CALL cp_fm_create(operator_mo, mo_struct, name="ECD C^T operator C", set_zero=.TRUE.)
-      CALL cp_fm_struct_release(mo_struct)
-
-      CALL cp_dbcsr_sm_fm_multiply(operator_ao%matrix, mo_coeff, operator_coeff, ncol=nmo, &
-                                   alpha=1.0_dp, beta=0.0_dp)
-      CALL parallel_gemm("T", "N", nmo, nmo, nao, 1.0_dp, mo_coeff, operator_coeff, &
-                         0.0_dp, operator_mo)
-
-      CALL cp_fm_release(operator_coeff)
-
-   END SUBROUTINE ecd_project_operator_to_mo
-
-! **************************************************************************************************
 !> \brief Assemble direct molecular ECD transition quantities.
 !> \param position_mo Three direct MO-space position matrices
 !> \param magnetic_mo Three direct MO-space angular-momentum matrices
@@ -976,9 +966,8 @@ CONTAINS
       REAL(KIND=dp), DIMENSION(:), INTENT(IN)            :: eigenvalues
       INTEGER, INTENT(IN)                                :: iocc, ivirt
       REAL(KIND=dp), INTENT(IN)                          :: transition_weight
-      REAL(KIND=dp), DIMENSION(ncart), INTENT(OUT)       :: magnetic, position
-      REAL(KIND=dp), INTENT(OUT)                         :: oscillator_strength, &
-                                                            rotatory_strength
+      REAL(KIND=dp), DIMENSION(ncart), INTENT(OUT)       :: position, magnetic
+      REAL(KIND=dp), INTENT(OUT)                         :: rotatory_strength, oscillator_strength
 
       INTEGER                                            :: idir
       REAL(KIND=dp)                                      :: gap
@@ -1038,13 +1027,15 @@ CONTAINS
    SUBROUTINE ecd_print_ipa_transition(iounit, istate, energy, ispin, iocc, ivirt, &
                                        transition_weight, position, magnetic, &
                                        rotatory_strength, oscillator_strength)
-      INTEGER, INTENT(IN)                                :: iocc, iounit, ispin, istate, ivirt
-      REAL(KIND=dp), INTENT(IN)                          :: energy, oscillator_strength, &
-                                                            rotatory_strength, transition_weight
-      REAL(KIND=dp), DIMENSION(ncart), INTENT(IN)        :: magnetic, position
+      INTEGER, INTENT(IN)                                :: iounit, istate
+      REAL(KIND=dp), INTENT(IN)                          :: energy
+      INTEGER, INTENT(IN)                                :: ispin, iocc, ivirt
+      REAL(KIND=dp), INTENT(IN)                          :: transition_weight
+      REAL(KIND=dp), DIMENSION(ncart), INTENT(IN)        :: position, magnetic
+      REAL(KIND=dp), INTENT(IN)                          :: rotatory_strength, oscillator_strength
 
       WRITE (iounit, '(1X,A,T11,I7,T20,F11.5,T32,I7,T43,I7,T53,I7,T63,I7,'// &
-                      'T73,F8.3,T84,ES12.5E2,T99,ES12.5E2)') &
+             'T73,F8.3,T84,ES12.5E2,T99,ES12.5E2)') &
          "ECD_IPA|", istate, energy*evolt, 1, ispin, iocc, ivirt, transition_weight, &
          rotatory_strength, oscillator_strength
       WRITE (iounit, '(1X,A,T17,3(1X,ES13.6E2))') "ECD_IPA_R|", position
@@ -1064,19 +1055,20 @@ CONTAINS
    SUBROUTINE ecd_print_ipa_spectrum(ecd_section, transition_energy, rotatory_stick, &
                                      oscillator_stick, broadening, fwhm)
       TYPE(section_vals_type), POINTER                   :: ecd_section
-      REAL(KIND=dp), DIMENSION(:), INTENT(IN)            :: oscillator_stick, rotatory_stick, &
-                                                            transition_energy
+      REAL(KIND=dp), DIMENSION(:), INTENT(IN)            :: transition_energy, rotatory_stick, &
+                                                            oscillator_stick
       INTEGER, INTENT(IN)                                :: broadening
       REAL(KIND=dp), INTENT(IN)                          :: fwhm
 
       CHARACTER(LEN=default_path_length)                 :: spectrum_filename
       CHARACTER(LEN=default_string_length)               :: x_column_label, x_unit_label, &
                                                             y_column_label, y_unit_label
-      INTEGER                                            :: ipoint, istate, spectrum_unit
-      INTEGER                                            :: iounit, x_unit, y_unit
+      INTEGER                                            :: iounit, ipoint, istate, spectrum_unit, &
+                                                            x_unit, y_unit
       REAL(KIND=dp)                                      :: absorption_density, delta_e, emax, emin, &
                                                             energy, energy_ev, jacobian, margin, &
-                                                            rotatory_density, step, x_value, y_scale
+                                                            rotatory_density, step, x_value, &
+                                                            y_scale
       TYPE(cp_logger_type), POINTER                      :: logger
       TYPE(section_vals_type), POINTER                   :: spectrum_print_key
 
@@ -1202,8 +1194,9 @@ CONTAINS
 !> \return Kernel value in inverse hartree
 ! **************************************************************************************************
    PURE FUNCTION ecd_broadening_function(delta_e, broadening, fwhm) RESULT(value)
-      REAL(KIND=dp), INTENT(IN)                          :: delta_e, fwhm
+      REAL(KIND=dp), INTENT(IN)                          :: delta_e
       INTEGER, INTENT(IN)                                :: broadening
+      REAL(KIND=dp), INTENT(IN)                          :: fwhm
       REAL(KIND=dp)                                      :: value
 
       REAL(KIND=dp)                                      :: gamma, sigma

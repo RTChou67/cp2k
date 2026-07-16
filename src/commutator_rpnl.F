@@ -17,15 +17,18 @@ MODULE commutator_rpnl
    USE basis_set_types,                 ONLY: gto_basis_set_p_type,&
                                               gto_basis_set_type
    USE block_p_types,                   ONLY: block_p_type
-   USE cell_types,                      ONLY: cell_type
+   USE cell_types,                      ONLY: cell_type,&
+                                              pbc
    USE cp_dbcsr_api,                    ONLY: dbcsr_get_block_p,&
-                                              dbcsr_p_type
+                                              dbcsr_p_type,&
+                                              dbcsr_set
    USE external_potential_types,        ONLY: gth_potential_p_type,&
                                               gth_potential_type,&
                                               sgp_potential_p_type,&
                                               sgp_potential_type
    USE kinds,                           ONLY: dp
-   USE orbital_pointers,                ONLY: init_orbital_pointers,&
+   USE orbital_pointers,                ONLY: coset,&
+                                              init_orbital_pointers,&
                                               nco,&
                                               ncoset
    USE particle_types,                  ONLY: particle_type
@@ -61,6 +64,7 @@ MODULE commutator_rpnl
    CHARACTER(len=*), PARAMETER, PRIVATE :: moduleN = 'commutator_rpnl'
 
    PUBLIC :: build_com_rpnl, build_com_mom_nl, build_com_nl_mag, build_com_vnl_giao
+   PUBLIC :: build_com_current_nl_path
 
 CONTAINS
 
@@ -1522,6 +1526,209 @@ CONTAINS
       CALL timestop(handle)
 
    END SUBROUTINE build_com_mom_nl
+
+! **************************************************************************************************
+!> \brief Build image-resolved Pickard--Mauri GTH current path kernels.
+!> \param qs_kind_set Quickstep kinds
+!> \param sab_all Full AO neighbour list
+!> \param sap_ppnl AO-projector neighbour list
+!> \param eps_ppnl Non-local projector screening threshold
+!> \param particle_set Nuclear positions
+!> \param cell Simulation cell
+!> \param cell_to_index Real-space image-cell map
+!> \param direction Unit propagation direction
+!> \param ref_point Common position and path reference point
+!> \param max_order Highest normalized spatial Taylor order
+!> \param matrix_j_nl_rs Real raw path kernels indexed by Cartesian component, order, and image
+! **************************************************************************************************
+   SUBROUTINE build_com_current_nl_path(qs_kind_set, sab_all, sap_ppnl, eps_ppnl, particle_set, cell, &
+                                        cell_to_index, direction, ref_point, max_order, matrix_j_nl_rs)
+
+      TYPE(qs_kind_type), DIMENSION(:), POINTER          :: qs_kind_set
+      TYPE(neighbor_list_set_p_type), DIMENSION(:), &
+         POINTER                                         :: sab_all, sap_ppnl
+      REAL(KIND=dp), INTENT(IN)                          :: eps_ppnl
+      TYPE(particle_type), DIMENSION(:), POINTER         :: particle_set
+      TYPE(cell_type), POINTER                           :: cell
+      INTEGER, DIMENSION(:, :, :), POINTER               :: cell_to_index
+      REAL(KIND=dp), DIMENSION(3), INTENT(IN)            :: direction, ref_point
+      INTEGER, INTENT(IN)                                :: max_order
+      TYPE(dbcsr_p_type), DIMENSION(:, :, :), &
+         INTENT(INOUT)                                   :: matrix_j_nl_rs
+
+      CHARACTER(LEN=*), PARAMETER :: routineN = 'build_com_current_nl_path'
+
+      INTEGER                                            :: component, handle, i, iac, iatom, ibc, &
+                                                            ic, ikind, iorder, jatom, jkind, kac, &
+                                                            kbc, kkind, na, nb, nkind, np, slot
+      INTEGER, DIMENSION(3)                              :: cell_b
+      LOGICAL                                            :: found, ppnl_present
+      REAL(KIND=dp), DIMENSION(3)                        :: projector_position
+      REAL(KIND=dp), DIMENSION(:, :), POINTER            :: block
+      REAL(KIND=dp), DIMENSION(:, :, :), POINTER         :: achint, acint, bcint
+      TYPE(alist_type), POINTER                          :: alist_ac, alist_bc
+      TYPE(sap_int_type), DIMENSION(:), POINTER          :: sap_int
+
+      IF (max_order < 0) THEN
+         CPABORT("ECD| GTH path moments require a non-negative Taylor order")
+      END IF
+      IF (SIZE(matrix_j_nl_rs, 1) /= 3 .OR. SIZE(matrix_j_nl_rs, 2) < max_order + 1) THEN
+         CPABORT("ECD| GTH path-kernel storage has incompatible Cartesian or Taylor dimensions")
+      END IF
+
+      CALL timeset(routineN, handle)
+
+      DO ic = 1, SIZE(matrix_j_nl_rs, 3)
+         DO iorder = 0, max_order
+            DO component = 1, 3
+               CALL dbcsr_set(matrix_j_nl_rs(component, iorder + 1, ic)%matrix, 0.0_dp)
+            END DO
+         END DO
+      END DO
+
+      ppnl_present = ASSOCIATED(sap_ppnl)
+      IF (.NOT. ppnl_present) THEN
+         CALL timestop(handle)
+         RETURN
+      END IF
+
+      nkind = SIZE(qs_kind_set)
+      CALL init_orbital_pointers(max_order + 1)
+      ALLOCATE (sap_int(nkind*nkind))
+      DO i = 1, SIZE(sap_int)
+         NULLIFY (sap_int(i)%alist, sap_int(i)%asort, sap_int(i)%aindex)
+         sap_int(i)%nalist = 0
+      END DO
+      CALL build_sap_ints(sap_int, sap_ppnl, qs_kind_set, nder=max_order + 1, moment_mode=.TRUE., &
+                          refpoint=ref_point, particle_set=particle_set, cell=cell)
+      CALL sap_sort(sap_int)
+
+      DO slot = 1, sab_all(1)%nl_size
+         ikind = sab_all(1)%nlist_task(slot)%ikind
+         jkind = sab_all(1)%nlist_task(slot)%jkind
+         iatom = sab_all(1)%nlist_task(slot)%iatom
+         jatom = sab_all(1)%nlist_task(slot)%jatom
+         cell_b = sab_all(1)%nlist_task(slot)%cell
+         ic = cell_to_index(cell_b(1), cell_b(2), cell_b(3))
+         IF (ic < 1 .OR. ic > SIZE(matrix_j_nl_rs, 3)) CYCLE
+
+         DO kkind = 1, nkind
+            iac = ikind + nkind*(kkind - 1)
+            ibc = jkind + nkind*(kkind - 1)
+            IF (.NOT. ASSOCIATED(sap_int(iac)%alist) .OR. .NOT. ASSOCIATED(sap_int(ibc)%alist)) CYCLE
+            CALL get_alist(sap_int(iac), alist_ac, iatom)
+            CALL get_alist(sap_int(ibc), alist_bc, jatom)
+            IF (.NOT. ASSOCIATED(alist_ac) .OR. .NOT. ASSOCIATED(alist_bc)) CYCLE
+
+            DO kac = 1, alist_ac%nclist
+               DO kbc = 1, alist_bc%nclist
+                  IF (alist_ac%clist(kac)%catom /= alist_bc%clist(kbc)%catom) CYCLE
+                  IF (.NOT. ALL(cell_b + alist_bc%clist(kbc)%cell - alist_ac%clist(kac)%cell == 0)) CYCLE
+                  IF (alist_ac%clist(kac)%maxac*alist_bc%clist(kbc)%maxach < eps_ppnl) CYCLE
+
+                  acint => alist_ac%clist(kac)%acint
+                  achint => alist_ac%clist(kac)%achint
+                  bcint => alist_bc%clist(kbc)%acint
+                  na = SIZE(acint, 1)
+                  np = SIZE(acint, 2)
+                  nb = SIZE(bcint, 1)
+
+                  projector_position = ref_point + &
+                                       pbc(particle_set(alist_ac%clist(kac)%catom)%r - ref_point, cell)
+                  DO iorder = 0, max_order
+                     DO component = 1, 3
+                        NULLIFY (block)
+                        CALL dbcsr_get_block_p(matrix_j_nl_rs(component, iorder + 1, ic)%matrix, iatom, jatom, &
+                                               block, found)
+                        CPASSERT(found .AND. ASSOCIATED(block))
+                        CALL ecd_add_gth_path_moment(block, acint, achint, bcint, direction, &
+                                                     projector_position, ref_point, component, iorder, na, nb, np)
+                        NULLIFY (block)
+                     END DO
+                  END DO
+               END DO
+            END DO
+         END DO
+      END DO
+
+      CALL release_sap_int(sap_int)
+      CALL timestop(handle)
+
+   END SUBROUTINE build_com_current_nl_path
+
+! **************************************************************************************************
+!> \brief Add one real Pickard--Mauri path polynomial to an AO matrix block.
+! **************************************************************************************************
+   SUBROUTINE ecd_add_gth_path_moment(block, acint, achint, bcint, direction, projector_position, &
+                                      ref_point, component, order, na, nb, np)
+
+      REAL(KIND=dp), DIMENSION(:, :), POINTER            :: block
+      REAL(KIND=dp), DIMENSION(:, :, :), POINTER         :: acint, achint, bcint
+      REAL(KIND=dp), DIMENSION(3), INTENT(IN)            :: direction, projector_position, ref_point
+      INTEGER, INTENT(IN)                                :: component, order, na, nb, np
+
+      INTEGER                                            :: ix, iy, iz, m, moment_index, &
+                                                            shifted_moment_index
+      REAL(KIND=dp)                                      :: directional_factor, path_factor, &
+                                                            projector_coordinate
+      REAL(KIND=dp), ALLOCATABLE, DIMENSION(:, :)        :: left_path, right_path
+
+      ALLOCATE (left_path(na, np), right_path(nb, np))
+      left_path = 0.0_dp
+      right_path = 0.0_dp
+      projector_coordinate = DOT_PRODUCT(direction, projector_position - ref_point)
+
+      DO m = 0, order
+         path_factor = projector_coordinate**(order - m)/REAL(order + 1, KIND=dp)
+         DO ix = 0, m
+            DO iy = 0, m - ix
+               iz = m - ix - iy
+               moment_index = coset(ix, iy, iz)
+               SELECT CASE (component)
+               CASE (1)
+                  shifted_moment_index = coset(ix + 1, iy, iz)
+               CASE (2)
+                  shifted_moment_index = coset(ix, iy + 1, iz)
+               CASE (3)
+                  shifted_moment_index = coset(ix, iy, iz + 1)
+               CASE DEFAULT
+                  CPABORT("ECD| Invalid Cartesian component in GTH path moment")
+               END SELECT
+               directional_factor = ecd_integer_factorial(m)/ &
+                                    (ecd_integer_factorial(ix)*ecd_integer_factorial(iy)*ecd_integer_factorial(iz))
+               IF (ix > 0) directional_factor = directional_factor*direction(1)**ix
+               IF (iy > 0) directional_factor = directional_factor*direction(2)**iy
+               IF (iz > 0) directional_factor = directional_factor*direction(3)**iz
+               directional_factor = directional_factor*path_factor
+               left_path = left_path + directional_factor*(achint(1:na, 1:np, shifted_moment_index) - &
+                                            (projector_position(component) - ref_point(component))*achint(1:na, 1:np, moment_index))
+               right_path = right_path + directional_factor*(bcint(1:nb, 1:np, shifted_moment_index) - &
+                                             (projector_position(component) - ref_point(component))*bcint(1:nb, 1:np, moment_index))
+            END DO
+         END DO
+      END DO
+
+      block(1:na, 1:nb) = block(1:na, 1:nb) + MATMUL(left_path, TRANSPOSE(bcint(1:nb, 1:np, 1))) - &
+                          MATMUL(achint(1:na, 1:np, 1), TRANSPOSE(right_path))
+      DEALLOCATE (left_path, right_path)
+
+   END SUBROUTINE ecd_add_gth_path_moment
+
+! **************************************************************************************************
+!> \brief Return n! as a real scalar for a non-negative integer n.
+! **************************************************************************************************
+   PURE FUNCTION ecd_integer_factorial(n) RESULT(value)
+      INTEGER, INTENT(IN)                                :: n
+      REAL(KIND=dp)                                      :: value
+
+      INTEGER                                            :: i
+
+      value = 1.0_dp
+      DO i = 2, n
+         value = value*REAL(i, KIND=dp)
+      END DO
+
+   END FUNCTION ecd_integer_factorial
 
 ! **************************************************************************************************
 !> \brief calculate \sum_R_ps (R_ps - R_nu) x [V_nl, r] summing over all pseudized atoms R

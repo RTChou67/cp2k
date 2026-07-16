@@ -105,7 +105,7 @@ MODULE kpoint_methods
    PUBLIC :: kpoint_initialize, kpoint_env_initialize, kpoint_initialize_mos, kpoint_initialize_mo_set
    PUBLIC :: kpoint_init_cell_index, kpoint_set_mo_occupation
    PUBLIC :: kpoint_density_matrices, kpoint_density_transform
-   PUBLIC :: rskp_transform, lowdin_kp_trans, lowdin_kp_mo_coeff
+   PUBLIC :: rskp_transform, rskp_directional_taylor_transform, lowdin_kp_trans, lowdin_kp_mo_coeff
 
 ! **************************************************************************************************
 
@@ -1203,6 +1203,114 @@ CONTAINS
       CALL timestop(handle)
 
    END SUBROUTINE rskp_transform
+
+! **************************************************************************************************
+!> \brief Transform a real-space operator into one directional Taylor coefficient at a k-point.
+!> \param rmatrix Real part of the transformed matrix
+!> \param cmatrix Imaginary part of the transformed matrix
+!> \param rsmat Real-space image matrices
+!> \param ispin Spin channel in rsmat
+!> \param xkp Reduced reciprocal k-point coordinates
+!> \param cell_to_index Image-cell map
+!> \param sab_nl Full neighbour list defining rsmat
+!> \param hmat Cell matrix in Cartesian coordinates
+!> \param direction Cartesian propagation direction
+!> \param order Normalized Taylor order
+!> \param shift_scale Scale of the directional wave-vector shift
+!> \param is_complex Real-space operator represents an imaginary matrix
+! **************************************************************************************************
+   SUBROUTINE rskp_directional_taylor_transform(rmatrix, cmatrix, rsmat, ispin, xkp, cell_to_index, &
+                                                sab_nl, hmat, direction, order, shift_scale, is_complex)
+
+      TYPE(dbcsr_type), INTENT(INOUT)                    :: rmatrix, cmatrix
+      TYPE(dbcsr_p_type), DIMENSION(:, :), POINTER       :: rsmat
+      INTEGER, INTENT(IN)                                :: ispin
+      REAL(KIND=dp), DIMENSION(3), INTENT(IN)            :: xkp
+      INTEGER, DIMENSION(:, :, :), POINTER               :: cell_to_index
+      TYPE(neighbor_list_set_p_type), DIMENSION(:), &
+         POINTER                                         :: sab_nl
+      REAL(KIND=dp), DIMENSION(3, 3), INTENT(IN)         :: hmat
+      REAL(KIND=dp), DIMENSION(3), INTENT(IN)            :: direction
+      INTEGER, INTENT(IN)                                :: order
+      REAL(KIND=dp), INTENT(IN), OPTIONAL                :: shift_scale
+      LOGICAL, INTENT(IN), OPTIONAL                      :: is_complex
+
+      CHARACTER(LEN=*), PARAMETER :: routineN = 'rskp_directional_taylor_transform'
+
+      COMPLEX(KIND=dp)                                   :: coefficient, phase
+      INTEGER                                            :: handle, iatom, ic, iorder, icol, irow, jatom, nimg
+      INTEGER, DIMENSION(3)                              :: cell
+      LOGICAL                                            :: do_symmetric, found, my_complex
+      REAL(KIND=dp)                                      :: argument, directional_distance, &
+                                                            fsym, my_shift_scale
+      REAL(KIND=dp), DIMENSION(3)                        :: cell_vector
+      REAL(KIND=dp), DIMENSION(:, :), POINTER            :: cblock, rblock, rsblock
+      TYPE(neighbor_list_iterator_p_type), &
+         DIMENSION(:), POINTER                           :: nl_iterator
+
+      CALL timeset(routineN, handle)
+
+      IF (order < 0) THEN
+         CPABORT("rskp_directional_taylor_transform requires a non-negative order")
+      END IF
+      IF (ispin < 1 .OR. ispin > SIZE(rsmat, 1)) THEN
+         CPABORT("rskp_directional_taylor_transform spin index is outside the real-space matrix set")
+      END IF
+
+      my_complex = .FALSE.
+      IF (PRESENT(is_complex)) my_complex = is_complex
+      my_shift_scale = 1.0_dp
+      IF (PRESENT(shift_scale)) my_shift_scale = shift_scale
+
+      nimg = SIZE(rsmat, 2)
+      CALL dbcsr_set(rmatrix, 0.0_dp)
+      CALL dbcsr_set(cmatrix, 0.0_dp)
+
+      CALL get_neighbor_list_set_p(neighbor_list_sets=sab_nl, symmetric=do_symmetric)
+      CALL neighbor_list_iterator_create(nl_iterator, sab_nl)
+      DO WHILE (neighbor_list_iterate(nl_iterator) == 0)
+         CALL get_iterator_info(nl_iterator, iatom=iatom, jatom=jatom, cell=cell)
+         fsym = 1.0_dp
+         irow = iatom
+         icol = jatom
+         IF (do_symmetric .AND. iatom > jatom) THEN
+            irow = jatom
+            icol = iatom
+            fsym = -1.0_dp
+         END IF
+         ic = cell_to_index(cell(1), cell(2), cell(3))
+         IF (ic < 1 .OR. ic > nimg) CYCLE
+
+         CALL dbcsr_get_block_p(matrix=rsmat(ispin, ic)%matrix, row=irow, col=icol, &
+                                block=rsblock, found=found)
+         IF (.NOT. found) CYCLE
+         CALL dbcsr_get_block_p(matrix=rmatrix, row=irow, col=icol, block=rblock, found=found)
+         IF (.NOT. found) CYCLE
+         CALL dbcsr_get_block_p(matrix=cmatrix, row=irow, col=icol, block=cblock, found=found)
+         IF (.NOT. found) CYCLE
+
+         cell_vector = MATMUL(hmat, REAL(cell, KIND=dp))
+         directional_distance = my_shift_scale*DOT_PRODUCT(direction, cell_vector)
+         argument = twopi*DOT_PRODUCT(xkp, REAL(cell, KIND=dp))
+         phase = CMPLX(COS(argument), SIN(argument), KIND=dp)
+         coefficient = phase
+         DO iorder = 1, order
+            coefficient = coefficient*CMPLX(0.0_dp, directional_distance/REAL(iorder, KIND=dp), KIND=dp)
+         END DO
+
+         IF (my_complex) THEN
+            rblock = rblock + fsym*REAL(coefficient, KIND=dp)*rsblock
+            cblock = cblock + AIMAG(coefficient)*rsblock
+         ELSE
+            rblock = rblock + REAL(coefficient, KIND=dp)*rsblock
+            cblock = cblock + fsym*AIMAG(coefficient)*rsblock
+         END IF
+      END DO
+      CALL neighbor_list_iterator_release(nl_iterator)
+
+      CALL timestop(handle)
+
+   END SUBROUTINE rskp_directional_taylor_transform
 
 ! **************************************************************************************************
 !> \brief Given the eigenvalues of all kpoints, calculates the occupation numbers

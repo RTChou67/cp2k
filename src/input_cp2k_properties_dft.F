@@ -2204,7 +2204,7 @@ CONTAINS
       CPASSERT(.NOT. ASSOCIATED(section))
       CALL section_create(section, __LOCATION__, name="ECD", &
                           description="Parameters needed to set up electronic circular dichroism spectra.", &
-                          n_keywords=10, n_subsections=3, repeats=.FALSE.)
+                          n_keywords=9, n_subsections=3, repeats=.FALSE.)
 
       NULLIFY (keyword, print_key, subsection)
       CALL keyword_create(keyword, __LOCATION__, name="_SECTION_PARAMETERS_", &
@@ -2214,22 +2214,37 @@ CONTAINS
       CALL keyword_release(keyword)
 
       CALL keyword_create(keyword, __LOCATION__, name="PSEUDOPOTENTIAL_COMMUTATOR", &
-                          description="Controls the GTH non-local contribution to the molecular magnetic operator.", &
+                          description="Controls the GTH non-local contribution to the molecular magnetic operator "// &
+                          "and the periodic finite-wave-vector current.", &
                           usage="PSEUDOPOTENTIAL_COMMUTATOR {logical}", &
                           type_of_var=logical_t, default_l_val=.TRUE., lone_keyword_l_val=.TRUE.)
       CALL section_add_keyword(section, keyword)
       CALL keyword_release(keyword)
 
-      CALL keyword_create(keyword, __LOCATION__, name="IDENTITY_BAND_RANGE", &
-                          description="Band range reserved for periodic ECD identity-resolution paths. "// &
-                          "PERIODIC NONE direct AO operators ignore this setting.", &
-                          usage="IDENTITY_BAND_RANGE -1 -1", &
-                          n_var=2, type_of_var=integer_t, default_i_vals=[-1, -1])
+      CALL keyword_create(keyword, __LOCATION__, name="EPS_DEGENERACY", &
+                          description="Energy threshold used to construct complete degenerate band manifolds "// &
+                          "for periodic ECD.", &
+                          usage="EPS_DEGENERACY 1.0E-6", n_var=1, type_of_var=real_t, &
+                          unit_str="hartree", default_r_val=1.0E-6_dp)
+      CALL section_add_keyword(section, keyword)
+      CALL keyword_release(keyword)
+
+      CALL keyword_create(keyword, __LOCATION__, name="SPATIAL_ORDER", &
+                          description="Highest normalized photon-wave-vector Taylor order retained by periodic ECD.", &
+                          usage="SPATIAL_ORDER 1", n_var=1, type_of_var=integer_t, default_i_val=1)
+      CALL section_add_keyword(section, keyword)
+      CALL keyword_release(keyword)
+
+      CALL keyword_create(keyword, __LOCATION__, name="PROPAGATION_DIRECTION", &
+                          description="Cartesian propagation direction used by the periodic ECD response.", &
+                          usage="PROPAGATION_DIRECTION 0.0 0.0 1.0", &
+                          n_var=3, type_of_var=real_t)
       CALL section_add_keyword(section, keyword)
       CALL keyword_release(keyword)
 
       CALL keyword_create(keyword, __LOCATION__, name="REFERENCE", &
-                          description="Reference point used consistently by molecular ECD operators.", &
+                          description="Reference point used consistently by molecular operators and periodic "// &
+                          "finite-wave-vector phases.", &
                           usage="REFERENCE COAC", &
                           enum_c_vals=s2a("COM", "COAC", "USER_DEFINED", "ZERO"), &
                           enum_desc=s2a("Use Center of Mass", &
@@ -2243,7 +2258,7 @@ CONTAINS
       CALL keyword_release(keyword)
 
       CALL keyword_create(keyword, __LOCATION__, name="REF_POINT", &
-                          description="User-defined molecular ECD reference point.", &
+                          description="User-defined ECD reference point.", &
                           usage="REF_POINT x y z", repeats=.FALSE., n_var=3, &
                           type_of_var=real_t, unit_str="angstrom")
       CALL section_add_keyword(section, keyword)
@@ -2267,10 +2282,17 @@ CONTAINS
 
       CALL section_create(subsection, __LOCATION__, name="IPA", &
                           description="Controls independent-particle ECD spectra.", &
-                          n_keywords=3, repeats=.FALSE.)
+                          n_keywords=4, repeats=.FALSE.)
       CALL keyword_create(keyword, __LOCATION__, name="_SECTION_PARAMETERS_", &
                           description="Controls the activation of the independent-particle ECD source.", &
                           default_l_val=.FALSE., lone_keyword_l_val=.TRUE.)
+      CALL section_add_keyword(subsection, keyword)
+      CALL keyword_release(keyword)
+      CALL keyword_create(keyword, __LOCATION__, name="ELECTRIC_GAUGE", &
+                          description="Electric representation used by the periodic independent-particle response.", &
+                          usage="ELECTRIC_GAUGE VELOCITY", &
+                          enum_c_vals=s2a("LENGTH", "VELOCITY"), &
+                          enum_i_vals=[1, 2], default_i_val=2)
       CALL section_add_keyword(subsection, keyword)
       CALL keyword_release(keyword)
       CALL keyword_create(keyword, __LOCATION__, name="NTRANSITIONS", &
@@ -2315,6 +2337,17 @@ CONTAINS
       CALL cp_print_key_section_create(print_key, __LOCATION__, name="SPECTRUM", &
                                        description="Controls the printing of the broadened ECD spectrum.", &
                                        print_level=low_print_level)
+      CALL keyword_create(keyword, __LOCATION__, name="ENERGY_RANGE", &
+                          description="Photon-energy interval used by the periodic ECD response grid.", &
+                          usage="ENERGY_RANGE 0.0 10.0", n_var=2, type_of_var=real_t, &
+                          unit_str="eV")
+      CALL section_add_keyword(print_key, keyword)
+      CALL keyword_release(keyword)
+      CALL keyword_create(keyword, __LOCATION__, name="NPOINTS", &
+                          description="Number of points in the ECD spectrum grid, including both endpoints.", &
+                          usage="NPOINTS 2001", n_var=1, type_of_var=integer_t, default_i_val=2001)
+      CALL section_add_keyword(print_key, keyword)
+      CALL keyword_release(keyword)
       CALL keyword_create(keyword, __LOCATION__, name="X_UNIT", &
                           description="Unit used for the broadened ECD spectrum horizontal axis.", &
                           usage="X_UNIT EV", &
@@ -2323,12 +2356,24 @@ CONTAINS
       CALL section_add_keyword(print_key, keyword)
       CALL keyword_release(keyword)
       CALL keyword_create(keyword, __LOCATION__, name="Y_UNIT", &
-                          description="Unit used for the ECD rotatory-strength density column.", &
+                          description="Unit used for molecular rotatory-strength density or periodic absorption.", &
                           usage="Y_UNIT AU", &
-                          enum_c_vals=s2a("AU", "CGS_1E40"), &
-                          enum_i_vals=[1, 2], default_i_val=1)
+                          enum_c_vals=s2a("AU", "CGS_1E40", "CM-1"), &
+                          enum_i_vals=[1, 2, 3], default_i_val=1)
       CALL section_add_keyword(print_key, keyword)
       CALL keyword_release(keyword)
+      CALL section_add_subsection(subsection, print_key)
+      CALL section_release(print_key)
+      CALL cp_print_key_section_create(print_key, __LOCATION__, name="RESPONSE_TENSOR", &
+                                       description="Controls the printing of periodic ECD dielectric-response "// &
+                                       "Taylor coefficients.", &
+                                       print_level=low_print_level)
+      CALL section_add_subsection(subsection, print_key)
+      CALL section_release(print_key)
+      CALL cp_print_key_section_create(print_key, __LOCATION__, name="MATRIX_ELEMENTS", &
+                                       description="Controls the printing of transition-resolved periodic ECD "// &
+                                       "matrix elements and validation residuals.", &
+                                       print_level=debug_print_level)
       CALL section_add_subsection(subsection, print_key)
       CALL section_release(print_key)
       CALL section_add_subsection(section, subsection)

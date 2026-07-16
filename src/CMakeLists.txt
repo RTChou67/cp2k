@@ -574,6 +574,12 @@ list(
   qs_dos.F
   qs_dos_utils.F
   qs_ecd_methods.F
+  qs_ecd_gamma_data.F
+  qs_ecd_gamma_operators.F
+  qs_ecd_periodic.F
+  qs_ecd_operators.F
+  qs_ecd_subspace.F
+  qs_ecd_taylor.F
   qs_efield_berry.F
   qs_efield_local.F
   qs_elec_field.F
