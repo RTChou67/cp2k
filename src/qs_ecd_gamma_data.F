@@ -63,6 +63,12 @@ MODULE qs_ecd_gamma_data
          POINTER                                   :: manifolds => NULL()
    END TYPE ecd_gamma_spin_type
 
+   TYPE, PUBLIC :: ecd_gamma_translation_layout_type
+      INTEGER                                           :: ntranslations = 0
+      INTEGER, DIMENSION(:, :, :), POINTER              :: cell_to_index => NULL()
+      TYPE(kpoint_type), POINTER                        :: external_kpoints => NULL()
+   END TYPE ecd_gamma_translation_layout_type
+
    TYPE, PUBLIC :: ecd_gamma_context_type
       INTEGER                                                  :: nspin = 0, spatial_order = 0
       REAL(KIND=dp), DIMENSION(3)                            :: direction = 0.0_dp, ref_point = 0.0_dp
@@ -75,8 +81,7 @@ MODULE qs_ecd_gamma_data
                                                                   sap_ppnl => NULL()
       TYPE(particle_type), DIMENSION(:), POINTER              :: particle_set => NULL()
       TYPE(qs_kind_type), DIMENSION(:), POINTER               :: qs_kind_set => NULL()
-      INTEGER, DIMENSION(:, :, :), POINTER                    :: overlap_cell_to_index => NULL()
-      TYPE(kpoint_type), POINTER                              :: image_kpoints => NULL()
+      TYPE(ecd_gamma_translation_layout_type)                 :: translation_layout
       TYPE(ecd_gamma_spin_type), ALLOCATABLE, DIMENSION(:)    :: spin
    END TYPE ecd_gamma_context_type
 
@@ -108,8 +113,9 @@ CONTAINS
       TYPE(mp_para_env_type), POINTER                     :: para_env
       TYPE(qs_ks_env_type), POINTER                       :: ks_env
 
-      NULLIFY (context%core_images, context%image_kpoints, &
-               context%overlap_cell_to_index, context%overlap_images)
+      NULLIFY (context%core_images, context%translation_layout%external_kpoints, &
+               context%translation_layout%cell_to_index, context%overlap_images)
+      context%translation_layout%ntranslations = 0
       NULLIFY (blacs_env, eigenvalues, ks_env, mo_coeff, mos, occupations, para_env)
       CALL get_qs_env(qs_env, cell=context%cell, do_kpoints=do_kpoints, mos=mos, &
                       ks_env=ks_env, matrix_h=context%matrix_h, matrix_ks=context%matrix_ks, &
@@ -189,11 +195,11 @@ CONTAINS
       TYPE(dbcsr_p_type), DIMENSION(:, :), POINTER       :: core_images
       INTEGER, DIMENSION(:, :, :), POINTER               :: cell_to_index
 
-      IF (.NOT. ASSOCIATED(context%core_images) .OR. .NOT. ASSOCIATED(context%overlap_cell_to_index)) THEN
+      IF (.NOT. ASSOCIATED(context%core_images) .OR. .NOT. ASSOCIATED(context%translation_layout%cell_to_index)) THEN
          CPABORT("ECD| Implicit-Gamma core image snapshot is unavailable")
       END IF
       core_images => context%core_images
-      cell_to_index => context%overlap_cell_to_index
+      cell_to_index => context%translation_layout%cell_to_index
 
    END SUBROUTINE ecd_gamma_context_core_images_get
 
@@ -205,11 +211,11 @@ CONTAINS
       TYPE(dbcsr_p_type), DIMENSION(:, :), POINTER       :: overlap_images
       INTEGER, DIMENSION(:, :, :), POINTER               :: cell_to_index
 
-      IF (.NOT. ASSOCIATED(context%overlap_images) .OR. .NOT. ASSOCIATED(context%overlap_cell_to_index)) THEN
+      IF (.NOT. ASSOCIATED(context%overlap_images) .OR. .NOT. ASSOCIATED(context%translation_layout%cell_to_index)) THEN
          CPABORT("ECD| Implicit-Gamma overlap image snapshot is unavailable")
       END IF
       overlap_images => context%overlap_images
-      cell_to_index => context%overlap_cell_to_index
+      cell_to_index => context%translation_layout%cell_to_index
 
    END SUBROUTINE ecd_gamma_context_overlap_images_get
 
@@ -223,14 +229,14 @@ CONTAINS
 
       available = .FALSE.
       nimages = 0
-      IF (.NOT. ASSOCIATED(context%overlap_images) .OR. .NOT. ASSOCIATED(context%overlap_cell_to_index)) THEN
+      IF (.NOT. ASSOCIATED(context%overlap_images) .OR. .NOT. ASSOCIATED(context%translation_layout%cell_to_index)) THEN
          RETURN
       END IF
       IF (SIZE(context%overlap_images, 1) /= 1) THEN
          RETURN
       END IF
-      nimages = SIZE(context%overlap_images, 2)
-      IF (nimages < 1) THEN
+      nimages = context%translation_layout%ntranslations
+      IF (nimages < 1 .OR. SIZE(context%overlap_images, 2) /= nimages) THEN
          RETURN
       END IF
       available = .TRUE.
@@ -254,7 +260,7 @@ CONTAINS
       INTEGER                                            :: nimages
       INTEGER, DIMENSION(:, :, :), POINTER               :: cell_to_index
 
-      IF (ASSOCIATED(context%overlap_images) .OR. ASSOCIATED(context%overlap_cell_to_index)) THEN
+      IF (ASSOCIATED(context%overlap_images) .OR. ASSOCIATED(context%translation_layout%cell_to_index)) THEN
          CPABORT("ECD| Implicit-Gamma overlap image snapshot is already allocated")
       END IF
       IF (.NOT. ASSOCIATED(context%sab_orb)) THEN
@@ -262,30 +268,32 @@ CONTAINS
       END IF
 
       NULLIFY (cell_to_index)
-      CALL kpoint_create(context%image_kpoints)
-      context%image_kpoints%kp_scheme = "GAMMA"
-      context%image_kpoints%use_real_wfn = .TRUE.
-      CALL kpoint_initialize(context%image_kpoints, context%particle_set, context%cell)
-      CALL kpoint_env_initialize(context%image_kpoints, para_env, blacs_env)
-      CALL kpoint_initialize_mos(context%image_kpoints, mos)
-      CALL kpoint_initialize_mo_set(context%image_kpoints)
-      CALL kpoint_init_cell_index(context%image_kpoints, context%sab_orb, para_env, nimages)
-      CALL get_kpoint_info(context%image_kpoints, cell_to_index=cell_to_index)
+      CALL kpoint_create(context%translation_layout%external_kpoints)
+      context%translation_layout%external_kpoints%kp_scheme = "GAMMA"
+      context%translation_layout%external_kpoints%use_real_wfn = .TRUE.
+      CALL kpoint_initialize(context%translation_layout%external_kpoints, context%particle_set, context%cell)
+      CALL kpoint_env_initialize(context%translation_layout%external_kpoints, para_env, blacs_env)
+      CALL kpoint_initialize_mos(context%translation_layout%external_kpoints, mos)
+      CALL kpoint_initialize_mo_set(context%translation_layout%external_kpoints)
+      CALL kpoint_init_cell_index(context%translation_layout%external_kpoints, context%sab_orb, para_env, nimages)
+      CALL get_kpoint_info(context%translation_layout%external_kpoints, cell_to_index=cell_to_index)
       IF (nimages < 1 .OR. .NOT. ASSOCIATED(cell_to_index)) THEN
-         CALL kpoint_release(context%image_kpoints)
+         CALL kpoint_release(context%translation_layout%external_kpoints)
          CPABORT("ECD| Implicit-Gamma overlap image snapshot has no image cells")
       END IF
 
-      ALLOCATE (context%overlap_cell_to_index(LBOUND(cell_to_index, 1):UBOUND(cell_to_index, 1), &
-                                               LBOUND(cell_to_index, 2):UBOUND(cell_to_index, 2), &
-                                               LBOUND(cell_to_index, 3):UBOUND(cell_to_index, 3)))
-      context%overlap_cell_to_index = cell_to_index
+      context%translation_layout%ntranslations = nimages
+      ALLOCATE (context%translation_layout%cell_to_index(LBOUND(cell_to_index, 1):UBOUND(cell_to_index, 1), &
+                                                          LBOUND(cell_to_index, 2):UBOUND(cell_to_index, 2), &
+                                                          LBOUND(cell_to_index, 3):UBOUND(cell_to_index, 3)))
+      context%translation_layout%cell_to_index = cell_to_index
       CALL build_overlap_matrix(ks_env, matrixkp_s=context%overlap_images, &
                                 matrix_name="ECD IMPLICIT GAMMA OVERLAP IMAGES", basis_type_a="ORB", &
-                                basis_type_b="ORB", sab_nl=context%sab_orb, ext_kpoints=context%image_kpoints)
+                                basis_type_b="ORB", sab_nl=context%sab_orb, &
+                                ext_kpoints=context%translation_layout%external_kpoints)
 
       IF (.NOT. ASSOCIATED(context%overlap_images) .OR. SIZE(context%overlap_images, 1) /= 1 .OR. &
-          SIZE(context%overlap_images, 2) /= nimages) THEN
+          SIZE(context%overlap_images, 2) /= nimages .OR. context%translation_layout%ntranslations /= nimages) THEN
          CPABORT("ECD| Implicit-Gamma overlap image snapshot dimensions are inconsistent")
       END IF
 
@@ -308,10 +316,14 @@ CONTAINS
       IF (ASSOCIATED(context%core_images)) THEN
          CPABORT("ECD| Implicit-Gamma core image snapshot is already allocated")
       END IF
-      IF (.NOT. ASSOCIATED(context%image_kpoints) .OR. .NOT. ASSOCIATED(context%overlap_images)) THEN
+      IF (.NOT. ASSOCIATED(context%translation_layout%external_kpoints) .OR. &
+          .NOT. ASSOCIATED(context%overlap_images)) THEN
          CPABORT("ECD| Implicit-Gamma core image snapshot requires the overlap image environment")
       END IF
-      nimages = SIZE(context%overlap_images, 2)
+      nimages = context%translation_layout%ntranslations
+      IF (nimages < 1 .OR. SIZE(context%overlap_images, 2) /= nimages) THEN
+         CPABORT("ECD| Implicit-Gamma core image snapshot has an inconsistent translation layout")
+      END IF
       IF (SIZE(context%matrix_h) /= 1) THEN
          CPABORT("ECD| Implicit-Gamma folded core matrix has an unsupported shape")
       END IF
@@ -329,11 +341,11 @@ CONTAINS
       END DO
 
       CALL kinetic_energy_matrix(qs_env, matrixkp_t=context%core_images, matrix_p=density_dummy, &
-                                 ext_kpoints=context%image_kpoints, matrix_name="ECD CORE KINETIC", &
+                                 ext_kpoints=context%translation_layout%external_kpoints, matrix_name="ECD CORE KINETIC", &
                                  calculate_forces=.FALSE., sab_orb=context%sab_orb)
       ppl_method = context%dft_control%qs_control%do_ppl_method
       CALL core_matrices(qs_env, context%core_images, density_dummy, calculate_forces=.FALSE., nder=0, &
-                         ext_kpoints=context%image_kpoints)
+                         ext_kpoints=context%translation_layout%external_kpoints)
       context%dft_control%qs_control%do_ppl_method = ppl_method
       CALL dbcsr_deallocate_matrix_set(density_dummy)
 
@@ -368,13 +380,14 @@ CONTAINS
          CALL dbcsr_deallocate_matrix_set(context%core_images)
          NULLIFY (context%core_images)
       END IF
-      IF (ASSOCIATED(context%image_kpoints)) THEN
-         CALL kpoint_release(context%image_kpoints)
+      IF (ASSOCIATED(context%translation_layout%external_kpoints)) THEN
+         CALL kpoint_release(context%translation_layout%external_kpoints)
       END IF
-      IF (ASSOCIATED(context%overlap_cell_to_index)) THEN
-         DEALLOCATE (context%overlap_cell_to_index)
-         NULLIFY (context%overlap_cell_to_index)
+      IF (ASSOCIATED(context%translation_layout%cell_to_index)) THEN
+         DEALLOCATE (context%translation_layout%cell_to_index)
+         NULLIFY (context%translation_layout%cell_to_index)
       END IF
+      context%translation_layout%ntranslations = 0
       NULLIFY (context%cell, context%matrix_h, context%matrix_ks, context%matrix_s, context%dft_control, &
                context%sab_orb, &
                context%sab_all, context%sap_ppnl, context%particle_set, context%qs_kind_set)

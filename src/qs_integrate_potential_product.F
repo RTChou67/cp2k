@@ -709,6 +709,12 @@ CONTAINS
       IF (nimages > 1) THEN
          CPASSERT(do_kp)
       END IF
+      IF (PRESENT(hmat_kp)) THEN
+         CPASSERT(SIZE(hmat_kp) == nimages)
+      END IF
+      IF (PRESENT(pmat_kp)) THEN
+         CPASSERT(SIZE(pmat_kp) == nimages)
+      END IF
       nkind = SIZE(qs_kind_set)
       calculate_virial = virial%pv_availability .AND. (.NOT. virial%pv_numer) .AND. calculate_forces
       pab_required = (PRESENT(pmat) .OR. PRESENT(pmat_kp)) .AND. calculate_forces

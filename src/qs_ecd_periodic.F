@@ -22,6 +22,7 @@ MODULE qs_ecd_periodic
                                               dbcsr_desymmetrize,&
                                               dbcsr_init_p,&
                                               dbcsr_p_type,&
+                                              dbcsr_reserve_blocks,&
                                               dbcsr_set,&
                                               dbcsr_type,&
                                               dbcsr_type_antisymmetric,&
@@ -327,9 +328,9 @@ CONTAINS
          WRITE (cp_logger_get_default_io_unit(logger), '(T2,A,T55,L1)') &
             'ECD| Stage G1A GTH current available', gth_available
          WRITE (cp_logger_get_default_io_unit(logger), '(T2,A,T55,L1)') &
-            'ECD| Stage G3 overlap image data available', phase_images_available
+            'ECD| Stage G3 overlap translation data available', phase_images_available
          WRITE (cp_logger_get_default_io_unit(logger), '(T2,A,T55,I8)') &
-            'ECD| Stage G3 overlap image data count', phase_nimages
+            'ECD| Stage G3 overlap translation count', phase_nimages
       END IF
 
       DO ispin = 1, context%nspin
@@ -453,7 +454,7 @@ CONTAINS
       logger => cp_get_default_logger()
       IF (cp_logger_get_default_io_unit(logger) > 0) THEN
          WRITE (cp_logger_get_default_io_unit(logger), '(T2,A,T55,I8)') &
-            'ECD| Stage G3 overlap image count', nimages
+            'ECD| Stage G3 overlap translation count', nimages
          WRITE (cp_logger_get_default_io_unit(logger), '(T2,A,T55,ES14.6)') &
             'ECD| Stage G3 overlap fold norm', SQRT(ABS(fold_norm_sq))
          WRITE (cp_logger_get_default_io_unit(logger), '(T2,A,T55,ES14.6)') &
@@ -529,12 +530,13 @@ CONTAINS
       TYPE(qs_environment_type), POINTER                 :: qs_env
       TYPE(ecd_gamma_context_type), INTENT(IN), TARGET   :: context
 
-      INTEGER                                            :: iimage, ispin, nimages
+      INTEGER                                            :: ispin, nimages
       REAL(KIND=dp)                                      :: exc_dummy, fold_norm_sq, residual_norm_sq
       REAL(KIND=dp), DIMENSION(3)                        :: xkp_zero
       TYPE(cp_logger_type), POINTER                      :: logger
-      TYPE(dbcsr_p_type), DIMENSION(:, :), POINTER       :: core_images, ks_images, local_images
-      TYPE(dbcsr_p_type), DIMENSION(:), POINTER          :: ks_fold, ks_residual, local_image_spin
+      TYPE(dbcsr_p_type), DIMENSION(:, :), POINTER       :: core_images, local_images
+      TYPE(dbcsr_p_type), DIMENSION(:), POINTER          :: core_fold, ks_fold, ks_residual, local_fold, &
+                                                            local_image_spin
       TYPE(dft_control_type), POINTER                     :: dft_control
       INTEGER, DIMENSION(:, :, :), POINTER               :: cell_to_index
       TYPE(pw_env_type), POINTER                          :: pw_env
@@ -547,12 +549,12 @@ CONTAINS
       TYPE(section_vals_type), POINTER                    :: input, xc_section
       TYPE(task_list_type), POINTER                       :: image_task_list
 
-      NULLIFY (auxbas_pw_pool, cell_to_index, core_images, dft_control, image_task_list, input, ks_env, ks_fold, &
-               ks_images, ks_residual, local_images, local_image_spin, logger, pw_env, rho, v_hartree_rspace, &
-               vxc_rho, vxc_tau, xc_section)
+      NULLIFY (auxbas_pw_pool, cell_to_index, core_fold, core_images, dft_control, image_task_list, input, ks_env, &
+               ks_fold, ks_residual, local_fold, local_images, local_image_spin, logger, pw_env, rho, &
+               v_hartree_rspace, vxc_rho, vxc_tau, xc_section)
       CALL ecd_gamma_context_core_images_get(context, core_images, cell_to_index)
-      IF (.NOT. ASSOCIATED(context%image_kpoints)) THEN
-         CPABORT("ECD| Stage G6 requires the implicit-Gamma image k-point environment")
+      IF (.NOT. ASSOCIATED(context%translation_layout%external_kpoints)) THEN
+         CPABORT("ECD| Stage G6 requires the implicit-Gamma translation layout")
       END IF
       nimages = SIZE(core_images, 2)
       IF (nimages < 1) THEN
@@ -588,21 +590,11 @@ CONTAINS
 
       CALL allocate_task_list(image_task_list)
       CALL generate_qs_task_list(ks_env, image_task_list, basis_type="ORB", reorder_rs_grid_ranks=.FALSE., &
-                                 skip_load_balance_distributed=.FALSE., ext_kpoints=context%image_kpoints)
-      CALL dbcsr_allocate_matrix_set(local_images, context%nspin, nimages)
-      CALL dbcsr_allocate_matrix_set(ks_images, context%nspin, nimages)
-      DO iimage = 1, nimages
-         DO ispin = 1, context%nspin
-            CALL dbcsr_init_p(local_images(ispin, iimage)%matrix)
-            CALL dbcsr_create(local_images(ispin, iimage)%matrix, template=context%matrix_ks(ispin)%matrix, &
-                              matrix_type=dbcsr_type_no_symmetry, name="ECD G6 LOCAL POTENTIAL IMAGE")
-            CALL dbcsr_init_p(ks_images(ispin, iimage)%matrix)
-            CALL dbcsr_create(ks_images(ispin, iimage)%matrix, template=context%matrix_ks(ispin)%matrix, &
-                              matrix_type=dbcsr_type_no_symmetry, name="ECD G6 KS IMAGE")
-            CALL dbcsr_desymmetrize(core_images(ispin, iimage)%matrix, local_images(ispin, iimage)%matrix)
-            CALL dbcsr_set(local_images(ispin, iimage)%matrix, 0.0_dp)
-         END DO
-      END DO
+                                 skip_load_balance_distributed=dft_control%qs_control%skip_load_balance_distributed, &
+                                 sab_orb_external=context%sab_orb, &
+                                 ext_kpoints=context%translation_layout%external_kpoints)
+      CALL ecd_periodic_task_image_matrix_set_create(local_images, context%matrix_ks, context%nspin, nimages, &
+                                                      image_task_list, 'ECD G6 LOCAL POTENTIAL IMAGE')
 
       DO ispin = 1, context%nspin
          CALL auxbas_pw_pool%create_pw(local_potential)
@@ -611,15 +603,9 @@ CONTAINS
          local_image_spin => local_images(ispin, :)
          CALL integrate_v_rspace(v_rspace=local_potential, hmat_kp=local_image_spin, qs_env=qs_env, &
                                  calculate_forces=.FALSE., task_list_external=image_task_list, &
-                                 ext_kpoints=context%image_kpoints)
+                                 ext_kpoints=context%translation_layout%external_kpoints)
          CALL auxbas_pw_pool%give_back_pw(local_potential)
          NULLIFY (local_image_spin)
-      END DO
-      DO iimage = 1, nimages
-         DO ispin = 1, context%nspin
-            CALL dbcsr_desymmetrize(core_images(ispin, iimage)%matrix, ks_images(ispin, iimage)%matrix)
-            CALL dbcsr_add(ks_images(ispin, iimage)%matrix, local_images(ispin, iimage)%matrix, 1.0_dp, 1.0_dp)
-         END DO
       END DO
       DO ispin = 1, context%nspin
          CALL auxbas_pw_pool%give_back_pw(vxc_rho(ispin))
@@ -627,6 +613,10 @@ CONTAINS
       DEALLOCATE (vxc_rho)
 
       xkp_zero = 0.0_dp
+      CALL ecd_periodic_ao_set_create(core_fold, context%nspin, context%matrix_ks(1)%matrix, context%sab_orb, &
+                                      'ECD G6 core fold', dbcsr_type_symmetric)
+      CALL ecd_periodic_ao_set_create(local_fold, context%nspin, context%matrix_ks(1)%matrix, context%sab_orb, &
+                                      'ECD G6 local-potential fold', dbcsr_type_symmetric)
       CALL ecd_periodic_ao_set_create(ks_fold, context%nspin, context%matrix_ks(1)%matrix, context%sab_orb, &
                                       'ECD G6 KS fold', dbcsr_type_symmetric)
       CALL ecd_periodic_ao_set_create(ks_residual, context%nspin, context%matrix_ks(1)%matrix, context%sab_orb, &
@@ -635,11 +625,16 @@ CONTAINS
       logger => cp_get_default_logger()
       IF (cp_logger_get_default_io_unit(logger) > 0) THEN
          WRITE (cp_logger_get_default_io_unit(logger), '(T2,A,T55,I8)') &
-            'ECD| Stage G6 KS image count', nimages
+            'ECD| Stage G6 KS translation count', nimages
       END IF
       DO ispin = 1, context%nspin
-         CALL rskp_transform(ks_fold(ispin)%matrix, rsmat=ks_images, ispin=ispin, xkp=xkp_zero, &
+         CALL rskp_transform(core_fold(ispin)%matrix, rsmat=core_images, ispin=ispin, xkp=xkp_zero, &
                              cell_to_index=cell_to_index, sab_nl=context%sab_orb)
+         CALL rskp_transform(local_fold(ispin)%matrix, rsmat=local_images, ispin=ispin, xkp=xkp_zero, &
+                             cell_to_index=cell_to_index, sab_nl=context%sab_orb)
+         CALL dbcsr_set(ks_fold(ispin)%matrix, 0.0_dp)
+         CALL dbcsr_add(ks_fold(ispin)%matrix, core_fold(ispin)%matrix, 0.0_dp, 1.0_dp)
+         CALL dbcsr_add(ks_fold(ispin)%matrix, local_fold(ispin)%matrix, 1.0_dp, 1.0_dp)
          CALL dbcsr_set(ks_residual(ispin)%matrix, 0.0_dp)
          CALL dbcsr_add(ks_residual(ispin)%matrix, ks_fold(ispin)%matrix, 0.0_dp, 1.0_dp)
          CALL dbcsr_add(ks_residual(ispin)%matrix, context%matrix_ks(ispin)%matrix, 1.0_dp, -1.0_dp)
@@ -652,13 +647,89 @@ CONTAINS
                'ECD| Stage G6 KS fold residual spin', ispin, SQRT(ABS(residual_norm_sq))
          END IF
       END DO
+      CALL dbcsr_deallocate_matrix_set(core_fold)
       CALL dbcsr_deallocate_matrix_set(ks_fold)
       CALL dbcsr_deallocate_matrix_set(ks_residual)
-      CALL dbcsr_deallocate_matrix_set(ks_images)
+      CALL dbcsr_deallocate_matrix_set(local_fold)
       CALL dbcsr_deallocate_matrix_set(local_images)
       CALL deallocate_task_list(image_task_list)
 
    END SUBROUTINE ecd_periodic_implicit_gamma_ks_g6
+
+! **************************************************************************************************
+!> \brief Allocate external-translation matrices from the exact real-space task-list block contract.
+!>
+!> The distributed gather path addresses atom_pair_send while the replicated-grid
+!> path addresses atom_pair_recv.  Reserving their union gives every target
+!> translation matrix the blocks that either path can write.
+! **************************************************************************************************
+   SUBROUTINE ecd_periodic_task_image_matrix_set_create(matrices, templates, nspin, nimages, task_list, name)
+      TYPE(dbcsr_p_type), DIMENSION(:, :), POINTER       :: matrices
+      TYPE(dbcsr_p_type), DIMENSION(:), POINTER          :: templates
+      INTEGER, INTENT(IN)                                :: nspin, nimages
+      TYPE(task_list_type), POINTER                       :: task_list
+      CHARACTER(LEN=*), INTENT(IN)                       :: name
+
+      INTEGER                                            :: iimage, imatrix, ipair, npairs, nreserve
+      INTEGER, ALLOCATABLE, DIMENSION(:)                 :: reserve_cols, reserve_rows
+
+      IF (.NOT. ASSOCIATED(task_list)) THEN
+         CPABORT("ECD| External translation matrix allocation requires a task list")
+      END IF
+      IF (nspin < 1 .OR. nimages < 1 .OR. SIZE(templates) /= nspin) THEN
+         CPABORT("ECD| External translation matrix allocation has inconsistent dimensions")
+      END IF
+      npairs = 0
+      IF (ASSOCIATED(task_list%atom_pair_recv)) npairs = npairs + SIZE(task_list%atom_pair_recv)
+      IF (ASSOCIATED(task_list%atom_pair_send)) npairs = npairs + SIZE(task_list%atom_pair_send)
+      IF (npairs < 1) THEN
+         CPABORT("ECD| External translation task list contains no atom pairs")
+      END IF
+
+      ALLOCATE (reserve_rows(npairs), reserve_cols(npairs))
+      CALL dbcsr_allocate_matrix_set(matrices, nspin, nimages)
+      DO iimage = 1, nimages
+         nreserve = 0
+         IF (ASSOCIATED(task_list%atom_pair_recv)) THEN
+            DO ipair = 1, SIZE(task_list%atom_pair_recv)
+               IF (task_list%atom_pair_recv(ipair)%image < 1 .OR. &
+                   task_list%atom_pair_recv(ipair)%image > nimages) THEN
+                  CPABORT("ECD| External translation receive pair has an invalid translation index")
+               END IF
+               IF (task_list%atom_pair_recv(ipair)%image == iimage) THEN
+                  nreserve = nreserve + 1
+                  reserve_rows(nreserve) = task_list%atom_pair_recv(ipair)%row
+                  reserve_cols(nreserve) = task_list%atom_pair_recv(ipair)%col
+               END IF
+            END DO
+         END IF
+         IF (ASSOCIATED(task_list%atom_pair_send)) THEN
+            DO ipair = 1, SIZE(task_list%atom_pair_send)
+               IF (task_list%atom_pair_send(ipair)%image < 1 .OR. &
+                   task_list%atom_pair_send(ipair)%image > nimages) THEN
+                  CPABORT("ECD| External translation send pair has an invalid translation index")
+               END IF
+               IF (task_list%atom_pair_send(ipair)%image == iimage) THEN
+                  nreserve = nreserve + 1
+                  reserve_rows(nreserve) = task_list%atom_pair_send(ipair)%row
+                  reserve_cols(nreserve) = task_list%atom_pair_send(ipair)%col
+               END IF
+            END DO
+         END IF
+         DO imatrix = 1, nspin
+            CALL dbcsr_init_p(matrices(imatrix, iimage)%matrix)
+            CALL dbcsr_create(matrices(imatrix, iimage)%matrix, template=templates(imatrix)%matrix, &
+                              matrix_type=dbcsr_type_symmetric, name=name)
+            IF (nreserve > 0) THEN
+               CALL dbcsr_reserve_blocks(matrices(imatrix, iimage)%matrix, reserve_rows(1:nreserve), &
+                                         reserve_cols(1:nreserve))
+            END IF
+            CALL dbcsr_set(matrices(imatrix, iimage)%matrix, 0.0_dp)
+         END DO
+      END DO
+      DEALLOCATE (reserve_cols, reserve_rows)
+
+   END SUBROUTINE ecd_periodic_task_image_matrix_set_create
 
 ! **************************************************************************************************
 !> \brief Build implicit-Gamma current Taylor coefficients through first spatial order.
@@ -688,14 +759,14 @@ CONTAINS
       TYPE(ecd_periodic_gth_operators_type)              :: gth_operators
       TYPE(ecd_periodic_local_operators_type)            :: local_operators
       INTEGER, DIMENSION(:, :, :), POINTER               :: gth_cell_to_index, local_cell_to_index, &
-                                                            overlap_cell_to_index
+                                                            translation_cell_to_index
 
       NULLIFY (complete_current, current_residual, current_taylor_imag, current_taylor_real, &
                gth_cell_to_index, gth_current, gth_current_path_rs, gth_current_taylor_imag, &
                gth_current_taylor_real, local_cell_to_index, local_current, local_moments_der_rs, &
-               local_moments_rs, local_momentum_rs, logger, overlap_cell_to_index, overlap_images, position)
+               local_moments_rs, local_momentum_rs, logger, translation_cell_to_index, overlap_images, position)
       xkp_zero = 0.0_dp
-      CALL ecd_gamma_context_overlap_images_get(context, overlap_images, overlap_cell_to_index)
+      CALL ecd_gamma_context_overlap_images_get(context, overlap_images, translation_cell_to_index)
       CALL ecd_gamma_zero_order_operators_get(gamma_operators, position, local_current, gth_current, complete_current, &
                                                gth_available)
 
@@ -712,7 +783,7 @@ CONTAINS
                                              gth_current_taylor_real, gth_current_taylor_imag, &
                                              local_momentum_rs, local_moments_der_rs, local_moments_rs, &
                                              gth_current_path_rs, gth_enabled, overlap_images, xkp_zero, &
-                                             overlap_cell_to_index, local_cell_to_index, gth_cell_to_index, &
+                                             translation_cell_to_index, local_cell_to_index, gth_cell_to_index, &
                                              context%sab_all, context%cell%hmat, context%direction, 1)
       CALL ecd_periodic_ao_vector_create(current_residual, context%matrix_s(1)%matrix, context%sab_all, &
                                          'ECD G4 current zeroth residual', dbcsr_type_no_symmetry)
