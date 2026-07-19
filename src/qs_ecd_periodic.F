@@ -58,7 +58,7 @@ MODULE qs_ecd_periodic
    USE kpoint_methods,                  ONLY: rskp_directional_taylor_transform,&
                                               rskp_transform
    USE mathconstants,                   ONLY: twopi
-   USE orbital_pointers,                 ONLY: coset
+   USE orbital_pointers,                 ONLY: coset, ncoset
    USE qs_commutators,                  ONLY: build_com_hr_matrix
    USE qs_ecd_subspace,                 ONLY: ecd_band_manifold_type,&
                                               ecd_band_first_order_response,&
@@ -168,6 +168,7 @@ CONTAINS
       REAL(KIND=dp), INTENT(IN)                          :: fwhm
 
       CHARACTER(LEN=default_string_length)               :: gauge_label
+      COMPLEX(KIND=dp), ALLOCATABLE, DIMENSION(:, :, :)  :: velocity_response_first, velocity_response_zero
       INTEGER                                            :: electric_gauge, npoints, spatial_order
       LOGICAL                                            :: direction_explicit, do_kpoints, &
                                                             energy_range_explicit
@@ -203,7 +204,7 @@ CONTAINS
          CPABORT("ECD| EPS_DEGENERACY must be positive")
       END IF
       IF (spatial_order /= 1) THEN
-         CPABORT("ECD| Periodic velocity response currently requires SPATIAL_ORDER 1")
+         CPABORT("ECD| Periodic ECD response currently requires SPATIAL_ORDER 1")
       END IF
       IF (.NOT. direction_explicit) THEN
          CPABORT("ECD| Periodic ECD requires PROPAGATION_DIRECTION")
@@ -268,7 +269,7 @@ CONTAINS
          CPABORT("ECD| ENERGY_RANGE requires 0 <= lower < upper")
       END IF
       IF (energy_range(1) <= 0.0_dp) THEN
-         CPABORT("ECD| Periodic velocity response requires ENERGY_RANGE lower > 0")
+         CPABORT("ECD| Periodic ECD response requires ENERGY_RANGE lower > 0")
       END IF
       IF (npoints < 2) THEN
          CPABORT("ECD| Periodic response requires NPOINTS of at least two")
@@ -284,14 +285,25 @@ CONTAINS
          CALL ecd_periodic_implicit_gamma_core_g5(gamma_context)
          CALL ecd_periodic_implicit_gamma_current_g4(qs_env, gamma_context, gamma_operators, &
                                                       pseudopotential_commutator)
+         CALL ecd_periodic_implicit_gamma_length_g11(qs_env, gamma_context, gamma_operators)
          CALL ecd_periodic_implicit_gamma_ks_g6(qs_env, gamma_context)
          CALL ecd_periodic_implicit_gamma_ks_phase_g7(gamma_context)
          CALL ecd_periodic_implicit_gamma_state_g8(gamma_context)
          CALL ecd_periodic_implicit_gamma_transition_g9(gamma_context, transition_band_range)
+         CALL ecd_periodic_implicit_gamma_length_transition_g12(gamma_context, transition_band_range)
       END IF
       CALL ecd_periodic_implicit_gamma_zero_order_response(qs_env, ecd_section, gamma_context, gamma_operators, &
                                                             electric_gauge, transition_band_range, energy_range, &
-                                                            npoints, fwhm)
+                                                            npoints, fwhm, .FALSE.)
+      CALL ecd_periodic_implicit_gamma_velocity_response_g10(qs_env, ecd_section, gamma_context, gamma_operators, &
+                                                              transition_band_range, energy_range, npoints, fwhm, &
+                                                              electric_gauge == ecd_gauge_velocity, velocity_response_zero, &
+                                                              velocity_response_first)
+      CALL ecd_periodic_implicit_gamma_length_response_g13(qs_env, ecd_section, gamma_context, gamma_operators, &
+                                                            transition_band_range, energy_range, npoints, fwhm, &
+                                                            electric_gauge == ecd_gauge_length, velocity_response_zero, &
+                                                            velocity_response_first)
+      DEALLOCATE (velocity_response_first, velocity_response_zero)
       CALL ecd_gamma_zero_order_operators_release(gamma_operators)
       CALL ecd_gamma_context_release(gamma_context)
 
@@ -1075,6 +1087,133 @@ CONTAINS
    END SUBROUTINE ecd_periodic_implicit_gamma_transition_g9
 
 ! **************************************************************************************************
+!> \brief Assemble and diagnose the first-order length-gauge Gamma transition coefficient.
+! **************************************************************************************************
+   SUBROUTINE ecd_periodic_implicit_gamma_length_transition_g12(context, transition_band_range)
+      TYPE(ecd_gamma_context_type), INTENT(IN), TARGET  :: context
+      INTEGER, DIMENSION(2), INTENT(IN)                 :: transition_band_range
+
+      REAL(KIND=dp), PARAMETER                          :: occupation_threshold = 1.0E-8_dp
+
+      COMPLEX(KIND=dp), ALLOCATABLE, DIMENSION(:, :)    :: length_first_mo, length_first_rotated, &
+                                                           length_zero_mo, length_zero_rotated, &
+                                                           state_first, transition_first
+      INTEGER                                           :: first_band, iband, idir, ispin, ivirt, last_band, nmo, &
+                                                           ntransitions
+      REAL(KIND=dp)                                     :: gap, gap_derivative, operator_first_norm_sq, &
+                                                           state_first_norm_sq, total_first_norm_sq, zero_order_norm_sq
+      TYPE(cp_logger_type), POINTER                     :: logger
+
+      NULLIFY (logger)
+      IF (.NOT. ASSOCIATED(context%length_taylor_real) .OR. .NOT. ASSOCIATED(context%length_taylor_imag)) THEN
+         CPABORT("ECD| Stage G12 requires retained length Taylor coefficients")
+      END IF
+      IF (SIZE(context%length_taylor_real, 1) /= ncart .OR. SIZE(context%length_taylor_imag, 1) /= ncart .OR. &
+          SIZE(context%length_taylor_real, 2) < 2 .OR. SIZE(context%length_taylor_imag, 2) < 2) THEN
+         CPABORT("ECD| Stage G12 length Taylor coefficient dimensions are inconsistent")
+      END IF
+      logger => cp_get_default_logger()
+
+      DO ispin = 1, context%nspin
+         nmo = context%spin(ispin)%nmo
+         IF (nmo < 1 .OR. .NOT. ASSOCIATED(context%spin(ispin)%eigenvalue_first) .OR. &
+             .NOT. ASSOCIATED(context%spin(ispin)%eigenvalue_reference) .OR. &
+             .NOT. ASSOCIATED(context%spin(ispin)%mo_coeff) .OR. &
+             .NOT. ASSOCIATED(context%spin(ispin)%manifolds) .OR. &
+             .NOT. ALLOCATED(context%spin(ispin)%band_rotation) .OR. &
+             .NOT. ALLOCATED(context%spin(ispin)%coefficient_first)) THEN
+            CPABORT("ECD| Stage G12 state-response data are incomplete")
+         END IF
+         IF (SIZE(context%spin(ispin)%eigenvalue_first) /= nmo .OR. &
+             SIZE(context%spin(ispin)%eigenvalue_reference) /= nmo .OR. &
+             SIZE(context%spin(ispin)%band_rotation, 1) /= nmo .OR. &
+             SIZE(context%spin(ispin)%band_rotation, 2) /= nmo .OR. &
+             SIZE(context%spin(ispin)%coefficient_first, 1) /= nmo .OR. &
+             SIZE(context%spin(ispin)%coefficient_first, 2) /= nmo) THEN
+            CPABORT("ECD| Stage G12 retained state-response dimensions are inconsistent")
+         END IF
+         IF (ALL(transition_band_range == -1)) THEN
+            first_band = 1
+            last_band = nmo
+         ELSE
+            first_band = transition_band_range(1)
+            last_band = transition_band_range(2)
+            CALL ecd_band_manifolds_validate_window(context%spin(ispin)%manifolds, transition_band_range)
+         END IF
+         IF (first_band < 1 .OR. last_band > nmo .OR. first_band > last_band) THEN
+            CPABORT("ECD| Stage G12 transition band range is inconsistent with the Gamma MO space")
+         END IF
+
+         ntransitions = 0
+         operator_first_norm_sq = 0.0_dp
+         state_first_norm_sq = 0.0_dp
+         total_first_norm_sq = 0.0_dp
+         zero_order_norm_sq = 0.0_dp
+         DO idir = 1, ncart
+            CALL ecd_project_complex_operator_to_mo(context%length_taylor_real(idir, 1), &
+                                                    context%length_taylor_imag(idir, 1), &
+                                                    context%spin(ispin)%mo_coeff, context%spin(ispin)%nao, nmo, &
+                                                    length_zero_mo)
+            CALL ecd_project_complex_operator_to_mo(context%length_taylor_real(idir, 2), &
+                                                    context%length_taylor_imag(idir, 2), &
+                                                    context%spin(ispin)%mo_coeff, context%spin(ispin)%nao, nmo, &
+                                                    length_first_mo)
+            ALLOCATE (length_first_rotated(nmo, nmo), length_zero_rotated(nmo, nmo), state_first(nmo, nmo), &
+                      transition_first(nmo, nmo))
+            length_zero_rotated = MATMUL(CONJG(TRANSPOSE(context%spin(ispin)%band_rotation)), &
+                                          MATMUL(length_zero_mo, context%spin(ispin)%band_rotation))
+            length_first_rotated = MATMUL(CONJG(TRANSPOSE(context%spin(ispin)%band_rotation)), &
+                                           MATMUL(length_first_mo, context%spin(ispin)%band_rotation))
+            state_first = 0.5_dp*(MATMUL(CONJG(TRANSPOSE(context%spin(ispin)%coefficient_first)), &
+                                          length_zero_rotated) - &
+                                    MATMUL(length_zero_rotated, context%spin(ispin)%coefficient_first))
+
+            DO iband = first_band, last_band
+               IF (context%spin(ispin)%occupations(iband) <= occupation_threshold) CYCLE
+               DO ivirt = first_band, last_band
+                  IF (context%spin(ispin)%occupations(ivirt) > occupation_threshold) CYCLE
+                  gap = context%spin(ispin)%eigenvalue_reference(ivirt) - &
+                        context%spin(ispin)%eigenvalue_reference(iband)
+                  IF (gap <= SQRT(TINY(1.0_dp))) THEN
+                     CPABORT("ECD| Stage G12 requires positive occupied-to-empty transition gaps")
+                  END IF
+                  gap_derivative = 0.5_dp*(context%spin(ispin)%eigenvalue_first(ivirt) + &
+                                           context%spin(ispin)%eigenvalue_first(iband))
+                  IF (idir == 1) ntransitions = ntransitions + 1
+                  zero_order_norm_sq = zero_order_norm_sq + ABS(-gap*length_zero_rotated(ivirt, iband))**2
+                  operator_first_norm_sq = operator_first_norm_sq + &
+                     ABS(-gap_derivative*length_zero_rotated(ivirt, iband) - &
+                         gap*length_first_rotated(ivirt, iband))**2
+                  state_first_norm_sq = state_first_norm_sq + ABS(-gap*state_first(ivirt, iband))**2
+                  transition_first(ivirt, iband) = -gap_derivative*length_zero_rotated(ivirt, iband) - &
+                                                    gap*(length_first_rotated(ivirt, iband) + &
+                                                         state_first(ivirt, iband))
+                  total_first_norm_sq = total_first_norm_sq + ABS(transition_first(ivirt, iband))**2
+               END DO
+            END DO
+            DEALLOCATE (length_first_mo, length_first_rotated, length_zero_mo, length_zero_rotated, &
+                        state_first, transition_first)
+         END DO
+         IF (ntransitions < 1) THEN
+            CPABORT("ECD| Stage G12 found no occupied-to-empty transitions")
+         END IF
+         IF (cp_logger_get_default_io_unit(logger) > 0) THEN
+            WRITE (cp_logger_get_default_io_unit(logger), '(T2,A,I2,T55,I10)') &
+               'ECD| Stage G12 selected transitions spin', ispin, ntransitions
+            WRITE (cp_logger_get_default_io_unit(logger), '(T2,A,I2,T55,ES14.6)') &
+               'ECD| Stage G12 zero-order transition norm spin', ispin, SQRT(zero_order_norm_sq)
+            WRITE (cp_logger_get_default_io_unit(logger), '(T2,A,I2,T55,ES14.6)') &
+               'ECD| Stage G12 operator first-order norm spin', ispin, SQRT(operator_first_norm_sq)
+            WRITE (cp_logger_get_default_io_unit(logger), '(T2,A,I2,T55,ES14.6)') &
+               'ECD| Stage G12 state first-order norm spin', ispin, SQRT(state_first_norm_sq)
+            WRITE (cp_logger_get_default_io_unit(logger), '(T2,A,I2,T55,ES14.6)') &
+               'ECD| Stage G12 complete first-order norm spin', ispin, SQRT(total_first_norm_sq)
+         END IF
+      END DO
+
+   END SUBROUTINE ecd_periodic_implicit_gamma_length_transition_g12
+
+! **************************************************************************************************
 !> \brief Allocate external-translation matrices from the exact real-space task-list block contract.
 !>
 !> The distributed gather path addresses atom_pair_send while the replicated-grid
@@ -1243,6 +1382,67 @@ CONTAINS
    END SUBROUTINE ecd_periodic_implicit_gamma_current_g4
 
 ! **************************************************************************************************
+!> \brief Build and validate the first-order length-gauge position vertex at implicit Gamma.
+! **************************************************************************************************
+   SUBROUTINE ecd_periodic_implicit_gamma_length_g11(qs_env, context, gamma_operators)
+      TYPE(qs_environment_type), POINTER                 :: qs_env
+      TYPE(ecd_gamma_context_type), INTENT(INOUT), TARGET :: context
+      TYPE(ecd_gamma_zero_order_operators_type), INTENT(IN), TARGET :: gamma_operators
+
+      INTEGER                                            :: idir
+      REAL(KIND=dp)                                      :: first_imag_norm_sq, first_real_norm_sq, &
+                                                            residual_norm_sq, zero_norm_sq
+      TYPE(cp_logger_type), POINTER                      :: logger
+      TYPE(dbcsr_p_type), DIMENSION(:), POINTER          :: complete_current, gth_current, local_current, &
+                                                            position, position_general, residual, length_moments
+
+      NULLIFY (complete_current, gth_current, local_current, length_moments, logger, position, position_general, &
+               residual)
+      IF (ASSOCIATED(context%length_taylor_real) .OR. ASSOCIATED(context%length_taylor_imag)) THEN
+         CPABORT("ECD| Stage G11 length Taylor coefficients are already allocated")
+      END IF
+      CALL ecd_gamma_zero_order_operators_get(gamma_operators, position, local_current, gth_current, complete_current)
+      CALL ecd_periodic_ao_set_create(length_moments, ncoset(2) - 1, context%matrix_s(1)%matrix, context%sab_orb, &
+                                      'ECD G11 length moments', dbcsr_type_symmetric)
+      CALL build_local_moment_matrix(qs_env, length_moments, 2, ref_point=context%ref_point)
+      CALL ecd_periodic_length_taylor_build(context%length_taylor_real, context%length_taylor_imag, length_moments, &
+                                            context%sab_all, context%matrix_s(1)%matrix, context%direction)
+
+      CALL ecd_periodic_ao_vector_create(position_general, context%matrix_s(1)%matrix, context%sab_all, &
+                                         'ECD G11 position general', dbcsr_type_no_symmetry)
+      CALL ecd_periodic_ao_vector_create(residual, context%matrix_s(1)%matrix, context%sab_all, &
+                                         'ECD G11 length zero residual', dbcsr_type_no_symmetry)
+      logger => cp_get_default_logger()
+      DO idir = 1, ncart
+         CALL dbcsr_desymmetrize(position(idir)%matrix, position_general(idir)%matrix)
+         CALL dbcsr_set(residual(idir)%matrix, 0.0_dp)
+         CALL dbcsr_add(residual(idir)%matrix, context%length_taylor_real(idir, 1)%matrix, 0.0_dp, 1.0_dp)
+         CALL dbcsr_add(residual(idir)%matrix, position_general(idir)%matrix, 1.0_dp, -1.0_dp)
+         CALL dbcsr_dot(context%length_taylor_real(idir, 1)%matrix, &
+                        context%length_taylor_real(idir, 1)%matrix, zero_norm_sq)
+         CALL dbcsr_dot(context%length_taylor_real(idir, 2)%matrix, &
+                        context%length_taylor_real(idir, 2)%matrix, first_real_norm_sq)
+         CALL dbcsr_dot(context%length_taylor_imag(idir, 2)%matrix, &
+                        context%length_taylor_imag(idir, 2)%matrix, first_imag_norm_sq)
+         CALL dbcsr_dot(residual(idir)%matrix, residual(idir)%matrix, residual_norm_sq)
+         IF (cp_logger_get_default_io_unit(logger) > 0) THEN
+            WRITE (cp_logger_get_default_io_unit(logger), '(T2,A,I1,T55,ES14.6)') &
+               'ECD| Stage G11 length zero norm component', idir, SQRT(ABS(zero_norm_sq))
+            WRITE (cp_logger_get_default_io_unit(logger), '(T2,A,I1,T55,ES14.6)') &
+               'ECD| Stage G11 length zero residual component', idir, SQRT(ABS(residual_norm_sq))
+            WRITE (cp_logger_get_default_io_unit(logger), '(T2,A,I1,T55,ES14.6)') &
+               'ECD| Stage G11 length first real norm component', idir, SQRT(ABS(first_real_norm_sq))
+            WRITE (cp_logger_get_default_io_unit(logger), '(T2,A,I1,T55,ES14.6)') &
+               'ECD| Stage G11 length first imaginary norm component', idir, SQRT(ABS(first_imag_norm_sq))
+         END IF
+      END DO
+      CALL dbcsr_deallocate_matrix_set(position_general)
+      CALL dbcsr_deallocate_matrix_set(residual)
+      CALL dbcsr_deallocate_matrix_set(length_moments)
+
+   END SUBROUTINE ecd_periodic_implicit_gamma_length_g11
+
+! **************************************************************************************************
 !> \brief Assemble the implicit-Gamma zeroth-order causal dielectric response.
 !>
 !> The q=0 response is a production baseline for the subsequent finite-q ECD
@@ -1251,12 +1451,13 @@ CONTAINS
 ! **************************************************************************************************
    SUBROUTINE ecd_periodic_implicit_gamma_zero_order_response(qs_env, ecd_section, context, operators, &
                                                                electric_gauge, transition_band_range, energy_range, &
-                                                               npoints, fwhm)
+                                                               npoints, fwhm, write_response)
       TYPE(qs_environment_type), POINTER                 :: qs_env
       TYPE(section_vals_type), POINTER                   :: ecd_section
       TYPE(ecd_gamma_context_type), INTENT(IN)           :: context
       TYPE(ecd_gamma_zero_order_operators_type), INTENT(IN), TARGET :: operators
       INTEGER, INTENT(IN)                                :: electric_gauge, npoints
+      LOGICAL, INTENT(IN)                                :: write_response
       INTEGER, DIMENSION(2), INTENT(IN)                  :: transition_band_range
       REAL(KIND=dp), DIMENSION(2), INTENT(IN)            :: energy_range
       REAL(KIND=dp), INTENT(IN)                          :: fwhm
@@ -1431,12 +1632,539 @@ CONTAINS
          WRITE (cp_logger_get_default_io_unit(logger), '(T2,A,T55,ES14.6)') &
             'ECD| Stage G2 maximum gauge residual norm', gauge_residual_max
       END IF
-      CALL ecd_periodic_print_zero_order_response_tensor(ecd_section, energy_range, response_zero)
+      IF (write_response) THEN
+         CALL ecd_periodic_print_zero_order_response_tensor(ecd_section, energy_range, response_zero)
+      END IF
 
       DEALLOCATE (alternate_counter, alternate_resonant, alternate_response, response_counter, response_resonant, &
                   response_zero)
 
    END SUBROUTINE ecd_periodic_implicit_gamma_zero_order_response
+
+! **************************************************************************************************
+!> \brief Assemble the first-order velocity-gauge causal response from retained Gamma providers.
+! **************************************************************************************************
+   SUBROUTINE ecd_periodic_implicit_gamma_velocity_response_g10(qs_env, ecd_section, context, operators, &
+                                                                 transition_band_range, energy_range, npoints, fwhm, &
+                                                                 write_response, response_zero_output, response_first_output)
+      TYPE(qs_environment_type), POINTER                 :: qs_env
+      TYPE(section_vals_type), POINTER                   :: ecd_section
+      TYPE(ecd_gamma_context_type), INTENT(IN), TARGET   :: context
+      TYPE(ecd_gamma_zero_order_operators_type), INTENT(IN), TARGET :: operators
+      INTEGER, DIMENSION(2), INTENT(IN)                  :: transition_band_range
+      LOGICAL, INTENT(IN)                                :: write_response
+      REAL(KIND=dp), DIMENSION(2), INTENT(IN)            :: energy_range
+      INTEGER, INTENT(IN)                                :: npoints
+      REAL(KIND=dp), INTENT(IN)                          :: fwhm
+      COMPLEX(KIND=dp), ALLOCATABLE, DIMENSION(:, :, :), INTENT(OUT) :: response_first_output, response_zero_output
+
+      REAL(KIND=dp), PARAMETER                           :: occupation_threshold = 1.0E-8_dp
+
+      COMPLEX(KIND=dp), ALLOCATABLE, DIMENSION(:, :)     :: current_first_mo, current_first_rotated, &
+                                                            current_zero_mo, current_zero_rotated, position_rotated, &
+                                                            state_first, transition_first
+      COMPLEX(KIND=dp), ALLOCATABLE, DIMENSION(:, :, :)  :: alternate_counter, alternate_counter_taylor, &
+                                                            alternate_resonant, alternate_resonant_taylor, &
+                                                            alternate_response, &
+                                                            counter_taylor, current_first_components, current_zero_components, &
+                                                            position_components, resonant_taylor, response_counter, &
+                                                            response_first, response_first_counter, response_resonant, &
+                                                            response_zero
+      COMPLEX(KIND=dp), ALLOCATABLE, DIMENSION(:, :)     :: alternate_taylor, transition_taylor
+      INTEGER                                            :: first_band, iband, idir, ipoint, ispin, ivirt, last_band, &
+                                                            nmo, ntransitions
+      LOGICAL                                            :: gth_available
+      REAL(KIND=dp)                                      :: antisymmetric_first_norm, cell_volume, gap, gap_derivative, &
+                                                            gauge_residual_max, gauge_residual_norm, occupation_difference, &
+                                                            photon_energy, prefactor, response_counter_norm, &
+                                                            response_first_counter_norm, response_first_norm, &
+                                                            response_first_resonant_norm, response_norm, &
+                                                            response_resonant_norm
+      REAL(KIND=dp), ALLOCATABLE, DIMENSION(:)           :: alternate_gap_taylor, gap_taylor
+      REAL(KIND=dp), ALLOCATABLE, DIMENSION(:, :)        :: position_buffer
+      REAL(KIND=dp), DIMENSION(ncart, ncart)             :: diamagnetic_kernel
+      TYPE(cp_fm_type)                                   :: position_mo
+      TYPE(cp_logger_type), POINTER                      :: logger
+      TYPE(dbcsr_p_type), DIMENSION(:), POINTER          :: complete_current, gth_current, local_current, position
+
+      NULLIFY (complete_current, gth_current, local_current, logger, position)
+      IF (.NOT. ASSOCIATED(context%current_taylor_real) .OR. .NOT. ASSOCIATED(context%current_taylor_imag)) THEN
+         CPABORT("ECD| Stage G10 requires retained current Taylor coefficients")
+      END IF
+      IF (SIZE(context%current_taylor_real, 1) /= ncart .OR. SIZE(context%current_taylor_imag, 1) /= ncart .OR. &
+          SIZE(context%current_taylor_real, 2) < 2 .OR. SIZE(context%current_taylor_imag, 2) < 2) THEN
+         CPABORT("ECD| Stage G10 current Taylor coefficient dimensions are inconsistent")
+      END IF
+      IF (fwhm <= 0.0_dp) THEN
+         CPABORT("ECD| Stage G10 requires a positive FWHM")
+      END IF
+      cell_volume = ABS(context%cell%deth)
+      IF (cell_volume <= 0.0_dp) THEN
+         CPABORT("ECD| Stage G10 requires a positive cell volume")
+      END IF
+      CALL ecd_gamma_zero_order_operators_get(operators, position, local_current, gth_current, complete_current, &
+                                               gth_available)
+
+      ALLOCATE (alternate_counter(ncart, ncart, npoints), alternate_resonant(ncart, ncart, npoints), &
+                alternate_response(ncart, ncart, npoints), response_counter(ncart, ncart, npoints), &
+                response_first(ncart, ncart, npoints), response_first_counter(ncart, ncart, npoints), &
+                response_resonant(ncart, ncart, npoints), response_zero(ncart, ncart, npoints))
+      alternate_counter = CMPLX(0.0_dp, 0.0_dp, KIND=dp)
+      alternate_resonant = CMPLX(0.0_dp, 0.0_dp, KIND=dp)
+      response_counter = CMPLX(0.0_dp, 0.0_dp, KIND=dp)
+      response_first = CMPLX(0.0_dp, 0.0_dp, KIND=dp)
+      response_first_counter = CMPLX(0.0_dp, 0.0_dp, KIND=dp)
+      response_resonant = CMPLX(0.0_dp, 0.0_dp, KIND=dp)
+
+      logger => cp_get_default_logger()
+      DO ispin = 1, context%nspin
+         nmo = context%spin(ispin)%nmo
+         IF (nmo < 1 .OR. .NOT. ASSOCIATED(context%spin(ispin)%eigenvalue_first) .OR. &
+             .NOT. ASSOCIATED(context%spin(ispin)%eigenvalue_reference) .OR. &
+             .NOT. ASSOCIATED(context%spin(ispin)%mo_coeff) .OR. &
+             .NOT. ASSOCIATED(context%spin(ispin)%manifolds) .OR. &
+             .NOT. ALLOCATED(context%spin(ispin)%band_rotation) .OR. &
+             .NOT. ALLOCATED(context%spin(ispin)%coefficient_first)) THEN
+            CPABORT("ECD| Stage G10 state-response data are incomplete")
+         END IF
+         IF (SIZE(context%spin(ispin)%eigenvalue_first) /= nmo .OR. &
+             SIZE(context%spin(ispin)%eigenvalue_reference) /= nmo .OR. &
+             SIZE(context%spin(ispin)%band_rotation, 1) /= nmo .OR. &
+             SIZE(context%spin(ispin)%band_rotation, 2) /= nmo .OR. &
+             SIZE(context%spin(ispin)%coefficient_first, 1) /= nmo .OR. &
+             SIZE(context%spin(ispin)%coefficient_first, 2) /= nmo) THEN
+            CPABORT("ECD| Stage G10 retained state-response dimensions are inconsistent")
+         END IF
+         IF (ALL(transition_band_range == -1)) THEN
+            first_band = 1
+            last_band = nmo
+         ELSE
+            first_band = transition_band_range(1)
+            last_band = transition_band_range(2)
+            CALL ecd_band_manifolds_validate_window(context%spin(ispin)%manifolds, transition_band_range)
+         END IF
+         IF (first_band < 1 .OR. last_band > nmo .OR. first_band > last_band) THEN
+            CPABORT("ECD| Stage G10 transition band range is inconsistent with the Gamma MO space")
+         END IF
+
+         ALLOCATE (current_first_components(nmo, nmo, ncart), current_zero_components(nmo, nmo, ncart), &
+                   position_components(nmo, nmo, ncart))
+         DO idir = 1, ncart
+            CALL ecd_project_complex_operator_to_mo(context%current_taylor_real(idir, 1), &
+                                                    context%current_taylor_imag(idir, 1), &
+                                                    context%spin(ispin)%mo_coeff, context%spin(ispin)%nao, nmo, &
+                                                    current_zero_mo)
+            CALL ecd_project_complex_operator_to_mo(context%current_taylor_real(idir, 2), &
+                                                    context%current_taylor_imag(idir, 2), &
+                                                    context%spin(ispin)%mo_coeff, context%spin(ispin)%nao, nmo, &
+                                                    current_first_mo)
+            CALL ecd_project_real_operator_to_mo(position(idir), context%spin(ispin)%mo_coeff, &
+                                                 context%spin(ispin)%nao, nmo, position_mo)
+            ALLOCATE (current_first_rotated(nmo, nmo), current_zero_rotated(nmo, nmo), position_buffer(nmo, nmo), &
+                      position_rotated(nmo, nmo), state_first(nmo, nmo), transition_first(nmo, nmo))
+            current_zero_rotated = MATMUL(CONJG(TRANSPOSE(context%spin(ispin)%band_rotation)), &
+                                           MATMUL(current_zero_mo, context%spin(ispin)%band_rotation))
+            current_first_rotated = MATMUL(CONJG(TRANSPOSE(context%spin(ispin)%band_rotation)), &
+                                            MATMUL(current_first_mo, context%spin(ispin)%band_rotation))
+            CALL cp_fm_get_submatrix(position_mo, position_buffer)
+            position_rotated = MATMUL(CONJG(TRANSPOSE(context%spin(ispin)%band_rotation)), &
+                                      MATMUL(CMPLX(position_buffer, 0.0_dp, KIND=dp), &
+                                             context%spin(ispin)%band_rotation))
+            state_first = 0.5_dp*(MATMUL(CONJG(TRANSPOSE(context%spin(ispin)%coefficient_first)), &
+                                          current_zero_rotated) - &
+                                    MATMUL(current_zero_rotated, context%spin(ispin)%coefficient_first))
+            transition_first = current_first_rotated + state_first
+            current_zero_components(:, :, idir) = current_zero_rotated
+            current_first_components(:, :, idir) = transition_first
+            position_components(:, :, idir) = position_rotated
+            DEALLOCATE (current_first_mo, current_first_rotated, current_zero_mo, current_zero_rotated, &
+                        position_buffer, position_rotated, state_first, transition_first)
+            CALL cp_fm_release(position_mo)
+         END DO
+
+         ALLOCATE (alternate_counter_taylor(ncart, ncart, 0:0), alternate_gap_taylor(0:0), &
+                   alternate_resonant_taylor(ncart, ncart, 0:0), alternate_taylor(ncart, 0:0), &
+                   counter_taylor(ncart, ncart, 0:1), gap_taylor(0:1), resonant_taylor(ncart, ncart, 0:1), &
+                   transition_taylor(ncart, 0:1))
+         ntransitions = 0
+         DO iband = first_band, last_band
+            IF (context%spin(ispin)%occupations(iband) <= occupation_threshold) CYCLE
+            DO ivirt = first_band, last_band
+               IF (context%spin(ispin)%occupations(ivirt) > occupation_threshold) CYCLE
+               gap = context%spin(ispin)%eigenvalue_reference(ivirt) - &
+                     context%spin(ispin)%eigenvalue_reference(iband)
+               IF (gap <= SQRT(TINY(1.0_dp))) THEN
+                  CPABORT("ECD| Stage G10 requires positive occupied-to-empty transition gaps")
+               END IF
+               occupation_difference = context%spin(ispin)%occupations(iband) - &
+                                       context%spin(ispin)%occupations(ivirt)
+               IF (occupation_difference <= occupation_threshold) CYCLE
+               gap_derivative = 0.5_dp*(context%spin(ispin)%eigenvalue_first(ivirt) + &
+                                        context%spin(ispin)%eigenvalue_first(iband))
+               gap_taylor(0) = gap
+               gap_taylor(1) = gap_derivative
+               alternate_gap_taylor(0) = gap
+               DO idir = 1, ncart
+                  transition_taylor(idir, 0) = current_zero_components(ivirt, iband, idir)
+                  transition_taylor(idir, 1) = current_first_components(ivirt, iband, idir)
+                  alternate_taylor(idir, 0) = -gap*position_components(ivirt, iband, idir)
+               END DO
+               ntransitions = ntransitions + 1
+               DO ipoint = 1, npoints
+                  photon_energy = energy_range(1) + REAL(ipoint - 1, KIND=dp)* &
+                                  (energy_range(2) - energy_range(1))/REAL(npoints - 1, KIND=dp)
+                  prefactor = -2.0_dp*twopi/(cell_volume*photon_energy**2)
+                  CALL ecd_taylor_retarded_response(transition_taylor, gap_taylor, photon_energy, 0.5_dp*fwhm, &
+                                                     resonant_taylor, counter_taylor)
+                  response_resonant(:, :, ipoint) = response_resonant(:, :, ipoint) + &
+                                                     prefactor*occupation_difference*resonant_taylor(:, :, 0)
+                  response_counter(:, :, ipoint) = response_counter(:, :, ipoint) + &
+                                                    prefactor*occupation_difference*counter_taylor(:, :, 0)
+                  response_first(:, :, ipoint) = response_first(:, :, ipoint) + &
+                                                  prefactor*occupation_difference*resonant_taylor(:, :, 1)
+                  response_first_counter(:, :, ipoint) = response_first_counter(:, :, ipoint) + &
+                                                          prefactor*occupation_difference*counter_taylor(:, :, 1)
+                  CALL ecd_taylor_retarded_response(alternate_taylor, alternate_gap_taylor, photon_energy, &
+                                                     0.5_dp*fwhm, alternate_resonant_taylor, alternate_counter_taylor)
+                  alternate_resonant(:, :, ipoint) = alternate_resonant(:, :, ipoint) + &
+                                                      prefactor*occupation_difference*alternate_resonant_taylor(:, :, 0)
+                  alternate_counter(:, :, ipoint) = alternate_counter(:, :, ipoint) + &
+                                                     prefactor*occupation_difference*alternate_counter_taylor(:, :, 0)
+               END DO
+            END DO
+         END DO
+         IF (ntransitions < 1) THEN
+            CPABORT("ECD| Stage G10 found no occupied-to-empty transitions")
+         END IF
+         DEALLOCATE (alternate_counter_taylor, alternate_gap_taylor, alternate_resonant_taylor, alternate_taylor, &
+                     counter_taylor, current_first_components, current_zero_components, gap_taylor, &
+                     position_components, resonant_taylor, transition_taylor)
+      END DO
+
+      CALL ecd_periodic_implicit_gamma_diamagnetic_kernel(qs_env, context, gth_available, diamagnetic_kernel)
+      response_zero = response_resonant + response_counter
+      alternate_response = alternate_resonant + alternate_counter
+      DO ipoint = 1, npoints
+         photon_energy = energy_range(1) + REAL(ipoint - 1, KIND=dp)* &
+                         (energy_range(2) - energy_range(1))/REAL(npoints - 1, KIND=dp)
+         prefactor = 2.0_dp*twopi/(cell_volume*photon_energy**2)
+         response_zero(:, :, ipoint) = response_zero(:, :, ipoint) + &
+                                        CMPLX(prefactor*diamagnetic_kernel, 0.0_dp, KIND=dp)
+         alternate_response(:, :, ipoint) = alternate_response(:, :, ipoint) + &
+                                             CMPLX(prefactor*diamagnetic_kernel, 0.0_dp, KIND=dp)
+      END DO
+      response_first = response_first + response_first_counter
+
+      gauge_residual_max = 0.0_dp
+      DO ipoint = 1, npoints
+         gauge_residual_norm = SQRT(SUM(ABS(response_zero(:, :, ipoint) - alternate_response(:, :, ipoint))**2))
+         gauge_residual_max = MAX(gauge_residual_max, gauge_residual_norm)
+      END DO
+      ipoint = (npoints + 1)/2
+      photon_energy = energy_range(1) + REAL(ipoint - 1, KIND=dp)* &
+                      (energy_range(2) - energy_range(1))/REAL(npoints - 1, KIND=dp)
+      gauge_residual_norm = SQRT(SUM(ABS(response_zero(:, :, ipoint) - alternate_response(:, :, ipoint))**2))
+      response_resonant_norm = SQRT(SUM(ABS(response_resonant(:, :, ipoint))**2))
+      response_counter_norm = SQRT(SUM(ABS(response_counter(:, :, ipoint))**2))
+      response_first_resonant_norm = SQRT(SUM(ABS(response_first(:, :, ipoint) - &
+                                                       response_first_counter(:, :, ipoint))**2))
+      response_first_counter_norm = SQRT(SUM(ABS(response_first_counter(:, :, ipoint))**2))
+      response_norm = SQRT(SUM(ABS(response_zero(:, :, ipoint))**2))
+      response_first_norm = SQRT(SUM(ABS(response_first(:, :, ipoint))**2))
+      antisymmetric_first_norm = 0.5_dp*SQRT(SUM(ABS(response_first(:, :, ipoint) - &
+                                                       TRANSPOSE(response_first(:, :, ipoint)))**2))
+      IF (cp_logger_get_default_io_unit(logger) > 0) THEN
+         WRITE (cp_logger_get_default_io_unit(logger), '(T2,A,T55,I10)') &
+            'ECD| Stage G10 velocity response grid points', npoints
+         WRITE (cp_logger_get_default_io_unit(logger), '(T2,A,T55,ES14.6)') &
+            'ECD| Stage G10 midpoint photon energy [hartree]', photon_energy
+         WRITE (cp_logger_get_default_io_unit(logger), '(T2,A,T55,ES14.6)') &
+            'ECD| Stage G10 midpoint resonant zeroth-order norm', response_resonant_norm
+         WRITE (cp_logger_get_default_io_unit(logger), '(T2,A,T55,ES14.6)') &
+            'ECD| Stage G10 midpoint counter zeroth-order norm', response_counter_norm
+         WRITE (cp_logger_get_default_io_unit(logger), '(T2,A,T55,ES14.6)') &
+            'ECD| Stage G10 midpoint full zeroth-order norm', response_norm
+         WRITE (cp_logger_get_default_io_unit(logger), '(T2,A,T55,ES14.6)') &
+            'ECD| Stage G10 midpoint resonant first-order norm', response_first_resonant_norm
+         WRITE (cp_logger_get_default_io_unit(logger), '(T2,A,T55,ES14.6)') &
+            'ECD| Stage G10 midpoint counter first-order norm', response_first_counter_norm
+         WRITE (cp_logger_get_default_io_unit(logger), '(T2,A,T55,ES14.6)') &
+            'ECD| Stage G10 midpoint full first-order norm', response_first_norm
+         WRITE (cp_logger_get_default_io_unit(logger), '(T2,A,T55,ES14.6)') &
+            'ECD| Stage G10 midpoint antisymmetric first-order norm', antisymmetric_first_norm
+         WRITE (cp_logger_get_default_io_unit(logger), '(T2,A,T55,ES14.6)') &
+            'ECD| Stage G10 midpoint zero-order gauge residual norm', gauge_residual_norm
+         WRITE (cp_logger_get_default_io_unit(logger), '(T2,A,T55,ES14.6)') &
+            'ECD| Stage G10 maximum zero-order gauge residual norm', gauge_residual_max
+      END IF
+      ALLOCATE (response_zero_output(ncart, ncart, npoints), response_first_output(ncart, ncart, npoints))
+      response_zero_output = response_zero
+      response_first_output = response_first
+      IF (write_response) THEN
+         CALL ecd_periodic_print_response_tensor(ecd_section, energy_range, response_zero, response_first)
+         CALL ecd_periodic_print_maxwell_spectrum(ecd_section, energy_range, context%direction, response_zero, &
+                                                  response_first)
+      END IF
+
+      DEALLOCATE (alternate_counter, alternate_resonant, alternate_response, response_counter, response_first, &
+                  response_first_counter, response_resonant, response_zero)
+
+   END SUBROUTINE ecd_periodic_implicit_gamma_velocity_response_g10
+
+! **************************************************************************************************
+!> \brief Assemble the first-order length-gauge causal response and compare it with the velocity tensor.
+! **************************************************************************************************
+   SUBROUTINE ecd_periodic_implicit_gamma_length_response_g13(qs_env, ecd_section, context, operators, &
+                                                               transition_band_range, energy_range, npoints, fwhm, &
+                                                               write_response, velocity_response_zero, &
+                                                               velocity_response_first)
+      TYPE(qs_environment_type), POINTER                 :: qs_env
+      TYPE(section_vals_type), POINTER                   :: ecd_section
+      TYPE(ecd_gamma_context_type), INTENT(IN), TARGET   :: context
+      TYPE(ecd_gamma_zero_order_operators_type), INTENT(IN), TARGET :: operators
+      INTEGER, DIMENSION(2), INTENT(IN)                  :: transition_band_range
+      LOGICAL, INTENT(IN)                                :: write_response
+      REAL(KIND=dp), DIMENSION(2), INTENT(IN)            :: energy_range
+      INTEGER, INTENT(IN)                                :: npoints
+      REAL(KIND=dp), INTENT(IN)                          :: fwhm
+      COMPLEX(KIND=dp), DIMENSION(:, :, :), INTENT(IN)   :: velocity_response_first, velocity_response_zero
+
+      REAL(KIND=dp), PARAMETER                           :: occupation_threshold = 1.0E-8_dp
+
+      COMPLEX(KIND=dp), ALLOCATABLE, DIMENSION(:, :)     :: length_first_mo, length_first_rotated, &
+                                                            length_zero_mo, length_zero_rotated, state_first, &
+                                                            transition_first
+      COMPLEX(KIND=dp), ALLOCATABLE, DIMENSION(:, :, :)  :: response_counter, response_first, &
+                                                            response_first_counter, response_first_resonant, &
+                                                            response_resonant, response_zero
+      COMPLEX(KIND=dp), ALLOCATABLE, DIMENSION(:, :, :)  :: length_first_components, length_zero_components
+      COMPLEX(KIND=dp), ALLOCATABLE, DIMENSION(:, :)     :: transition_taylor
+      COMPLEX(KIND=dp), DIMENSION(ncart, ncart, 0:1)     :: counter_taylor, resonant_taylor
+      INTEGER                                            :: first_band, iband, idir, ipoint, ispin, ivirt, last_band, &
+                                                            nmo, ntransitions
+      LOGICAL                                            :: gth_available
+      REAL(KIND=dp)                                      :: antisymmetric_first_norm, cell_volume, gap, gap_derivative, &
+                                                            gauge_first_residual_max, gauge_first_residual_norm, &
+                                                            gauge_zero_residual_max, gauge_zero_residual_norm, &
+                                                            occupation_difference, photon_energy, prefactor, &
+                                                            response_counter_norm, response_first_counter_norm, &
+                                                            response_first_norm, response_first_resonant_norm, &
+                                                            response_norm, response_resonant_norm
+      REAL(KIND=dp), DIMENSION(0:1)                      :: gap_taylor
+      REAL(KIND=dp), DIMENSION(ncart, ncart)             :: diamagnetic_kernel
+      TYPE(cp_logger_type), POINTER                      :: logger
+      TYPE(dbcsr_p_type), DIMENSION(:), POINTER          :: complete_current, gth_current, local_current, position
+
+      NULLIFY (complete_current, gth_current, local_current, logger, position)
+      IF (.NOT. ASSOCIATED(context%length_taylor_real) .OR. .NOT. ASSOCIATED(context%length_taylor_imag)) THEN
+         CPABORT("ECD| Stage G13 requires retained length Taylor coefficients")
+      END IF
+      IF (SIZE(context%length_taylor_real, 1) /= ncart .OR. SIZE(context%length_taylor_imag, 1) /= ncart .OR. &
+          SIZE(context%length_taylor_real, 2) < 2 .OR. SIZE(context%length_taylor_imag, 2) < 2) THEN
+         CPABORT("ECD| Stage G13 length Taylor coefficient dimensions are inconsistent")
+      END IF
+      IF (fwhm <= 0.0_dp) THEN
+         CPABORT("ECD| Stage G13 requires a positive FWHM")
+      END IF
+      IF (SIZE(velocity_response_zero, 1) /= ncart .OR. SIZE(velocity_response_zero, 2) /= ncart .OR. &
+          SIZE(velocity_response_first, 1) /= ncart .OR. SIZE(velocity_response_first, 2) /= ncart .OR. &
+          SIZE(velocity_response_zero, 3) /= npoints .OR. SIZE(velocity_response_first, 3) /= npoints) THEN
+         CPABORT("ECD| Stage G13 received incompatible velocity response tensors")
+      END IF
+      cell_volume = ABS(context%cell%deth)
+      IF (cell_volume <= 0.0_dp) THEN
+         CPABORT("ECD| Stage G13 requires a positive cell volume")
+      END IF
+      CALL ecd_gamma_zero_order_operators_get(operators, position, local_current, gth_current, complete_current, &
+                                               gth_available)
+
+      ALLOCATE (response_counter(ncart, ncart, npoints), response_first(ncart, ncart, npoints), &
+                response_first_counter(ncart, ncart, npoints), response_first_resonant(ncart, ncart, npoints), &
+                response_resonant(ncart, ncart, npoints), response_zero(ncart, ncart, npoints))
+      response_counter = CMPLX(0.0_dp, 0.0_dp, KIND=dp)
+      response_first = CMPLX(0.0_dp, 0.0_dp, KIND=dp)
+      response_first_counter = CMPLX(0.0_dp, 0.0_dp, KIND=dp)
+      response_first_resonant = CMPLX(0.0_dp, 0.0_dp, KIND=dp)
+      response_resonant = CMPLX(0.0_dp, 0.0_dp, KIND=dp)
+
+      logger => cp_get_default_logger()
+      DO ispin = 1, context%nspin
+         nmo = context%spin(ispin)%nmo
+         IF (nmo < 1 .OR. .NOT. ASSOCIATED(context%spin(ispin)%eigenvalue_first) .OR. &
+             .NOT. ASSOCIATED(context%spin(ispin)%eigenvalue_reference) .OR. &
+             .NOT. ASSOCIATED(context%spin(ispin)%mo_coeff) .OR. &
+             .NOT. ASSOCIATED(context%spin(ispin)%manifolds) .OR. &
+             .NOT. ALLOCATED(context%spin(ispin)%band_rotation) .OR. &
+             .NOT. ALLOCATED(context%spin(ispin)%coefficient_first)) THEN
+            CPABORT("ECD| Stage G13 state-response data are incomplete")
+         END IF
+         IF (SIZE(context%spin(ispin)%eigenvalue_first) /= nmo .OR. &
+             SIZE(context%spin(ispin)%eigenvalue_reference) /= nmo .OR. &
+             SIZE(context%spin(ispin)%band_rotation, 1) /= nmo .OR. &
+             SIZE(context%spin(ispin)%band_rotation, 2) /= nmo .OR. &
+             SIZE(context%spin(ispin)%coefficient_first, 1) /= nmo .OR. &
+             SIZE(context%spin(ispin)%coefficient_first, 2) /= nmo) THEN
+            CPABORT("ECD| Stage G13 retained state-response dimensions are inconsistent")
+         END IF
+         IF (ALL(transition_band_range == -1)) THEN
+            first_band = 1
+            last_band = nmo
+         ELSE
+            first_band = transition_band_range(1)
+            last_band = transition_band_range(2)
+            CALL ecd_band_manifolds_validate_window(context%spin(ispin)%manifolds, transition_band_range)
+         END IF
+         IF (first_band < 1 .OR. last_band > nmo .OR. first_band > last_band) THEN
+            CPABORT("ECD| Stage G13 transition band range is inconsistent with the Gamma MO space")
+         END IF
+
+         ALLOCATE (length_first_components(nmo, nmo, ncart), length_zero_components(nmo, nmo, ncart))
+         DO idir = 1, ncart
+            CALL ecd_project_complex_operator_to_mo(context%length_taylor_real(idir, 1), &
+                                                    context%length_taylor_imag(idir, 1), &
+                                                    context%spin(ispin)%mo_coeff, context%spin(ispin)%nao, nmo, &
+                                                    length_zero_mo)
+            CALL ecd_project_complex_operator_to_mo(context%length_taylor_real(idir, 2), &
+                                                    context%length_taylor_imag(idir, 2), &
+                                                    context%spin(ispin)%mo_coeff, context%spin(ispin)%nao, nmo, &
+                                                    length_first_mo)
+            ALLOCATE (length_first_rotated(nmo, nmo), length_zero_rotated(nmo, nmo), state_first(nmo, nmo), &
+                      transition_first(nmo, nmo))
+            length_zero_rotated = MATMUL(CONJG(TRANSPOSE(context%spin(ispin)%band_rotation)), &
+                                          MATMUL(length_zero_mo, context%spin(ispin)%band_rotation))
+            length_first_rotated = MATMUL(CONJG(TRANSPOSE(context%spin(ispin)%band_rotation)), &
+                                           MATMUL(length_first_mo, context%spin(ispin)%band_rotation))
+            state_first = 0.5_dp*(MATMUL(CONJG(TRANSPOSE(context%spin(ispin)%coefficient_first)), &
+                                          length_zero_rotated) - &
+                                    MATMUL(length_zero_rotated, context%spin(ispin)%coefficient_first))
+            transition_first = length_first_rotated + state_first
+            length_zero_components(:, :, idir) = length_zero_rotated
+            length_first_components(:, :, idir) = transition_first
+            DEALLOCATE (length_first_mo, length_first_rotated, length_zero_mo, length_zero_rotated, &
+                        state_first, transition_first)
+         END DO
+
+         ALLOCATE (transition_taylor(ncart, 0:1))
+         ntransitions = 0
+         DO iband = first_band, last_band
+            IF (context%spin(ispin)%occupations(iband) <= occupation_threshold) CYCLE
+            DO ivirt = first_band, last_band
+               IF (context%spin(ispin)%occupations(ivirt) > occupation_threshold) CYCLE
+               gap = context%spin(ispin)%eigenvalue_reference(ivirt) - &
+                     context%spin(ispin)%eigenvalue_reference(iband)
+               IF (gap <= SQRT(TINY(1.0_dp))) THEN
+                  CPABORT("ECD| Stage G13 requires positive occupied-to-empty transition gaps")
+               END IF
+               occupation_difference = context%spin(ispin)%occupations(iband) - &
+                                       context%spin(ispin)%occupations(ivirt)
+               IF (occupation_difference <= occupation_threshold) CYCLE
+               gap_derivative = 0.5_dp*(context%spin(ispin)%eigenvalue_first(ivirt) + &
+                                        context%spin(ispin)%eigenvalue_first(iband))
+               gap_taylor(0) = gap
+               gap_taylor(1) = gap_derivative
+               DO idir = 1, ncart
+                  transition_taylor(idir, 0) = -gap*length_zero_components(ivirt, iband, idir)
+                  transition_taylor(idir, 1) = -gap_derivative*length_zero_components(ivirt, iband, idir) - &
+                                                gap*length_first_components(ivirt, iband, idir)
+               END DO
+               ntransitions = ntransitions + 1
+               DO ipoint = 1, npoints
+                  photon_energy = energy_range(1) + REAL(ipoint - 1, KIND=dp)* &
+                                  (energy_range(2) - energy_range(1))/REAL(npoints - 1, KIND=dp)
+                  prefactor = -2.0_dp*twopi/(cell_volume*photon_energy**2)
+                  CALL ecd_taylor_retarded_response(transition_taylor, gap_taylor, photon_energy, 0.5_dp*fwhm, &
+                                                     resonant_taylor, counter_taylor)
+                  response_resonant(:, :, ipoint) = response_resonant(:, :, ipoint) + &
+                                                     prefactor*occupation_difference*resonant_taylor(:, :, 0)
+                  response_counter(:, :, ipoint) = response_counter(:, :, ipoint) + &
+                                                    prefactor*occupation_difference*counter_taylor(:, :, 0)
+                  response_first_resonant(:, :, ipoint) = response_first_resonant(:, :, ipoint) + &
+                                                           prefactor*occupation_difference*resonant_taylor(:, :, 1)
+                  response_first_counter(:, :, ipoint) = response_first_counter(:, :, ipoint) + &
+                                                          prefactor*occupation_difference*counter_taylor(:, :, 1)
+               END DO
+            END DO
+         END DO
+         IF (ntransitions < 1) THEN
+            CPABORT("ECD| Stage G13 found no occupied-to-empty transitions")
+         END IF
+         DEALLOCATE (length_first_components, length_zero_components, transition_taylor)
+      END DO
+
+      CALL ecd_periodic_implicit_gamma_diamagnetic_kernel(qs_env, context, gth_available, diamagnetic_kernel)
+      response_zero = response_resonant + response_counter
+      response_first = response_first_resonant + response_first_counter
+      DO ipoint = 1, npoints
+         photon_energy = energy_range(1) + REAL(ipoint - 1, KIND=dp)* &
+                         (energy_range(2) - energy_range(1))/REAL(npoints - 1, KIND=dp)
+         prefactor = 2.0_dp*twopi/(cell_volume*photon_energy**2)
+         response_zero(:, :, ipoint) = response_zero(:, :, ipoint) + &
+                                        CMPLX(prefactor*diamagnetic_kernel, 0.0_dp, KIND=dp)
+      END DO
+
+      gauge_zero_residual_max = 0.0_dp
+      gauge_first_residual_max = 0.0_dp
+      DO ipoint = 1, npoints
+         gauge_zero_residual_norm = SQRT(SUM(ABS(response_zero(:, :, ipoint) - &
+                                                  velocity_response_zero(:, :, ipoint))**2))
+         gauge_first_residual_norm = SQRT(SUM(ABS(response_first(:, :, ipoint) - &
+                                                   velocity_response_first(:, :, ipoint))**2))
+         gauge_zero_residual_max = MAX(gauge_zero_residual_max, gauge_zero_residual_norm)
+         gauge_first_residual_max = MAX(gauge_first_residual_max, gauge_first_residual_norm)
+      END DO
+      ipoint = (npoints + 1)/2
+      photon_energy = energy_range(1) + REAL(ipoint - 1, KIND=dp)* &
+                      (energy_range(2) - energy_range(1))/REAL(npoints - 1, KIND=dp)
+      gauge_zero_residual_norm = SQRT(SUM(ABS(response_zero(:, :, ipoint) - &
+                                               velocity_response_zero(:, :, ipoint))**2))
+      gauge_first_residual_norm = SQRT(SUM(ABS(response_first(:, :, ipoint) - &
+                                                velocity_response_first(:, :, ipoint))**2))
+      response_resonant_norm = SQRT(SUM(ABS(response_resonant(:, :, ipoint))**2))
+      response_counter_norm = SQRT(SUM(ABS(response_counter(:, :, ipoint))**2))
+      response_norm = SQRT(SUM(ABS(response_zero(:, :, ipoint))**2))
+      response_first_resonant_norm = SQRT(SUM(ABS(response_first_resonant(:, :, ipoint))**2))
+      response_first_counter_norm = SQRT(SUM(ABS(response_first_counter(:, :, ipoint))**2))
+      response_first_norm = SQRT(SUM(ABS(response_first(:, :, ipoint))**2))
+      antisymmetric_first_norm = 0.5_dp*SQRT(SUM(ABS(response_first(:, :, ipoint) - &
+                                                       TRANSPOSE(response_first(:, :, ipoint)))**2))
+      IF (cp_logger_get_default_io_unit(logger) > 0) THEN
+         WRITE (cp_logger_get_default_io_unit(logger), '(T2,A,T55,I10)') &
+            'ECD| Stage G13 length response grid points', npoints
+         WRITE (cp_logger_get_default_io_unit(logger), '(T2,A,T55,ES14.6)') &
+            'ECD| Stage G13 midpoint photon energy [hartree]', photon_energy
+         WRITE (cp_logger_get_default_io_unit(logger), '(T2,A,T55,ES14.6)') &
+            'ECD| Stage G13 midpoint resonant zeroth-order norm', response_resonant_norm
+         WRITE (cp_logger_get_default_io_unit(logger), '(T2,A,T55,ES14.6)') &
+            'ECD| Stage G13 midpoint counter zeroth-order norm', response_counter_norm
+         WRITE (cp_logger_get_default_io_unit(logger), '(T2,A,T55,ES14.6)') &
+            'ECD| Stage G13 midpoint full zeroth-order norm', response_norm
+         WRITE (cp_logger_get_default_io_unit(logger), '(T2,A,T55,ES14.6)') &
+            'ECD| Stage G13 midpoint resonant first-order norm', response_first_resonant_norm
+         WRITE (cp_logger_get_default_io_unit(logger), '(T2,A,T55,ES14.6)') &
+            'ECD| Stage G13 midpoint counter first-order norm', response_first_counter_norm
+         WRITE (cp_logger_get_default_io_unit(logger), '(T2,A,T55,ES14.6)') &
+            'ECD| Stage G13 midpoint full first-order norm', response_first_norm
+         WRITE (cp_logger_get_default_io_unit(logger), '(T2,A,T55,ES14.6)') &
+            'ECD| Stage G13 midpoint antisymmetric first-order norm', antisymmetric_first_norm
+         WRITE (cp_logger_get_default_io_unit(logger), '(T2,A,T55,ES14.6)') &
+            'ECD| Stage G13 midpoint zero-order gauge residual norm', gauge_zero_residual_norm
+         WRITE (cp_logger_get_default_io_unit(logger), '(T2,A,T55,ES14.6)') &
+            'ECD| Stage G13 midpoint first-order gauge residual norm', gauge_first_residual_norm
+         WRITE (cp_logger_get_default_io_unit(logger), '(T2,A,T55,ES14.6)') &
+            'ECD| Stage G13 maximum zero-order gauge residual norm', gauge_zero_residual_max
+         WRITE (cp_logger_get_default_io_unit(logger), '(T2,A,T55,ES14.6)') &
+            'ECD| Stage G13 maximum first-order gauge residual norm', gauge_first_residual_max
+      END IF
+      IF (write_response) THEN
+         CALL ecd_periodic_print_response_tensor(ecd_section, energy_range, response_zero, response_first)
+         CALL ecd_periodic_print_maxwell_spectrum(ecd_section, energy_range, context%direction, response_zero, &
+                                                  response_first)
+      END IF
+
+      DEALLOCATE (response_counter, response_first, response_first_counter, response_first_resonant, &
+                  response_resonant, response_zero)
+
+   END SUBROUTINE ecd_periodic_implicit_gamma_length_response_g13
 
 ! **************************************************************************************************
 !> \brief Assemble the folded local plus GTH diamagnetic kernel at implicit Gamma.
@@ -3669,6 +4397,91 @@ CONTAINS
       CALL dbcsr_deallocate_matrix_set(work_real)
 
    END SUBROUTINE ecd_periodic_current_taylor_build
+
+! **************************************************************************************************
+!> \brief Build directional Taylor coefficients of the length-gauge position vertex.
+! **************************************************************************************************
+   SUBROUTINE ecd_periodic_length_taylor_build(length_real, length_imag, moments, sab_nl, template, direction)
+      TYPE(dbcsr_p_type), DIMENSION(:, :), POINTER       :: length_real, length_imag
+      TYPE(dbcsr_p_type), DIMENSION(:), POINTER          :: moments
+      TYPE(neighbor_list_set_p_type), DIMENSION(:), &
+         POINTER                                          :: sab_nl
+      TYPE(dbcsr_type), POINTER                           :: template
+      REAL(KIND=dp), DIMENSION(3), INTENT(IN)            :: direction
+
+      INTEGER                                             :: idir, ix, iy, iz, jdir, moment_index
+      TYPE(dbcsr_p_type), DIMENSION(:), POINTER          :: work
+
+      NULLIFY (work)
+      IF (SIZE(moments) < ncoset(2) - 1) THEN
+         CPABORT("ECD| Length Taylor construction requires coordinate moments through second order")
+      END IF
+      CALL dbcsr_allocate_matrix_set(length_real, ncart, 2)
+      CALL dbcsr_allocate_matrix_set(length_imag, ncart, 2)
+      DO idir = 1, ncart
+         DO ix = 1, 2
+            CALL dbcsr_init_p(length_real(idir, ix)%matrix)
+            CALL dbcsr_create(length_real(idir, ix)%matrix, template=template, &
+                              matrix_type=dbcsr_type_no_symmetry, name='ECD LENGTH TAYLOR REAL')
+            CALL cp_dbcsr_alloc_block_from_nbl(length_real(idir, ix)%matrix, sab_nl)
+            CALL dbcsr_set(length_real(idir, ix)%matrix, 0.0_dp)
+            CALL dbcsr_init_p(length_imag(idir, ix)%matrix)
+            CALL dbcsr_create(length_imag(idir, ix)%matrix, template=template, &
+                              matrix_type=dbcsr_type_no_symmetry, name='ECD LENGTH TAYLOR IMAG')
+            CALL cp_dbcsr_alloc_block_from_nbl(length_imag(idir, ix)%matrix, sab_nl)
+            CALL dbcsr_set(length_imag(idir, ix)%matrix, 0.0_dp)
+         END DO
+      END DO
+      CALL ecd_periodic_ao_set_create(work, 1, template, sab_nl, &
+                                      'ECD LENGTH TAYLOR WORK', dbcsr_type_no_symmetry)
+
+      DO idir = 1, ncart
+         ix = 0
+         iy = 0
+         iz = 0
+         SELECT CASE (idir)
+         CASE (1)
+            ix = 1
+         CASE (2)
+            iy = 1
+         CASE (3)
+            iz = 1
+         END SELECT
+         moment_index = coset(ix, iy, iz) - 1
+         CALL dbcsr_desymmetrize(moments(moment_index)%matrix, length_real(idir, 1)%matrix)
+
+         DO jdir = 1, ncart
+            SELECT CASE (idir)
+            CASE (1)
+               ix = 1
+               iy = 0
+               iz = 0
+            CASE (2)
+               ix = 0
+               iy = 1
+               iz = 0
+            CASE (3)
+               ix = 0
+               iy = 0
+               iz = 1
+            END SELECT
+            SELECT CASE (jdir)
+            CASE (1)
+               ix = ix + 1
+            CASE (2)
+               iy = iy + 1
+            CASE (3)
+               iz = iz + 1
+            END SELECT
+            moment_index = coset(ix, iy, iz) - 1
+            CALL dbcsr_desymmetrize(moments(moment_index)%matrix, work(1)%matrix)
+            CALL dbcsr_add(length_imag(idir, 2)%matrix, work(1)%matrix, 1.0_dp, direction(jdir))
+         END DO
+      END DO
+
+      CALL dbcsr_deallocate_matrix_set(work)
+
+   END SUBROUTINE ecd_periodic_length_taylor_build
 
 ! **************************************************************************************************
 !> \brief Add a complex scaled AO matrix pair to a complex AO matrix pair.
