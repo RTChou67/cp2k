@@ -49,6 +49,7 @@ MODULE qs_integrate_potential_product
                                               integrate_pgf_product
    USE kinds,                           ONLY: default_string_length,&
                                               dp
+   USE kpoint_types,                    ONLY: kpoint_type
    USE message_passing,                 ONLY: mp_comm_type
    USE orbital_pointers,                ONLY: ncoset
    USE particle_types,                  ONLY: particle_type
@@ -577,7 +578,7 @@ CONTAINS
 ! **************************************************************************************************
    SUBROUTINE integrate_v_rspace(v_rspace, hmat, hmat_kp, pmat, pmat_kp, &
                                  qs_env, calculate_forces, force_adm, &
-                                 compute_tau, gapw, basis_type, pw_env_external, task_list_external)
+                                 compute_tau, gapw, basis_type, pw_env_external, task_list_external, ext_kpoints)
 
       TYPE(pw_r3d_rs_type), INTENT(IN)                   :: v_rspace
       TYPE(dbcsr_p_type), INTENT(INOUT), OPTIONAL        :: hmat
@@ -593,6 +594,7 @@ CONTAINS
       CHARACTER(len=*), INTENT(IN), OPTIONAL             :: basis_type
       TYPE(pw_env_type), OPTIONAL, POINTER               :: pw_env_external
       TYPE(task_list_type), OPTIONAL, POINTER            :: task_list_external
+      TYPE(kpoint_type), OPTIONAL, POINTER               :: ext_kpoints
 
       CHARACTER(len=*), PARAMETER :: routineN = 'integrate_v_rspace'
 
@@ -698,6 +700,12 @@ CONTAINS
       CALL potential_pw2rs(rs_v, v_rspace, pw_env)
 
       nimages = dft_control%nimages
+      IF (PRESENT(ext_kpoints)) THEN
+         IF (ASSOCIATED(ext_kpoints)) THEN
+            do_kp = .TRUE.
+            nimages = SIZE(ext_kpoints%index_to_cell, 2)
+         END IF
+      END IF
       IF (nimages > 1) THEN
          CPASSERT(do_kp)
       END IF

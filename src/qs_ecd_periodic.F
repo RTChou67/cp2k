@@ -75,6 +75,9 @@ MODULE qs_ecd_periodic
                                               ecd_periodic_local_operators_type,&
                                               ecd_project_real_operator_to_mo
    USE qs_ecd_gamma_data,               ONLY: ecd_gamma_context_create_implicit,&
+                                              ecd_gamma_context_core_images_get,&
+                                              ecd_gamma_context_overlap_images_get,&
+                                              ecd_gamma_context_overlap_images_status,&
                                               ecd_gamma_context_release,&
                                               ecd_gamma_spin_type,&
                                               ecd_gamma_context_type
@@ -84,16 +87,30 @@ MODULE qs_ecd_periodic
                                               ecd_gamma_zero_order_operators_type
    USE qs_environment_types,            ONLY: get_qs_env,&
                                               qs_environment_type
+   USE qs_integrate_potential,          ONLY: integrate_v_rspace
    USE qs_kind_types,                   ONLY: qs_kind_type
+   USE qs_ks_types,                     ONLY: qs_ks_env_type
    USE qs_mo_types,                     ONLY: get_mo_set,&
                                               mo_set_type
    USE qs_moments,                      ONLY: build_local_moment_matrix
    USE qs_neighbor_list_types,          ONLY: neighbor_list_set_p_type
    USE qs_operators_ao,                 ONLY: build_lin_mom_matrix
+   USE qs_rho_types,                    ONLY: qs_rho_type
+   USE qs_vxc,                          ONLY: qs_vxc_create
    USE particle_types,                  ONLY: particle_type
    USE physcon,                         ONLY: c_light_au,&
                                               evolt
+   USE pw_env_types,                    ONLY: pw_env_get,&
+                                              pw_env_type
+   USE pw_methods,                      ONLY: pw_axpy,&
+                                              pw_copy
+   USE pw_pool_types,                   ONLY: pw_pool_type
+   USE pw_types,                        ONLY: pw_r3d_rs_type
    USE rt_propagation_velocity_gauge,    ONLY: velocity_gauge_nl_term
+   USE task_list_methods,               ONLY: generate_qs_task_list
+   USE task_list_types,                 ONLY: allocate_task_list,&
+                                              deallocate_task_list,&
+                                              task_list_type
 #include "./base/base_uses.f90"
 
    IMPLICIT NONE
@@ -260,6 +277,13 @@ CONTAINS
       CALL ecd_gamma_zero_order_operators_build(gamma_operators, qs_env, gamma_context, &
                                                  pseudopotential_commutator)
       CALL ecd_periodic_implicit_gamma_g1(gamma_context, gamma_operators, gauge_label)
+      IF (spatial_order >= 1) THEN
+         CALL ecd_periodic_implicit_gamma_overlap_g3(gamma_context)
+         CALL ecd_periodic_implicit_gamma_core_g5(gamma_context)
+         CALL ecd_periodic_implicit_gamma_current_g4(qs_env, gamma_context, gamma_operators, &
+                                                      pseudopotential_commutator)
+         CALL ecd_periodic_implicit_gamma_ks_g6(qs_env, gamma_context)
+      END IF
       CALL ecd_periodic_implicit_gamma_zero_order_response(qs_env, ecd_section, gamma_context, gamma_operators, &
                                                             electric_gauge, transition_band_range, energy_range, &
                                                             npoints, fwhm)
@@ -277,7 +301,8 @@ CONTAINS
       CHARACTER(LEN=*), INTENT(IN)                       :: gauge_label
 
       INTEGER                                            :: idir, ispin
-      LOGICAL                                            :: gth_available
+      INTEGER                                            :: phase_nimages
+      LOGICAL                                            :: gth_available, phase_images_available
       REAL(KIND=dp)                                      :: complete_norm_sq, gth_norm_sq, local_norm_sq, &
                                                             position_norm_sq
       TYPE(cp_logger_type), POINTER                      :: logger
@@ -287,6 +312,7 @@ CONTAINS
       NULLIFY (complete_current, gth_current, local_current, logger, position)
       CALL ecd_gamma_zero_order_operators_get(operators, position, local_current, gth_current, complete_current, &
                                                gth_available)
+      CALL ecd_gamma_context_overlap_images_status(context, phase_images_available, phase_nimages)
 
       logger => cp_get_default_logger()
       IF (cp_logger_get_default_io_unit(logger) > 0) THEN
@@ -300,6 +326,10 @@ CONTAINS
             'ECD| Stage G1A reference point [bohr]', context%ref_point
          WRITE (cp_logger_get_default_io_unit(logger), '(T2,A,T55,L1)') &
             'ECD| Stage G1A GTH current available', gth_available
+         WRITE (cp_logger_get_default_io_unit(logger), '(T2,A,T55,L1)') &
+            'ECD| Stage G3 overlap image data available', phase_images_available
+         WRITE (cp_logger_get_default_io_unit(logger), '(T2,A,T55,I8)') &
+            'ECD| Stage G3 overlap image data count', phase_nimages
       END IF
 
       DO ispin = 1, context%nspin
@@ -339,6 +369,385 @@ CONTAINS
          END DO
       END DO
    END SUBROUTINE ecd_periodic_implicit_gamma_g1
+
+! **************************************************************************************************
+!> \brief Validate the ECD-owned implicit-Gamma overlap image snapshot through first order.
+!>
+!> This provider establishes the image-resolved overlap and its directional
+!> Taylor coefficient before KS image assembly and state-response construction.
+! **************************************************************************************************
+   SUBROUTINE ecd_periodic_implicit_gamma_overlap_g3(context)
+      TYPE(ecd_gamma_context_type), INTENT(IN), TARGET   :: context
+
+      REAL(KIND=dp), PARAMETER                           :: fd_step = 1.0E-5_dp
+
+      INTEGER                                            :: nimages
+      LOGICAL                                            :: available
+      REAL(KIND=dp)                                      :: derivative_norm_sq, fd_residual_norm_sq, &
+                                                            fold_norm_sq, fold_residual_norm_sq
+      REAL(KIND=dp), DIMENSION(3)                        :: xkp_minus, xkp_plus, xkp_step, xkp_zero
+      TYPE(cp_logger_type), POINTER                      :: logger
+      TYPE(dbcsr_p_type), DIMENSION(:), POINTER          :: derivative_imag, derivative_real, fd_imag, &
+                                                            fold_residual, fold_zero, minus_imag, minus_real, &
+                                                            plus_imag, plus_real
+      TYPE(dbcsr_p_type), DIMENSION(:, :), POINTER       :: overlap_images
+      INTEGER, DIMENSION(:, :, :), POINTER               :: cell_to_index
+
+      NULLIFY (cell_to_index, derivative_imag, derivative_real, fd_imag, fold_residual, fold_zero, logger, &
+               minus_imag, minus_real, overlap_images, plus_imag, plus_real)
+      CALL ecd_gamma_context_overlap_images_status(context, available, nimages)
+      IF (.NOT. available) THEN
+         CPABORT("ECD| Stage G3 requires an image-resolved overlap snapshot")
+      END IF
+      CALL ecd_gamma_context_overlap_images_get(context, overlap_images, cell_to_index)
+      IF (SIZE(overlap_images, 2) /= nimages) THEN
+         CPABORT("ECD| Stage G3 overlap image count is inconsistent")
+      END IF
+
+      xkp_zero = 0.0_dp
+      xkp_step = fd_step*MATMUL(TRANSPOSE(context%cell%hmat), context%direction)/twopi
+      xkp_plus = xkp_zero + xkp_step
+      xkp_minus = xkp_zero - xkp_step
+
+      CALL ecd_periodic_ao_set_create(fold_zero, 1, context%matrix_s(1)%matrix, context%sab_orb, &
+                                      'ECD G3 overlap fold', dbcsr_type_symmetric)
+      CALL ecd_periodic_ao_set_create(fold_residual, 1, context%matrix_s(1)%matrix, context%sab_orb, &
+                                      'ECD G3 overlap fold residual', dbcsr_type_symmetric)
+      CALL ecd_periodic_ao_set_create(derivative_real, 1, context%matrix_s(1)%matrix, context%sab_orb, &
+                                      'ECD G3 overlap derivative real', dbcsr_type_symmetric)
+      CALL ecd_periodic_ao_set_create(derivative_imag, 1, context%matrix_s(1)%matrix, context%sab_orb, &
+                                      'ECD G3 overlap derivative imag', dbcsr_type_antisymmetric)
+      CALL ecd_periodic_ao_set_create(plus_real, 1, context%matrix_s(1)%matrix, context%sab_orb, &
+                                      'ECD G3 overlap positive real', dbcsr_type_symmetric)
+      CALL ecd_periodic_ao_set_create(plus_imag, 1, context%matrix_s(1)%matrix, context%sab_orb, &
+                                      'ECD G3 overlap positive imag', dbcsr_type_antisymmetric)
+      CALL ecd_periodic_ao_set_create(minus_real, 1, context%matrix_s(1)%matrix, context%sab_orb, &
+                                      'ECD G3 overlap negative real', dbcsr_type_symmetric)
+      CALL ecd_periodic_ao_set_create(minus_imag, 1, context%matrix_s(1)%matrix, context%sab_orb, &
+                                      'ECD G3 overlap negative imag', dbcsr_type_antisymmetric)
+      CALL ecd_periodic_ao_set_create(fd_imag, 1, context%matrix_s(1)%matrix, context%sab_orb, &
+                                      'ECD G3 overlap finite difference imag', dbcsr_type_antisymmetric)
+
+      CALL rskp_transform(fold_zero(1)%matrix, rsmat=overlap_images, ispin=1, xkp=xkp_zero, &
+                          cell_to_index=cell_to_index, sab_nl=context%sab_orb)
+      CALL dbcsr_set(fold_residual(1)%matrix, 0.0_dp)
+      CALL dbcsr_add(fold_residual(1)%matrix, fold_zero(1)%matrix, 0.0_dp, 1.0_dp)
+      CALL dbcsr_add(fold_residual(1)%matrix, context%matrix_s(1)%matrix, 1.0_dp, -1.0_dp)
+      CALL dbcsr_dot(fold_zero(1)%matrix, fold_zero(1)%matrix, fold_norm_sq)
+      CALL dbcsr_dot(fold_residual(1)%matrix, fold_residual(1)%matrix, fold_residual_norm_sq)
+
+      CALL rskp_directional_taylor_transform(derivative_real(1)%matrix, derivative_imag(1)%matrix, &
+                                             overlap_images, 1, xkp_zero, cell_to_index, context%sab_orb, &
+                                             context%cell%hmat, context%direction, 1)
+      CALL rskp_transform(plus_real(1)%matrix, plus_imag(1)%matrix, overlap_images, 1, xkp_plus, &
+                          cell_to_index, context%sab_orb)
+      CALL rskp_transform(minus_real(1)%matrix, minus_imag(1)%matrix, overlap_images, 1, xkp_minus, &
+                          cell_to_index, context%sab_orb)
+      CALL dbcsr_set(fd_imag(1)%matrix, 0.0_dp)
+      CALL dbcsr_add(fd_imag(1)%matrix, plus_imag(1)%matrix, 0.0_dp, 0.5_dp/fd_step)
+      CALL dbcsr_add(fd_imag(1)%matrix, minus_imag(1)%matrix, 1.0_dp, -0.5_dp/fd_step)
+      CALL dbcsr_add(fd_imag(1)%matrix, derivative_imag(1)%matrix, 1.0_dp, -1.0_dp)
+      CALL dbcsr_dot(derivative_imag(1)%matrix, derivative_imag(1)%matrix, derivative_norm_sq)
+      CALL dbcsr_dot(fd_imag(1)%matrix, fd_imag(1)%matrix, fd_residual_norm_sq)
+
+      logger => cp_get_default_logger()
+      IF (cp_logger_get_default_io_unit(logger) > 0) THEN
+         WRITE (cp_logger_get_default_io_unit(logger), '(T2,A,T55,I8)') &
+            'ECD| Stage G3 overlap image count', nimages
+         WRITE (cp_logger_get_default_io_unit(logger), '(T2,A,T55,ES14.6)') &
+            'ECD| Stage G3 overlap fold norm', SQRT(ABS(fold_norm_sq))
+         WRITE (cp_logger_get_default_io_unit(logger), '(T2,A,T55,ES14.6)') &
+            'ECD| Stage G3 overlap fold residual', SQRT(ABS(fold_residual_norm_sq))
+         WRITE (cp_logger_get_default_io_unit(logger), '(T2,A,T55,ES14.6)') &
+            'ECD| Stage G3 overlap Taylor derivative norm', SQRT(ABS(derivative_norm_sq))
+         WRITE (cp_logger_get_default_io_unit(logger), '(T2,A,T55,ES14.6)') &
+            'ECD| Stage G3 overlap finite-difference residual', SQRT(ABS(fd_residual_norm_sq))
+         WRITE (cp_logger_get_default_io_unit(logger), '(T2,A,T55,ES14.6)') &
+            'ECD| Stage G3 overlap finite-difference step [bohr^-1]', fd_step
+      END IF
+
+      CALL dbcsr_deallocate_matrix_set(derivative_imag)
+      CALL dbcsr_deallocate_matrix_set(derivative_real)
+      CALL dbcsr_deallocate_matrix_set(fd_imag)
+      CALL dbcsr_deallocate_matrix_set(fold_residual)
+      CALL dbcsr_deallocate_matrix_set(fold_zero)
+      CALL dbcsr_deallocate_matrix_set(minus_imag)
+      CALL dbcsr_deallocate_matrix_set(minus_real)
+      CALL dbcsr_deallocate_matrix_set(plus_imag)
+      CALL dbcsr_deallocate_matrix_set(plus_real)
+
+   END SUBROUTINE ecd_periodic_implicit_gamma_overlap_g3
+
+! **************************************************************************************************
+!> \brief Validate the external-image core Hamiltonian against the folded Gamma core matrix.
+! **************************************************************************************************
+   SUBROUTINE ecd_periodic_implicit_gamma_core_g5(context)
+      TYPE(ecd_gamma_context_type), INTENT(IN), TARGET   :: context
+
+      REAL(KIND=dp)                                      :: fold_norm_sq, residual_norm_sq
+      REAL(KIND=dp), DIMENSION(3)                        :: xkp_zero
+      TYPE(cp_logger_type), POINTER                      :: logger
+      TYPE(dbcsr_p_type), DIMENSION(:), POINTER          :: core_fold, core_residual
+      TYPE(dbcsr_p_type), DIMENSION(:, :), POINTER       :: core_images
+      INTEGER, DIMENSION(:, :, :), POINTER               :: cell_to_index
+
+      NULLIFY (cell_to_index, core_fold, core_images, core_residual, logger)
+      CALL ecd_gamma_context_core_images_get(context, core_images, cell_to_index)
+      IF (SIZE(core_images, 1) /= 1) THEN
+         CPABORT("ECD| Stage G5 core image spin structure is inconsistent")
+      END IF
+      xkp_zero = 0.0_dp
+      CALL ecd_periodic_ao_set_create(core_fold, 1, context%matrix_h(1)%matrix, context%sab_orb, &
+                                      'ECD G5 core fold', dbcsr_type_symmetric)
+      CALL ecd_periodic_ao_set_create(core_residual, 1, context%matrix_h(1)%matrix, context%sab_orb, &
+                                      'ECD G5 core fold residual', dbcsr_type_symmetric)
+      CALL rskp_transform(core_fold(1)%matrix, rsmat=core_images, ispin=1, xkp=xkp_zero, &
+                          cell_to_index=cell_to_index, sab_nl=context%sab_orb)
+      CALL dbcsr_set(core_residual(1)%matrix, 0.0_dp)
+      CALL dbcsr_add(core_residual(1)%matrix, core_fold(1)%matrix, 0.0_dp, 1.0_dp)
+      CALL dbcsr_add(core_residual(1)%matrix, context%matrix_h(1)%matrix, 1.0_dp, -1.0_dp)
+      CALL dbcsr_dot(core_fold(1)%matrix, core_fold(1)%matrix, fold_norm_sq)
+      CALL dbcsr_dot(core_residual(1)%matrix, core_residual(1)%matrix, residual_norm_sq)
+
+      logger => cp_get_default_logger()
+      IF (cp_logger_get_default_io_unit(logger) > 0) THEN
+         WRITE (cp_logger_get_default_io_unit(logger), '(T2,A,T55,ES14.6)') &
+            'ECD| Stage G5 core fold norm', SQRT(ABS(fold_norm_sq))
+         WRITE (cp_logger_get_default_io_unit(logger), '(T2,A,T55,ES14.6)') &
+            'ECD| Stage G5 core fold residual', SQRT(ABS(residual_norm_sq))
+      END IF
+
+      CALL dbcsr_deallocate_matrix_set(core_fold)
+      CALL dbcsr_deallocate_matrix_set(core_residual)
+
+   END SUBROUTINE ecd_periodic_implicit_gamma_core_g5
+
+! **************************************************************************************************
+!> \brief Reconstruct and validate the frozen local-potential KS image snapshot.
+! **************************************************************************************************
+   SUBROUTINE ecd_periodic_implicit_gamma_ks_g6(qs_env, context)
+      TYPE(qs_environment_type), POINTER                 :: qs_env
+      TYPE(ecd_gamma_context_type), INTENT(IN), TARGET   :: context
+
+      INTEGER                                            :: iimage, ispin, nimages
+      REAL(KIND=dp)                                      :: exc_dummy, fold_norm_sq, residual_norm_sq
+      REAL(KIND=dp), DIMENSION(3)                        :: xkp_zero
+      TYPE(cp_logger_type), POINTER                      :: logger
+      TYPE(dbcsr_p_type), DIMENSION(:, :), POINTER       :: core_images, ks_images, local_images
+      TYPE(dbcsr_p_type), DIMENSION(:), POINTER          :: ks_fold, ks_residual, local_image_spin
+      TYPE(dft_control_type), POINTER                     :: dft_control
+      INTEGER, DIMENSION(:, :, :), POINTER               :: cell_to_index
+      TYPE(pw_env_type), POINTER                          :: pw_env
+      TYPE(pw_pool_type), POINTER                         :: auxbas_pw_pool
+      TYPE(pw_r3d_rs_type), POINTER                       :: v_hartree_rspace
+      TYPE(pw_r3d_rs_type)                                :: local_potential
+      TYPE(pw_r3d_rs_type), DIMENSION(:), POINTER         :: vxc_rho, vxc_tau
+      TYPE(qs_ks_env_type), POINTER                       :: ks_env
+      TYPE(qs_rho_type), POINTER                          :: rho
+      TYPE(section_vals_type), POINTER                    :: input, xc_section
+      TYPE(task_list_type), POINTER                       :: image_task_list
+
+      NULLIFY (auxbas_pw_pool, cell_to_index, core_images, dft_control, image_task_list, input, ks_env, ks_fold, &
+               ks_images, ks_residual, local_images, local_image_spin, logger, pw_env, rho, v_hartree_rspace, &
+               vxc_rho, vxc_tau, xc_section)
+      CALL ecd_gamma_context_core_images_get(context, core_images, cell_to_index)
+      IF (.NOT. ASSOCIATED(context%image_kpoints)) THEN
+         CPABORT("ECD| Stage G6 requires the implicit-Gamma image k-point environment")
+      END IF
+      nimages = SIZE(core_images, 2)
+      IF (nimages < 1) THEN
+         CPABORT("ECD| Stage G6 requires at least one KS image")
+      END IF
+      IF (SIZE(core_images, 1) /= context%nspin .OR. SIZE(context%matrix_ks) /= context%nspin) THEN
+         CPABORT("ECD| Stage G6 KS image spin structure is inconsistent")
+      END IF
+
+      CALL get_qs_env(qs_env, dft_control=dft_control, input=input, ks_env=ks_env, pw_env=pw_env, rho=rho, &
+                      v_hartree_rspace=v_hartree_rspace)
+      IF (.NOT. ASSOCIATED(dft_control) .OR. .NOT. ASSOCIATED(input) .OR. .NOT. ASSOCIATED(ks_env) .OR. &
+          .NOT. ASSOCIATED(pw_env) .OR. .NOT. ASSOCIATED(rho) .OR. .NOT. ASSOCIATED(v_hartree_rspace)) THEN
+         CPABORT("ECD| Stage G6 frozen local-potential data are incomplete")
+      END IF
+      IF (dft_control%qs_control%gapw .OR. dft_control%qs_control%gapw_xc .OR. dft_control%do_admm .OR. &
+          dft_control%qs_control%rigpw .OR. dft_control%qs_control%lrigpw) THEN
+         CPABORT("ECD| Stage G6 supports the ordinary GPW local-potential SCF path")
+      END IF
+
+      CALL pw_env_get(pw_env, auxbas_pw_pool=auxbas_pw_pool)
+      IF (.NOT. ASSOCIATED(auxbas_pw_pool)) THEN
+         CPABORT("ECD| Stage G6 cannot obtain the auxiliary plane-wave pool")
+      END IF
+      xc_section => section_vals_get_subs_vals(input, "DFT%XC")
+      CALL qs_vxc_create(ks_env, rho, xc_section, vxc_rho, vxc_tau, exc_dummy)
+      IF (.NOT. ASSOCIATED(vxc_rho) .OR. SIZE(vxc_rho) /= context%nspin) THEN
+         CPABORT("ECD| Stage G6 local XC potential has an inconsistent spin structure")
+      END IF
+      IF (ASSOCIATED(vxc_tau)) THEN
+         CPABORT("ECD| Stage G6 meta-GGA kinetic-density potentials are outside the current scope")
+      END IF
+
+      CALL allocate_task_list(image_task_list)
+      CALL generate_qs_task_list(ks_env, image_task_list, basis_type="ORB", reorder_rs_grid_ranks=.FALSE., &
+                                 skip_load_balance_distributed=.FALSE., ext_kpoints=context%image_kpoints)
+      CALL dbcsr_allocate_matrix_set(local_images, context%nspin, nimages)
+      CALL dbcsr_allocate_matrix_set(ks_images, context%nspin, nimages)
+      DO iimage = 1, nimages
+         DO ispin = 1, context%nspin
+            CALL dbcsr_init_p(local_images(ispin, iimage)%matrix)
+            CALL dbcsr_create(local_images(ispin, iimage)%matrix, template=context%matrix_ks(ispin)%matrix, &
+                              matrix_type=dbcsr_type_no_symmetry, name="ECD G6 LOCAL POTENTIAL IMAGE")
+            CALL dbcsr_init_p(ks_images(ispin, iimage)%matrix)
+            CALL dbcsr_create(ks_images(ispin, iimage)%matrix, template=context%matrix_ks(ispin)%matrix, &
+                              matrix_type=dbcsr_type_no_symmetry, name="ECD G6 KS IMAGE")
+            CALL dbcsr_desymmetrize(core_images(ispin, iimage)%matrix, local_images(ispin, iimage)%matrix)
+            CALL dbcsr_set(local_images(ispin, iimage)%matrix, 0.0_dp)
+         END DO
+      END DO
+
+      DO ispin = 1, context%nspin
+         CALL auxbas_pw_pool%create_pw(local_potential)
+         CALL pw_copy(v_hartree_rspace, local_potential)
+         CALL pw_axpy(vxc_rho(ispin), local_potential, alpha=vxc_rho(ispin)%pw_grid%dvol)
+         local_image_spin => local_images(ispin, :)
+         CALL integrate_v_rspace(v_rspace=local_potential, hmat_kp=local_image_spin, qs_env=qs_env, &
+                                 calculate_forces=.FALSE., task_list_external=image_task_list, &
+                                 ext_kpoints=context%image_kpoints)
+         CALL auxbas_pw_pool%give_back_pw(local_potential)
+         NULLIFY (local_image_spin)
+      END DO
+      DO iimage = 1, nimages
+         DO ispin = 1, context%nspin
+            CALL dbcsr_desymmetrize(core_images(ispin, iimage)%matrix, ks_images(ispin, iimage)%matrix)
+            CALL dbcsr_add(ks_images(ispin, iimage)%matrix, local_images(ispin, iimage)%matrix, 1.0_dp, 1.0_dp)
+         END DO
+      END DO
+      DO ispin = 1, context%nspin
+         CALL auxbas_pw_pool%give_back_pw(vxc_rho(ispin))
+      END DO
+      DEALLOCATE (vxc_rho)
+
+      xkp_zero = 0.0_dp
+      CALL ecd_periodic_ao_set_create(ks_fold, context%nspin, context%matrix_ks(1)%matrix, context%sab_orb, &
+                                      'ECD G6 KS fold', dbcsr_type_symmetric)
+      CALL ecd_periodic_ao_set_create(ks_residual, context%nspin, context%matrix_ks(1)%matrix, context%sab_orb, &
+                                      'ECD G6 KS fold residual', dbcsr_type_symmetric)
+
+      logger => cp_get_default_logger()
+      IF (cp_logger_get_default_io_unit(logger) > 0) THEN
+         WRITE (cp_logger_get_default_io_unit(logger), '(T2,A,T55,I8)') &
+            'ECD| Stage G6 KS image count', nimages
+      END IF
+      DO ispin = 1, context%nspin
+         CALL rskp_transform(ks_fold(ispin)%matrix, rsmat=ks_images, ispin=ispin, xkp=xkp_zero, &
+                             cell_to_index=cell_to_index, sab_nl=context%sab_orb)
+         CALL dbcsr_set(ks_residual(ispin)%matrix, 0.0_dp)
+         CALL dbcsr_add(ks_residual(ispin)%matrix, ks_fold(ispin)%matrix, 0.0_dp, 1.0_dp)
+         CALL dbcsr_add(ks_residual(ispin)%matrix, context%matrix_ks(ispin)%matrix, 1.0_dp, -1.0_dp)
+         CALL dbcsr_dot(ks_fold(ispin)%matrix, ks_fold(ispin)%matrix, fold_norm_sq)
+         CALL dbcsr_dot(ks_residual(ispin)%matrix, ks_residual(ispin)%matrix, residual_norm_sq)
+         IF (cp_logger_get_default_io_unit(logger) > 0) THEN
+            WRITE (cp_logger_get_default_io_unit(logger), '(T2,A,I2,T55,ES14.6)') &
+               'ECD| Stage G6 KS fold norm spin', ispin, SQRT(ABS(fold_norm_sq))
+            WRITE (cp_logger_get_default_io_unit(logger), '(T2,A,I2,T55,ES14.6)') &
+               'ECD| Stage G6 KS fold residual spin', ispin, SQRT(ABS(residual_norm_sq))
+         END IF
+      END DO
+      CALL dbcsr_deallocate_matrix_set(ks_fold)
+      CALL dbcsr_deallocate_matrix_set(ks_residual)
+      CALL dbcsr_deallocate_matrix_set(ks_images)
+      CALL dbcsr_deallocate_matrix_set(local_images)
+      CALL deallocate_task_list(image_task_list)
+
+   END SUBROUTINE ecd_periodic_implicit_gamma_ks_g6
+
+! **************************************************************************************************
+!> \brief Build implicit-Gamma current Taylor coefficients through first spatial order.
+!>
+!> The local and GTH image kernels are ECD-owned.  Their zeroth coefficient is
+!> checked against the folded complete current before the first coefficient is
+!> made available to the finite-q transition provider.
+! **************************************************************************************************
+   SUBROUTINE ecd_periodic_implicit_gamma_current_g4(qs_env, context, gamma_operators, &
+                                                       pseudopotential_commutator)
+      TYPE(qs_environment_type), POINTER                 :: qs_env
+      TYPE(ecd_gamma_context_type), INTENT(IN), TARGET   :: context
+      TYPE(ecd_gamma_zero_order_operators_type), INTENT(IN), TARGET :: gamma_operators
+      LOGICAL, INTENT(IN)                                :: pseudopotential_commutator
+
+      INTEGER                                            :: idir
+      LOGICAL                                            :: gth_available, gth_enabled
+      REAL(KIND=dp)                                      :: first_imag_norm_sq, first_norm_sq, residual_norm_sq, zero_norm_sq
+      REAL(KIND=dp), DIMENSION(3)                        :: xkp_zero
+      TYPE(cp_logger_type), POINTER                      :: logger
+      TYPE(dbcsr_p_type), DIMENSION(:), POINTER          :: complete_current, current_residual, &
+                                                            gth_current, local_current, position
+      TYPE(dbcsr_p_type), DIMENSION(:, :), POINTER       :: current_taylor_imag, current_taylor_real, &
+                                                            gth_current_taylor_imag, gth_current_taylor_real, &
+                                                            local_moments_rs, local_momentum_rs, overlap_images
+      TYPE(dbcsr_p_type), DIMENSION(:, :, :), POINTER    :: gth_current_path_rs, local_moments_der_rs
+      TYPE(ecd_periodic_gth_operators_type)              :: gth_operators
+      TYPE(ecd_periodic_local_operators_type)            :: local_operators
+      INTEGER, DIMENSION(:, :, :), POINTER               :: gth_cell_to_index, local_cell_to_index, &
+                                                            overlap_cell_to_index
+
+      NULLIFY (complete_current, current_residual, current_taylor_imag, current_taylor_real, &
+               gth_cell_to_index, gth_current, gth_current_path_rs, gth_current_taylor_imag, &
+               gth_current_taylor_real, local_cell_to_index, local_current, local_moments_der_rs, &
+               local_moments_rs, local_momentum_rs, logger, overlap_cell_to_index, overlap_images, position)
+      xkp_zero = 0.0_dp
+      CALL ecd_gamma_context_overlap_images_get(context, overlap_images, overlap_cell_to_index)
+      CALL ecd_gamma_zero_order_operators_get(gamma_operators, position, local_current, gth_current, complete_current, &
+                                               gth_available)
+
+      CALL ecd_periodic_local_operators_build(local_operators, qs_env, context%ref_point, 1)
+      CALL ecd_periodic_local_operators_get(local_operators, local_cell_to_index, local_momentum_rs, &
+                                            local_moments_der_rs, local_moments_rs)
+      gth_enabled = pseudopotential_commutator .AND. gth_available
+      IF (gth_enabled) THEN
+         CALL ecd_periodic_gth_operators_build(gth_operators, qs_env, context%direction, context%ref_point, 1)
+         CALL ecd_periodic_gth_operators_get(gth_operators, gth_cell_to_index, gth_current_path_rs)
+      END IF
+
+      CALL ecd_periodic_current_taylor_build(current_taylor_real, current_taylor_imag, &
+                                             gth_current_taylor_real, gth_current_taylor_imag, &
+                                             local_momentum_rs, local_moments_der_rs, local_moments_rs, &
+                                             gth_current_path_rs, gth_enabled, overlap_images, xkp_zero, &
+                                             overlap_cell_to_index, local_cell_to_index, gth_cell_to_index, &
+                                             context%sab_all, context%cell%hmat, context%direction, 1)
+      CALL ecd_periodic_ao_vector_create(current_residual, context%matrix_s(1)%matrix, context%sab_all, &
+                                         'ECD G4 current zeroth residual', dbcsr_type_no_symmetry)
+
+      logger => cp_get_default_logger()
+      DO idir = 1, ncart
+         CALL dbcsr_set(current_residual(idir)%matrix, 0.0_dp)
+         CALL dbcsr_add(current_residual(idir)%matrix, current_taylor_real(idir, 1)%matrix, 0.0_dp, 1.0_dp)
+         CALL dbcsr_add(current_residual(idir)%matrix, complete_current(idir)%matrix, 1.0_dp, -1.0_dp)
+         CALL dbcsr_dot(current_taylor_real(idir, 1)%matrix, current_taylor_real(idir, 1)%matrix, zero_norm_sq)
+         CALL dbcsr_dot(current_taylor_real(idir, 2)%matrix, current_taylor_real(idir, 2)%matrix, first_norm_sq)
+         CALL dbcsr_dot(current_taylor_imag(idir, 2)%matrix, current_taylor_imag(idir, 2)%matrix, &
+                        first_imag_norm_sq)
+         CALL dbcsr_dot(current_residual(idir)%matrix, current_residual(idir)%matrix, residual_norm_sq)
+         IF (cp_logger_get_default_io_unit(logger) > 0) THEN
+            WRITE (cp_logger_get_default_io_unit(logger), '(T2,A,I1,T55,ES14.6)') &
+               'ECD| Stage G4 current zeroth norm component', idir, SQRT(ABS(zero_norm_sq))
+            WRITE (cp_logger_get_default_io_unit(logger), '(T2,A,I1,T55,ES14.6)') &
+               'ECD| Stage G4 current zeroth residual component', idir, SQRT(ABS(residual_norm_sq))
+            WRITE (cp_logger_get_default_io_unit(logger), '(T2,A,I1,T55,ES14.6)') &
+               'ECD| Stage G4 current first real norm component', idir, SQRT(ABS(first_norm_sq))
+            WRITE (cp_logger_get_default_io_unit(logger), '(T2,A,I1,T55,ES14.6)') &
+               'ECD| Stage G4 current first imaginary norm component', idir, SQRT(ABS(first_imag_norm_sq))
+         END IF
+      END DO
+
+      CALL dbcsr_deallocate_matrix_set(current_residual)
+      CALL dbcsr_deallocate_matrix_set(current_taylor_imag)
+      CALL dbcsr_deallocate_matrix_set(current_taylor_real)
+      CALL dbcsr_deallocate_matrix_set(gth_current_taylor_imag)
+      CALL dbcsr_deallocate_matrix_set(gth_current_taylor_real)
+      CALL ecd_periodic_gth_operators_release(gth_operators)
+      CALL ecd_periodic_local_operators_release(local_operators)
+
+   END SUBROUTINE ecd_periodic_implicit_gamma_current_g4
 
 ! **************************************************************************************************
 !> \brief Assemble the implicit-Gamma zeroth-order causal dielectric response.

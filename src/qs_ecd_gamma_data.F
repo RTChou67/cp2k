@@ -11,20 +11,42 @@
 MODULE qs_ecd_gamma_data
    USE cell_types,                      ONLY: cell_type
    USE cp_control_types,                ONLY: dft_control_type
-   USE cp_dbcsr_api,                    ONLY: dbcsr_p_type
+   USE cp_blacs_env,                    ONLY: cp_blacs_env_type
+   USE cp_dbcsr_api,                    ONLY: dbcsr_create,&
+                                              dbcsr_init_p,&
+                                              dbcsr_p_type,&
+                                              dbcsr_set,&
+                                              dbcsr_type_no_symmetry
+   USE cp_dbcsr_cp2k_link,              ONLY: cp_dbcsr_alloc_block_from_nbl
+   USE cp_dbcsr_operations,             ONLY: dbcsr_allocate_matrix_set,&
+                                              dbcsr_deallocate_matrix_set
    USE cp_fm_types,                     ONLY: cp_fm_get_info,&
                                               cp_fm_type
    USE kinds,                           ONLY: dp
+   USE kpoint_methods,                  ONLY: kpoint_env_initialize,&
+                                              kpoint_init_cell_index,&
+                                              kpoint_initialize,&
+                                              kpoint_initialize_mo_set,&
+                                              kpoint_initialize_mos
+   USE kpoint_types,                    ONLY: get_kpoint_info,&
+                                              kpoint_create,&
+                                              kpoint_release,&
+                                              kpoint_type
+   USE message_passing,                 ONLY: mp_para_env_type
    USE particle_types,                  ONLY: particle_type
    USE qs_ecd_subspace,                 ONLY: ecd_band_manifold_type,&
                                               ecd_band_manifolds_build,&
                                               ecd_band_manifolds_release
    USE qs_environment_types,            ONLY: get_qs_env,&
                                               qs_environment_type
+   USE qs_core_matrices,                ONLY: core_matrices,&
+                                              kinetic_energy_matrix
    USE qs_kind_types,                   ONLY: qs_kind_type
+   USE qs_ks_types,                     ONLY: qs_ks_env_type
    USE qs_mo_types,                     ONLY: get_mo_set,&
                                               mo_set_type
    USE qs_neighbor_list_types,          ONLY: neighbor_list_set_p_type
+   USE qs_overlap,                      ONLY: build_overlap_matrix
 #include "./base/base_uses.f90"
 
    IMPLICIT NONE
@@ -45,16 +67,23 @@ MODULE qs_ecd_gamma_data
       INTEGER                                                  :: nspin = 0, spatial_order = 0
       REAL(KIND=dp), DIMENSION(3)                            :: direction = 0.0_dp, ref_point = 0.0_dp
       TYPE(cell_type), POINTER                                :: cell => NULL()
-      TYPE(dbcsr_p_type), DIMENSION(:), POINTER               :: matrix_ks => NULL(), matrix_s => NULL()
+      TYPE(dbcsr_p_type), DIMENSION(:), POINTER               :: matrix_h => NULL(), matrix_ks => NULL(), &
+                                                                  matrix_s => NULL()
+      TYPE(dbcsr_p_type), DIMENSION(:, :), POINTER            :: core_images => NULL(), overlap_images => NULL()
       TYPE(dft_control_type), POINTER                         :: dft_control => NULL()
       TYPE(neighbor_list_set_p_type), DIMENSION(:), POINTER   :: sab_orb => NULL(), sab_all => NULL(), &
                                                                   sap_ppnl => NULL()
       TYPE(particle_type), DIMENSION(:), POINTER              :: particle_set => NULL()
       TYPE(qs_kind_type), DIMENSION(:), POINTER               :: qs_kind_set => NULL()
+      INTEGER, DIMENSION(:, :, :), POINTER                    :: overlap_cell_to_index => NULL()
+      TYPE(kpoint_type), POINTER                              :: image_kpoints => NULL()
       TYPE(ecd_gamma_spin_type), ALLOCATABLE, DIMENSION(:)    :: spin
    END TYPE ecd_gamma_context_type
 
    PUBLIC :: ecd_gamma_context_create_implicit, &
+             ecd_gamma_context_core_images_get, &
+             ecd_gamma_context_overlap_images_get, &
+             ecd_gamma_context_overlap_images_status, &
              ecd_gamma_context_release
 
 CONTAINS
@@ -75,19 +104,27 @@ CONTAINS
       REAL(KIND=dp), DIMENSION(:), POINTER               :: eigenvalues, occupations
       TYPE(cp_fm_type), POINTER                          :: mo_coeff
       TYPE(mo_set_type), DIMENSION(:), POINTER           :: mos
+      TYPE(cp_blacs_env_type), POINTER                    :: blacs_env
+      TYPE(mp_para_env_type), POINTER                     :: para_env
+      TYPE(qs_ks_env_type), POINTER                       :: ks_env
 
-      NULLIFY (eigenvalues, mo_coeff, mos, occupations)
+      NULLIFY (context%core_images, context%image_kpoints, &
+               context%overlap_cell_to_index, context%overlap_images)
+      NULLIFY (blacs_env, eigenvalues, ks_env, mo_coeff, mos, occupations, para_env)
       CALL get_qs_env(qs_env, cell=context%cell, do_kpoints=do_kpoints, mos=mos, &
-                      matrix_ks=context%matrix_ks, matrix_s=context%matrix_s, &
+                      ks_env=ks_env, matrix_h=context%matrix_h, matrix_ks=context%matrix_ks, &
+                      matrix_s=context%matrix_s, &
                       dft_control=context%dft_control, sab_orb=context%sab_orb, sab_all=context%sab_all, &
-                      sap_ppnl=context%sap_ppnl, particle_set=context%particle_set, &
+                      blacs_env=blacs_env, para_env=para_env, sap_ppnl=context%sap_ppnl, &
+                      particle_set=context%particle_set, &
                       qs_kind_set=context%qs_kind_set)
 
       IF (do_kpoints) THEN
          CPABORT("ECD| Implicit-Gamma data adapter requires the field-free Gamma SCF layout")
       END IF
-      IF (.NOT. ASSOCIATED(context%cell) .OR. .NOT. ASSOCIATED(mos) .OR. &
-          .NOT. ASSOCIATED(context%matrix_ks) .OR. .NOT. ASSOCIATED(context%matrix_s) .OR. &
+      IF (.NOT. ASSOCIATED(context%cell) .OR. .NOT. ASSOCIATED(ks_env) .OR. .NOT. ASSOCIATED(mos) .OR. &
+          .NOT. ASSOCIATED(context%matrix_h) .OR. .NOT. ASSOCIATED(context%matrix_ks) .OR. &
+          .NOT. ASSOCIATED(context%matrix_s) .OR. &
           .NOT. ASSOCIATED(context%dft_control) .OR. .NOT. ASSOCIATED(context%sab_orb) .OR. &
           .NOT. ASSOCIATED(context%sab_all) .OR. .NOT. ASSOCIATED(context%particle_set) .OR. &
           .NOT. ASSOCIATED(context%qs_kind_set)) THEN
@@ -110,6 +147,13 @@ CONTAINS
       context%direction = direction
       context%ref_point = ref_point
       context%spatial_order = spatial_order
+      IF (spatial_order >= 1) THEN
+         IF (.NOT. ASSOCIATED(blacs_env) .OR. .NOT. ASSOCIATED(para_env)) THEN
+            CPABORT("ECD| Implicit-Gamma image snapshots require the parallel and BLACS environments")
+         END IF
+         CALL ecd_gamma_context_overlap_images_build(context, ks_env, mos, para_env, blacs_env)
+         CALL ecd_gamma_context_core_images_build(context, qs_env)
+      END IF
       ALLOCATE (context%spin(context%nspin))
 
       DO ispin = 1, context%nspin
@@ -135,8 +179,170 @@ CONTAINS
          context%spin(ispin)%mo_coeff => mo_coeff
          CALL ecd_band_manifolds_build(context%spin(ispin)%manifolds, eigenvalues, eps_degeneracy)
       END DO
-
    END SUBROUTINE ecd_gamma_context_create_implicit
+
+! **************************************************************************************************
+!> \brief Borrow the ECD-owned image-resolved core Hamiltonian and its cell map.
+! **************************************************************************************************
+   SUBROUTINE ecd_gamma_context_core_images_get(context, core_images, cell_to_index)
+      TYPE(ecd_gamma_context_type), INTENT(IN), TARGET   :: context
+      TYPE(dbcsr_p_type), DIMENSION(:, :), POINTER       :: core_images
+      INTEGER, DIMENSION(:, :, :), POINTER               :: cell_to_index
+
+      IF (.NOT. ASSOCIATED(context%core_images) .OR. .NOT. ASSOCIATED(context%overlap_cell_to_index)) THEN
+         CPABORT("ECD| Implicit-Gamma core image snapshot is unavailable")
+      END IF
+      core_images => context%core_images
+      cell_to_index => context%overlap_cell_to_index
+
+   END SUBROUTINE ecd_gamma_context_core_images_get
+
+! **************************************************************************************************
+!> \brief Borrow the ECD-owned image-resolved overlap matrices and their cell map.
+! **************************************************************************************************
+   SUBROUTINE ecd_gamma_context_overlap_images_get(context, overlap_images, cell_to_index)
+      TYPE(ecd_gamma_context_type), INTENT(IN), TARGET   :: context
+      TYPE(dbcsr_p_type), DIMENSION(:, :), POINTER       :: overlap_images
+      INTEGER, DIMENSION(:, :, :), POINTER               :: cell_to_index
+
+      IF (.NOT. ASSOCIATED(context%overlap_images) .OR. .NOT. ASSOCIATED(context%overlap_cell_to_index)) THEN
+         CPABORT("ECD| Implicit-Gamma overlap image snapshot is unavailable")
+      END IF
+      overlap_images => context%overlap_images
+      cell_to_index => context%overlap_cell_to_index
+
+   END SUBROUTINE ecd_gamma_context_overlap_images_get
+
+! **************************************************************************************************
+!> \brief Report whether the implicit-Gamma context owns an image-resolved overlap snapshot.
+! **************************************************************************************************
+   SUBROUTINE ecd_gamma_context_overlap_images_status(context, available, nimages)
+      TYPE(ecd_gamma_context_type), INTENT(IN)           :: context
+      LOGICAL, INTENT(OUT)                               :: available
+      INTEGER, INTENT(OUT)                               :: nimages
+
+      available = .FALSE.
+      nimages = 0
+      IF (.NOT. ASSOCIATED(context%overlap_images) .OR. .NOT. ASSOCIATED(context%overlap_cell_to_index)) THEN
+         RETURN
+      END IF
+      IF (SIZE(context%overlap_images, 1) /= 1) THEN
+         RETURN
+      END IF
+      nimages = SIZE(context%overlap_images, 2)
+      IF (nimages < 1) THEN
+         RETURN
+      END IF
+      available = .TRUE.
+
+   END SUBROUTINE ecd_gamma_context_overlap_images_status
+
+! **************************************************************************************************
+!> \brief Build a read-only image-resolved overlap snapshot for the implicit-Gamma ECD expansion.
+!>
+!> The standard Gamma SCF matrix is folded over lattice images.  The overlap
+!> Taylor coefficients need the individual image blocks, which are generated
+!> here without changing the matrices used by the SCF calculation.
+! **************************************************************************************************
+   SUBROUTINE ecd_gamma_context_overlap_images_build(context, ks_env, mos, para_env, blacs_env)
+      TYPE(ecd_gamma_context_type), INTENT(INOUT)        :: context
+      TYPE(qs_ks_env_type), POINTER                      :: ks_env
+      TYPE(mo_set_type), DIMENSION(:), POINTER           :: mos
+      TYPE(mp_para_env_type), POINTER                    :: para_env
+      TYPE(cp_blacs_env_type), POINTER                   :: blacs_env
+
+      INTEGER                                            :: nimages
+      INTEGER, DIMENSION(:, :, :), POINTER               :: cell_to_index
+
+      IF (ASSOCIATED(context%overlap_images) .OR. ASSOCIATED(context%overlap_cell_to_index)) THEN
+         CPABORT("ECD| Implicit-Gamma overlap image snapshot is already allocated")
+      END IF
+      IF (.NOT. ASSOCIATED(context%sab_orb)) THEN
+         CPABORT("ECD| Implicit-Gamma overlap image snapshot requires the orbital neighbour list")
+      END IF
+
+      NULLIFY (cell_to_index)
+      CALL kpoint_create(context%image_kpoints)
+      context%image_kpoints%kp_scheme = "GAMMA"
+      context%image_kpoints%use_real_wfn = .TRUE.
+      CALL kpoint_initialize(context%image_kpoints, context%particle_set, context%cell)
+      CALL kpoint_env_initialize(context%image_kpoints, para_env, blacs_env)
+      CALL kpoint_initialize_mos(context%image_kpoints, mos)
+      CALL kpoint_initialize_mo_set(context%image_kpoints)
+      CALL kpoint_init_cell_index(context%image_kpoints, context%sab_orb, para_env, nimages)
+      CALL get_kpoint_info(context%image_kpoints, cell_to_index=cell_to_index)
+      IF (nimages < 1 .OR. .NOT. ASSOCIATED(cell_to_index)) THEN
+         CALL kpoint_release(context%image_kpoints)
+         CPABORT("ECD| Implicit-Gamma overlap image snapshot has no image cells")
+      END IF
+
+      ALLOCATE (context%overlap_cell_to_index(LBOUND(cell_to_index, 1):UBOUND(cell_to_index, 1), &
+                                               LBOUND(cell_to_index, 2):UBOUND(cell_to_index, 2), &
+                                               LBOUND(cell_to_index, 3):UBOUND(cell_to_index, 3)))
+      context%overlap_cell_to_index = cell_to_index
+      CALL build_overlap_matrix(ks_env, matrixkp_s=context%overlap_images, &
+                                matrix_name="ECD IMPLICIT GAMMA OVERLAP IMAGES", basis_type_a="ORB", &
+                                basis_type_b="ORB", sab_nl=context%sab_orb, ext_kpoints=context%image_kpoints)
+
+      IF (.NOT. ASSOCIATED(context%overlap_images) .OR. SIZE(context%overlap_images, 1) /= 1 .OR. &
+          SIZE(context%overlap_images, 2) /= nimages) THEN
+         CPABORT("ECD| Implicit-Gamma overlap image snapshot dimensions are inconsistent")
+      END IF
+
+   END SUBROUTINE ecd_gamma_context_overlap_images_build
+
+! **************************************************************************************************
+!> \brief Build the field-free core Hamiltonian in the overlap-image representation.
+!>
+!> The core matrix has an external image-kpoint construction path.  The density
+!> argument is present for shared integral interfaces and remains unused because
+!> this snapshot does not request forces.
+! **************************************************************************************************
+   SUBROUTINE ecd_gamma_context_core_images_build(context, qs_env)
+      TYPE(ecd_gamma_context_type), INTENT(INOUT)        :: context
+      TYPE(qs_environment_type), POINTER                 :: qs_env
+
+      INTEGER                                            :: iimage, ispin, nimages, ppl_method
+      TYPE(dbcsr_p_type), DIMENSION(:, :), POINTER       :: density_dummy
+
+      IF (ASSOCIATED(context%core_images)) THEN
+         CPABORT("ECD| Implicit-Gamma core image snapshot is already allocated")
+      END IF
+      IF (.NOT. ASSOCIATED(context%image_kpoints) .OR. .NOT. ASSOCIATED(context%overlap_images)) THEN
+         CPABORT("ECD| Implicit-Gamma core image snapshot requires the overlap image environment")
+      END IF
+      nimages = SIZE(context%overlap_images, 2)
+      IF (SIZE(context%matrix_h) /= 1) THEN
+         CPABORT("ECD| Implicit-Gamma folded core matrix has an unsupported shape")
+      END IF
+
+      NULLIFY (density_dummy)
+      CALL dbcsr_allocate_matrix_set(density_dummy, context%nspin, nimages)
+      DO iimage = 1, nimages
+         DO ispin = 1, context%nspin
+            CALL dbcsr_init_p(density_dummy(ispin, iimage)%matrix)
+            CALL dbcsr_create(density_dummy(ispin, iimage)%matrix, template=context%matrix_s(1)%matrix, &
+                              matrix_type=dbcsr_type_no_symmetry, name="ECD CORE SNAPSHOT DENSITY")
+            CALL cp_dbcsr_alloc_block_from_nbl(density_dummy(ispin, iimage)%matrix, context%sab_orb)
+            CALL dbcsr_set(density_dummy(ispin, iimage)%matrix, 0.0_dp)
+         END DO
+      END DO
+
+      CALL kinetic_energy_matrix(qs_env, matrixkp_t=context%core_images, matrix_p=density_dummy, &
+                                 ext_kpoints=context%image_kpoints, matrix_name="ECD CORE KINETIC", &
+                                 calculate_forces=.FALSE., sab_orb=context%sab_orb)
+      ppl_method = context%dft_control%qs_control%do_ppl_method
+      CALL core_matrices(qs_env, context%core_images, density_dummy, calculate_forces=.FALSE., nder=0, &
+                         ext_kpoints=context%image_kpoints)
+      context%dft_control%qs_control%do_ppl_method = ppl_method
+      CALL dbcsr_deallocate_matrix_set(density_dummy)
+
+      IF (.NOT. ASSOCIATED(context%core_images) .OR. SIZE(context%core_images, 1) /= context%nspin .OR. &
+          SIZE(context%core_images, 2) /= nimages) THEN
+         CPABORT("ECD| Implicit-Gamma core image snapshot dimensions are inconsistent")
+      END IF
+
+   END SUBROUTINE ecd_gamma_context_core_images_build
 
 ! **************************************************************************************************
 !> \brief Release ECD-owned metadata while preserving borrowed Quickstep objects.
@@ -154,7 +360,23 @@ CONTAINS
          END DO
          DEALLOCATE (context%spin)
       END IF
-      NULLIFY (context%cell, context%matrix_ks, context%matrix_s, context%dft_control, context%sab_orb, &
+      IF (ASSOCIATED(context%overlap_images)) THEN
+         CALL dbcsr_deallocate_matrix_set(context%overlap_images)
+         NULLIFY (context%overlap_images)
+      END IF
+      IF (ASSOCIATED(context%core_images)) THEN
+         CALL dbcsr_deallocate_matrix_set(context%core_images)
+         NULLIFY (context%core_images)
+      END IF
+      IF (ASSOCIATED(context%image_kpoints)) THEN
+         CALL kpoint_release(context%image_kpoints)
+      END IF
+      IF (ASSOCIATED(context%overlap_cell_to_index)) THEN
+         DEALLOCATE (context%overlap_cell_to_index)
+         NULLIFY (context%overlap_cell_to_index)
+      END IF
+      NULLIFY (context%cell, context%matrix_h, context%matrix_ks, context%matrix_s, context%dft_control, &
+               context%sab_orb, &
                context%sab_all, context%sap_ppnl, context%particle_set, context%qs_kind_set)
       context%nspin = 0
       context%spatial_order = 0
