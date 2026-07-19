@@ -57,7 +57,9 @@ MODULE qs_ecd_gamma_data
 
    TYPE, PUBLIC :: ecd_gamma_spin_type
       INTEGER                                      :: nao = 0, nmo = 0
-      REAL(KIND=dp), DIMENSION(:), POINTER        :: eigenvalues => NULL(), occupations => NULL()
+      REAL(KIND=dp), DIMENSION(:), POINTER        :: eigenvalues => NULL(), eigenvalue_first => NULL(), &
+                                                       eigenvalue_reference => NULL(), occupations => NULL()
+      COMPLEX(KIND=dp), ALLOCATABLE, DIMENSION(:, :) :: band_rotation, coefficient_first
       TYPE(cp_fm_type), POINTER                    :: mo_coeff => NULL()
       TYPE(ecd_band_manifold_type), DIMENSION(:), &
          POINTER                                   :: manifolds => NULL()
@@ -75,7 +77,12 @@ MODULE qs_ecd_gamma_data
       TYPE(cell_type), POINTER                                :: cell => NULL()
       TYPE(dbcsr_p_type), DIMENSION(:), POINTER               :: matrix_h => NULL(), matrix_ks => NULL(), &
                                                                   matrix_s => NULL()
-      TYPE(dbcsr_p_type), DIMENSION(:, :), POINTER            :: core_images => NULL(), overlap_images => NULL()
+      TYPE(dbcsr_p_type), DIMENSION(:, :), POINTER            :: core_images => NULL(), &
+                                                                  local_potential_images => NULL(), overlap_images => NULL()
+      TYPE(dbcsr_p_type), DIMENSION(:, :), POINTER            :: current_taylor_imag => NULL(), &
+                                                                  current_taylor_real => NULL()
+      TYPE(dbcsr_p_type), DIMENSION(:), POINTER               :: ks_first_imag => NULL(), ks_first_real => NULL(), &
+                                                                  overlap_first_imag => NULL(), overlap_first_real => NULL()
       TYPE(dft_control_type), POINTER                         :: dft_control => NULL()
       TYPE(neighbor_list_set_p_type), DIMENSION(:), POINTER   :: sab_orb => NULL(), sab_all => NULL(), &
                                                                   sap_ppnl => NULL()
@@ -87,6 +94,7 @@ MODULE qs_ecd_gamma_data
 
    PUBLIC :: ecd_gamma_context_create_implicit, &
              ecd_gamma_context_core_images_get, &
+             ecd_gamma_context_local_potential_images_get, &
              ecd_gamma_context_overlap_images_get, &
              ecd_gamma_context_overlap_images_status, &
              ecd_gamma_context_release
@@ -113,8 +121,11 @@ CONTAINS
       TYPE(mp_para_env_type), POINTER                     :: para_env
       TYPE(qs_ks_env_type), POINTER                       :: ks_env
 
-      NULLIFY (context%core_images, context%translation_layout%external_kpoints, &
-               context%translation_layout%cell_to_index, context%overlap_images)
+      NULLIFY (context%core_images, context%current_taylor_imag, context%current_taylor_real, context%ks_first_imag, &
+               context%ks_first_real, context%local_potential_images, &
+               context%overlap_first_imag, context%overlap_first_real, &
+               context%translation_layout%external_kpoints, context%translation_layout%cell_to_index, &
+               context%overlap_images)
       context%translation_layout%ntranslations = 0
       NULLIFY (blacs_env, eigenvalues, ks_env, mo_coeff, mos, occupations, para_env)
       CALL get_qs_env(qs_env, cell=context%cell, do_kpoints=do_kpoints, mos=mos, &
@@ -202,6 +213,27 @@ CONTAINS
       cell_to_index => context%translation_layout%cell_to_index
 
    END SUBROUTINE ecd_gamma_context_core_images_get
+
+! **************************************************************************************************
+!> \brief Borrow frozen local-potential translation matrices and their shared cell map.
+! **************************************************************************************************
+   SUBROUTINE ecd_gamma_context_local_potential_images_get(context, local_potential_images, cell_to_index)
+      TYPE(ecd_gamma_context_type), INTENT(IN), TARGET   :: context
+      TYPE(dbcsr_p_type), DIMENSION(:, :), POINTER       :: local_potential_images
+      INTEGER, DIMENSION(:, :, :), POINTER               :: cell_to_index
+
+      IF (.NOT. ASSOCIATED(context%local_potential_images) .OR. &
+          .NOT. ASSOCIATED(context%translation_layout%cell_to_index)) THEN
+         CPABORT("ECD| Implicit-Gamma local-potential translation snapshot is unavailable")
+      END IF
+      IF (SIZE(context%local_potential_images, 1) /= context%nspin .OR. &
+          SIZE(context%local_potential_images, 2) /= context%translation_layout%ntranslations) THEN
+         CPABORT("ECD| Implicit-Gamma local-potential translation snapshot dimensions are inconsistent")
+      END IF
+      local_potential_images => context%local_potential_images
+      cell_to_index => context%translation_layout%cell_to_index
+
+   END SUBROUTINE ecd_gamma_context_local_potential_images_get
 
 ! **************************************************************************************************
 !> \brief Borrow the ECD-owned image-resolved overlap matrices and their cell map.
@@ -367,7 +399,14 @@ CONTAINS
       IF (ALLOCATED(context%spin)) THEN
          DO ispin = 1, SIZE(context%spin)
             CALL ecd_band_manifolds_release(context%spin(ispin)%manifolds)
-            NULLIFY (context%spin(ispin)%eigenvalues, context%spin(ispin)%occupations, &
+            IF (ASSOCIATED(context%spin(ispin)%eigenvalue_first)) DEALLOCATE (context%spin(ispin)%eigenvalue_first)
+            IF (ASSOCIATED(context%spin(ispin)%eigenvalue_reference)) THEN
+               DEALLOCATE (context%spin(ispin)%eigenvalue_reference)
+            END IF
+            IF (ALLOCATED(context%spin(ispin)%band_rotation)) DEALLOCATE (context%spin(ispin)%band_rotation)
+            IF (ALLOCATED(context%spin(ispin)%coefficient_first)) DEALLOCATE (context%spin(ispin)%coefficient_first)
+            NULLIFY (context%spin(ispin)%eigenvalues, context%spin(ispin)%eigenvalue_first, &
+                     context%spin(ispin)%eigenvalue_reference, context%spin(ispin)%occupations, &
                      context%spin(ispin)%mo_coeff)
          END DO
          DEALLOCATE (context%spin)
@@ -379,6 +418,34 @@ CONTAINS
       IF (ASSOCIATED(context%core_images)) THEN
          CALL dbcsr_deallocate_matrix_set(context%core_images)
          NULLIFY (context%core_images)
+      END IF
+      IF (ASSOCIATED(context%local_potential_images)) THEN
+         CALL dbcsr_deallocate_matrix_set(context%local_potential_images)
+         NULLIFY (context%local_potential_images)
+      END IF
+      IF (ASSOCIATED(context%current_taylor_imag)) THEN
+         CALL dbcsr_deallocate_matrix_set(context%current_taylor_imag)
+         NULLIFY (context%current_taylor_imag)
+      END IF
+      IF (ASSOCIATED(context%current_taylor_real)) THEN
+         CALL dbcsr_deallocate_matrix_set(context%current_taylor_real)
+         NULLIFY (context%current_taylor_real)
+      END IF
+      IF (ASSOCIATED(context%ks_first_real)) THEN
+         CALL dbcsr_deallocate_matrix_set(context%ks_first_real)
+         NULLIFY (context%ks_first_real)
+      END IF
+      IF (ASSOCIATED(context%ks_first_imag)) THEN
+         CALL dbcsr_deallocate_matrix_set(context%ks_first_imag)
+         NULLIFY (context%ks_first_imag)
+      END IF
+      IF (ASSOCIATED(context%overlap_first_real)) THEN
+         CALL dbcsr_deallocate_matrix_set(context%overlap_first_real)
+         NULLIFY (context%overlap_first_real)
+      END IF
+      IF (ASSOCIATED(context%overlap_first_imag)) THEN
+         CALL dbcsr_deallocate_matrix_set(context%overlap_first_imag)
+         NULLIFY (context%overlap_first_imag)
       END IF
       IF (ASSOCIATED(context%translation_layout%external_kpoints)) THEN
          CALL kpoint_release(context%translation_layout%external_kpoints)

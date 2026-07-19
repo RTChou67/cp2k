@@ -77,6 +77,7 @@ MODULE qs_ecd_periodic
                                               ecd_project_real_operator_to_mo
    USE qs_ecd_gamma_data,               ONLY: ecd_gamma_context_create_implicit,&
                                               ecd_gamma_context_core_images_get,&
+                                              ecd_gamma_context_local_potential_images_get,&
                                               ecd_gamma_context_overlap_images_get,&
                                               ecd_gamma_context_overlap_images_status,&
                                               ecd_gamma_context_release,&
@@ -284,6 +285,9 @@ CONTAINS
          CALL ecd_periodic_implicit_gamma_current_g4(qs_env, gamma_context, gamma_operators, &
                                                       pseudopotential_commutator)
          CALL ecd_periodic_implicit_gamma_ks_g6(qs_env, gamma_context)
+         CALL ecd_periodic_implicit_gamma_ks_phase_g7(gamma_context)
+         CALL ecd_periodic_implicit_gamma_state_g8(gamma_context)
+         CALL ecd_periodic_implicit_gamma_transition_g9(gamma_context, transition_band_range)
       END IF
       CALL ecd_periodic_implicit_gamma_zero_order_response(qs_env, ecd_section, gamma_context, gamma_operators, &
                                                             electric_gauge, transition_band_range, energy_range, &
@@ -378,7 +382,7 @@ CONTAINS
 !> Taylor coefficient before KS image assembly and state-response construction.
 ! **************************************************************************************************
    SUBROUTINE ecd_periodic_implicit_gamma_overlap_g3(context)
-      TYPE(ecd_gamma_context_type), INTENT(IN), TARGET   :: context
+      TYPE(ecd_gamma_context_type), INTENT(INOUT), TARGET :: context
 
       REAL(KIND=dp), PARAMETER                           :: fd_step = 1.0E-5_dp
 
@@ -404,6 +408,9 @@ CONTAINS
       IF (SIZE(overlap_images, 2) /= nimages) THEN
          CPABORT("ECD| Stage G3 overlap image count is inconsistent")
       END IF
+      IF (ASSOCIATED(context%overlap_first_real) .OR. ASSOCIATED(context%overlap_first_imag)) THEN
+         CPABORT("ECD| Stage G3 overlap Taylor coefficients are already allocated")
+      END IF
 
       xkp_zero = 0.0_dp
       xkp_step = fd_step*MATMUL(TRANSPOSE(context%cell%hmat), context%direction)/twopi
@@ -414,10 +421,12 @@ CONTAINS
                                       'ECD G3 overlap fold', dbcsr_type_symmetric)
       CALL ecd_periodic_ao_set_create(fold_residual, 1, context%matrix_s(1)%matrix, context%sab_orb, &
                                       'ECD G3 overlap fold residual', dbcsr_type_symmetric)
-      CALL ecd_periodic_ao_set_create(derivative_real, 1, context%matrix_s(1)%matrix, context%sab_orb, &
+      CALL ecd_periodic_ao_set_create(context%overlap_first_real, 1, context%matrix_s(1)%matrix, context%sab_orb, &
                                       'ECD G3 overlap derivative real', dbcsr_type_symmetric)
-      CALL ecd_periodic_ao_set_create(derivative_imag, 1, context%matrix_s(1)%matrix, context%sab_orb, &
+      CALL ecd_periodic_ao_set_create(context%overlap_first_imag, 1, context%matrix_s(1)%matrix, context%sab_orb, &
                                       'ECD G3 overlap derivative imag', dbcsr_type_antisymmetric)
+      derivative_real => context%overlap_first_real
+      derivative_imag => context%overlap_first_imag
       CALL ecd_periodic_ao_set_create(plus_real, 1, context%matrix_s(1)%matrix, context%sab_orb, &
                                       'ECD G3 overlap positive real', dbcsr_type_symmetric)
       CALL ecd_periodic_ao_set_create(plus_imag, 1, context%matrix_s(1)%matrix, context%sab_orb, &
@@ -467,8 +476,7 @@ CONTAINS
             'ECD| Stage G3 overlap finite-difference step [bohr^-1]', fd_step
       END IF
 
-      CALL dbcsr_deallocate_matrix_set(derivative_imag)
-      CALL dbcsr_deallocate_matrix_set(derivative_real)
+      NULLIFY (derivative_imag, derivative_real)
       CALL dbcsr_deallocate_matrix_set(fd_imag)
       CALL dbcsr_deallocate_matrix_set(fold_residual)
       CALL dbcsr_deallocate_matrix_set(fold_zero)
@@ -528,7 +536,7 @@ CONTAINS
 ! **************************************************************************************************
    SUBROUTINE ecd_periodic_implicit_gamma_ks_g6(qs_env, context)
       TYPE(qs_environment_type), POINTER                 :: qs_env
-      TYPE(ecd_gamma_context_type), INTENT(IN), TARGET   :: context
+      TYPE(ecd_gamma_context_type), INTENT(INOUT), TARGET :: context
 
       INTEGER                                            :: ispin, nimages
       REAL(KIND=dp)                                      :: exc_dummy, fold_norm_sq, residual_norm_sq
@@ -562,6 +570,9 @@ CONTAINS
       END IF
       IF (SIZE(core_images, 1) /= context%nspin .OR. SIZE(context%matrix_ks) /= context%nspin) THEN
          CPABORT("ECD| Stage G6 KS image spin structure is inconsistent")
+      END IF
+      IF (ASSOCIATED(context%local_potential_images)) THEN
+         CPABORT("ECD| Stage G6 local-potential translation snapshot is already allocated")
       END IF
 
       CALL get_qs_env(qs_env, dft_control=dft_control, input=input, ks_env=ks_env, pw_env=pw_env, rho=rho, &
@@ -611,6 +622,7 @@ CONTAINS
          CALL auxbas_pw_pool%give_back_pw(vxc_rho(ispin))
       END DO
       DEALLOCATE (vxc_rho)
+      context%local_potential_images => local_images
 
       xkp_zero = 0.0_dp
       CALL ecd_periodic_ao_set_create(core_fold, context%nspin, context%matrix_ks(1)%matrix, context%sab_orb, &
@@ -651,10 +663,416 @@ CONTAINS
       CALL dbcsr_deallocate_matrix_set(ks_fold)
       CALL dbcsr_deallocate_matrix_set(ks_residual)
       CALL dbcsr_deallocate_matrix_set(local_fold)
-      CALL dbcsr_deallocate_matrix_set(local_images)
+      NULLIFY (local_images)
       CALL deallocate_task_list(image_task_list)
 
    END SUBROUTINE ecd_periodic_implicit_gamma_ks_g6
+
+! **************************************************************************************************
+!> \brief Build and validate the first directional KS Taylor coefficient from frozen translations.
+! **************************************************************************************************
+   SUBROUTINE ecd_periodic_implicit_gamma_ks_phase_g7(context)
+      TYPE(ecd_gamma_context_type), INTENT(INOUT), TARGET :: context
+
+      REAL(KIND=dp), PARAMETER                           :: fd_step = 1.0E-5_dp
+
+      INTEGER                                            :: ispin, nimages
+      REAL(KIND=dp)                                      :: fd_residual_norm_sq, first_imag_norm_sq, first_real_norm_sq
+      REAL(KIND=dp), DIMENSION(3)                        :: xkp_minus, xkp_plus, xkp_step, xkp_zero
+      TYPE(cp_logger_type), POINTER                      :: logger
+      TYPE(dbcsr_p_type), DIMENSION(:, :), POINTER       :: core_images, local_potential_images
+      TYPE(dbcsr_p_type), DIMENSION(:), POINTER          :: core_first_imag, core_first_real, &
+                                                            local_first_imag, local_first_real, fd_imag, &
+                                                            minus_imag, minus_real, plus_imag, plus_real
+      INTEGER, DIMENSION(:, :, :), POINTER               :: cell_to_index
+
+      NULLIFY (cell_to_index, core_first_imag, core_first_real, core_images, fd_imag, local_first_imag, &
+               local_first_real, local_potential_images, logger, minus_imag, minus_real, plus_imag, plus_real)
+      CALL ecd_gamma_context_core_images_get(context, core_images, cell_to_index)
+      CALL ecd_gamma_context_local_potential_images_get(context, local_potential_images, cell_to_index)
+      nimages = context%translation_layout%ntranslations
+      IF (SIZE(core_images, 1) /= context%nspin .OR. SIZE(local_potential_images, 1) /= context%nspin .OR. &
+          SIZE(core_images, 2) /= nimages .OR. SIZE(local_potential_images, 2) /= nimages) THEN
+         CPABORT("ECD| Stage G7 KS translation snapshots have inconsistent dimensions")
+      END IF
+      IF (ASSOCIATED(context%ks_first_real) .OR. ASSOCIATED(context%ks_first_imag)) THEN
+         CPABORT("ECD| Stage G7 KS Taylor coefficients are already allocated")
+      END IF
+
+      xkp_zero = 0.0_dp
+      xkp_step = fd_step*MATMUL(TRANSPOSE(context%cell%hmat), context%direction)/twopi
+      xkp_plus = xkp_zero + xkp_step
+      xkp_minus = xkp_zero - xkp_step
+      CALL ecd_periodic_ao_set_create(core_first_real, context%nspin, context%matrix_ks(1)%matrix, context%sab_orb, &
+                                      'ECD G7 core first real', dbcsr_type_symmetric)
+      CALL ecd_periodic_ao_set_create(core_first_imag, context%nspin, context%matrix_ks(1)%matrix, context%sab_orb, &
+                                      'ECD G7 core first imaginary', dbcsr_type_antisymmetric)
+      CALL ecd_periodic_ao_set_create(local_first_real, context%nspin, context%matrix_ks(1)%matrix, context%sab_orb, &
+                                      'ECD G7 local first real', dbcsr_type_symmetric)
+      CALL ecd_periodic_ao_set_create(local_first_imag, context%nspin, context%matrix_ks(1)%matrix, context%sab_orb, &
+                                      'ECD G7 local first imaginary', dbcsr_type_antisymmetric)
+      CALL ecd_periodic_ao_set_create(context%ks_first_real, context%nspin, context%matrix_ks(1)%matrix, &
+                                      context%sab_orb, 'ECD G7 KS first real', dbcsr_type_symmetric)
+      CALL ecd_periodic_ao_set_create(context%ks_first_imag, context%nspin, context%matrix_ks(1)%matrix, &
+                                      context%sab_orb, 'ECD G7 KS first imaginary', dbcsr_type_antisymmetric)
+      CALL ecd_periodic_ao_set_create(plus_real, context%nspin, context%matrix_ks(1)%matrix, context%sab_orb, &
+                                      'ECD G7 KS positive real', dbcsr_type_symmetric)
+      CALL ecd_periodic_ao_set_create(plus_imag, context%nspin, context%matrix_ks(1)%matrix, context%sab_orb, &
+                                      'ECD G7 KS positive imaginary', dbcsr_type_antisymmetric)
+      CALL ecd_periodic_ao_set_create(minus_real, context%nspin, context%matrix_ks(1)%matrix, context%sab_orb, &
+                                      'ECD G7 KS negative real', dbcsr_type_symmetric)
+      CALL ecd_periodic_ao_set_create(minus_imag, context%nspin, context%matrix_ks(1)%matrix, context%sab_orb, &
+                                      'ECD G7 KS negative imaginary', dbcsr_type_antisymmetric)
+      CALL ecd_periodic_ao_set_create(fd_imag, context%nspin, context%matrix_ks(1)%matrix, context%sab_orb, &
+                                      'ECD G7 KS finite difference imaginary', dbcsr_type_antisymmetric)
+
+      DO ispin = 1, context%nspin
+         CALL rskp_directional_taylor_transform(core_first_real(ispin)%matrix, core_first_imag(ispin)%matrix, &
+                                                core_images, ispin, xkp_zero, cell_to_index, context%sab_orb, &
+                                                context%cell%hmat, context%direction, 1)
+         CALL rskp_directional_taylor_transform(local_first_real(ispin)%matrix, local_first_imag(ispin)%matrix, &
+                                                local_potential_images, ispin, xkp_zero, cell_to_index, &
+                                                context%sab_orb, context%cell%hmat, context%direction, 1)
+         CALL dbcsr_set(context%ks_first_real(ispin)%matrix, 0.0_dp)
+         CALL dbcsr_add(context%ks_first_real(ispin)%matrix, core_first_real(ispin)%matrix, 0.0_dp, 1.0_dp)
+         CALL dbcsr_add(context%ks_first_real(ispin)%matrix, local_first_real(ispin)%matrix, 1.0_dp, 1.0_dp)
+         CALL dbcsr_set(context%ks_first_imag(ispin)%matrix, 0.0_dp)
+         CALL dbcsr_add(context%ks_first_imag(ispin)%matrix, core_first_imag(ispin)%matrix, 0.0_dp, 1.0_dp)
+         CALL dbcsr_add(context%ks_first_imag(ispin)%matrix, local_first_imag(ispin)%matrix, 1.0_dp, 1.0_dp)
+
+         CALL rskp_transform(plus_real(ispin)%matrix, plus_imag(ispin)%matrix, core_images, ispin, xkp_plus, &
+                             cell_to_index, context%sab_orb)
+         CALL rskp_transform(plus_real(ispin)%matrix, plus_imag(ispin)%matrix, local_potential_images, ispin, &
+                             xkp_plus, cell_to_index, context%sab_orb)
+         CALL rskp_transform(minus_real(ispin)%matrix, minus_imag(ispin)%matrix, core_images, ispin, xkp_minus, &
+                             cell_to_index, context%sab_orb)
+         CALL rskp_transform(minus_real(ispin)%matrix, minus_imag(ispin)%matrix, local_potential_images, ispin, &
+                             xkp_minus, cell_to_index, context%sab_orb)
+         CALL dbcsr_set(fd_imag(ispin)%matrix, 0.0_dp)
+         CALL dbcsr_add(fd_imag(ispin)%matrix, plus_imag(ispin)%matrix, 0.0_dp, 0.5_dp/fd_step)
+         CALL dbcsr_add(fd_imag(ispin)%matrix, minus_imag(ispin)%matrix, 1.0_dp, -0.5_dp/fd_step)
+         CALL dbcsr_add(fd_imag(ispin)%matrix, context%ks_first_imag(ispin)%matrix, 1.0_dp, -1.0_dp)
+         CALL dbcsr_dot(context%ks_first_real(ispin)%matrix, context%ks_first_real(ispin)%matrix, &
+                        first_real_norm_sq)
+         CALL dbcsr_dot(context%ks_first_imag(ispin)%matrix, context%ks_first_imag(ispin)%matrix, &
+                        first_imag_norm_sq)
+         CALL dbcsr_dot(fd_imag(ispin)%matrix, fd_imag(ispin)%matrix, fd_residual_norm_sq)
+         logger => cp_get_default_logger()
+         IF (cp_logger_get_default_io_unit(logger) > 0) THEN
+            WRITE (cp_logger_get_default_io_unit(logger), '(T2,A,I2,T55,ES14.6)') &
+               'ECD| Stage G7 KS first real norm spin', ispin, SQRT(ABS(first_real_norm_sq))
+            WRITE (cp_logger_get_default_io_unit(logger), '(T2,A,I2,T55,ES14.6)') &
+               'ECD| Stage G7 KS first imaginary norm spin', ispin, SQRT(ABS(first_imag_norm_sq))
+            WRITE (cp_logger_get_default_io_unit(logger), '(T2,A,I2,T55,ES14.6)') &
+               'ECD| Stage G7 KS first finite-difference residual spin', ispin, SQRT(ABS(fd_residual_norm_sq))
+         END IF
+      END DO
+      IF (cp_logger_get_default_io_unit(logger) > 0) THEN
+         WRITE (cp_logger_get_default_io_unit(logger), '(T2,A,T55,ES14.6)') &
+            'ECD| Stage G7 KS finite-difference step [bohr^-1]', fd_step
+      END IF
+      CALL dbcsr_deallocate_matrix_set(core_first_imag)
+      CALL dbcsr_deallocate_matrix_set(core_first_real)
+      CALL dbcsr_deallocate_matrix_set(fd_imag)
+      CALL dbcsr_deallocate_matrix_set(local_first_imag)
+      CALL dbcsr_deallocate_matrix_set(local_first_real)
+      CALL dbcsr_deallocate_matrix_set(minus_imag)
+      CALL dbcsr_deallocate_matrix_set(minus_real)
+      CALL dbcsr_deallocate_matrix_set(plus_imag)
+      CALL dbcsr_deallocate_matrix_set(plus_real)
+
+   END SUBROUTINE ecd_periodic_implicit_gamma_ks_phase_g7
+
+! **************************************************************************************************
+!> \brief Solve the first Gamma generalized-eigenproblem response from retained phase coefficients.
+! **************************************************************************************************
+   SUBROUTINE ecd_periodic_implicit_gamma_state_g8(context)
+      TYPE(ecd_gamma_context_type), INTENT(INOUT), TARGET :: context
+
+      INTEGER                                            :: ispin, nao, nimages, nmo
+      REAL(KIND=dp), PARAMETER                           :: fd_step = 1.0E-5_dp
+      REAL(KIND=dp)                                      :: direct_energy_residual_max, direct_energy_residual_norm, &
+                                                            eigenvector_derivative_norm, equation_residual_norm, &
+                                                            manifold_residual_norm, normalization_residual_norm
+      REAL(KIND=dp), ALLOCATABLE, DIMENSION(:)           :: eigenvalue_derivative, eigenvalue_reference, plus_eigenvalues
+      REAL(KIND=dp), DIMENSION(3)                        :: xkp_plus, xkp_step, xkp_zero
+      TYPE(cp_cfm_type)                                  :: hamiltonian_derivative_mo, hamiltonian_plus, &
+                                                            overlap_derivative_mo, overlap_plus, plus_eigenvectors, plus_work
+      TYPE(cp_fm_type)                                   :: hamiltonian_derivative_raw, hamiltonian_plus_imag, &
+                                                            hamiltonian_plus_real, overlap_derivative_raw, overlap_plus_imag, &
+                                                            overlap_plus_real
+      TYPE(cp_logger_type), POINTER                      :: logger
+      TYPE(dbcsr_p_type), DIMENSION(:, :), POINTER       :: core_images, local_images, overlap_images
+      TYPE(dbcsr_p_type), DIMENSION(:), POINTER          :: hamiltonian_plus_imag_ao, hamiltonian_plus_real_ao, &
+                                                            overlap_plus_imag_ao, overlap_plus_real_ao
+      INTEGER, DIMENSION(:, :, :), POINTER               :: cell_to_index
+
+      NULLIFY (cell_to_index, core_images, hamiltonian_plus_imag_ao, hamiltonian_plus_real_ao, local_images, logger, &
+               overlap_images, overlap_plus_imag_ao, overlap_plus_real_ao)
+      IF (.NOT. ASSOCIATED(context%ks_first_imag) .OR. .NOT. ASSOCIATED(context%overlap_first_imag)) THEN
+         CPABORT("ECD| Stage G8 requires retained first-order KS and overlap coefficients")
+      END IF
+      IF (SIZE(context%ks_first_imag) /= context%nspin .OR. SIZE(context%overlap_first_imag) /= 1) THEN
+         CPABORT("ECD| Stage G8 first-order coefficient spin dimensions are inconsistent")
+      END IF
+      CALL ecd_gamma_context_core_images_get(context, core_images, cell_to_index)
+      CALL ecd_gamma_context_local_potential_images_get(context, local_images, cell_to_index)
+      CALL ecd_gamma_context_overlap_images_get(context, overlap_images, cell_to_index)
+      nimages = context%translation_layout%ntranslations
+      IF (nimages < 1 .OR. SIZE(core_images, 2) /= nimages .OR. SIZE(local_images, 2) /= nimages .OR. &
+          SIZE(overlap_images, 2) /= nimages) THEN
+         CPABORT("ECD| Stage G8 translation snapshot dimensions are inconsistent")
+      END IF
+      IF (SIZE(core_images, 1) /= context%nspin .OR. SIZE(local_images, 1) /= context%nspin .OR. &
+          SIZE(overlap_images, 1) /= 1) THEN
+         CPABORT("ECD| Stage G8 translation snapshot spin dimensions are inconsistent")
+      END IF
+
+      xkp_zero = 0.0_dp
+      xkp_step = fd_step*MATMUL(TRANSPOSE(context%cell%hmat), context%direction)/twopi
+      xkp_plus = xkp_zero + xkp_step
+      CALL ecd_periodic_ao_set_create(hamiltonian_plus_real_ao, context%nspin, context%matrix_ks(1)%matrix, &
+                                      context%sab_orb, 'ECD G8 positive-q KS real', dbcsr_type_symmetric)
+      CALL ecd_periodic_ao_set_create(hamiltonian_plus_imag_ao, context%nspin, context%matrix_ks(1)%matrix, &
+                                      context%sab_orb, 'ECD G8 positive-q KS imaginary', dbcsr_type_antisymmetric)
+      CALL ecd_periodic_ao_set_create(overlap_plus_real_ao, 1, context%matrix_s(1)%matrix, context%sab_orb, &
+                                      'ECD G8 positive-q overlap real', dbcsr_type_symmetric)
+      CALL ecd_periodic_ao_set_create(overlap_plus_imag_ao, 1, context%matrix_s(1)%matrix, context%sab_orb, &
+                                      'ECD G8 positive-q overlap imaginary', dbcsr_type_antisymmetric)
+      CALL rskp_transform(overlap_plus_real_ao(1)%matrix, overlap_plus_imag_ao(1)%matrix, overlap_images, 1, &
+                          xkp_plus, cell_to_index, context%sab_orb)
+      logger => cp_get_default_logger()
+      DO ispin = 1, context%nspin
+         nmo = context%spin(ispin)%nmo
+         nao = context%spin(ispin)%nao
+         IF (nao < 1 .OR. nmo < 1 .OR. .NOT. ASSOCIATED(context%spin(ispin)%mo_coeff) .OR. &
+             .NOT. ASSOCIATED(context%spin(ispin)%eigenvalues) .OR. &
+             .NOT. ASSOCIATED(context%spin(ispin)%manifolds)) THEN
+            CPABORT("ECD| Stage G8 Gamma MO data are incomplete")
+         END IF
+         IF (ASSOCIATED(context%spin(ispin)%eigenvalue_first) .OR. &
+             ASSOCIATED(context%spin(ispin)%eigenvalue_reference) .OR. &
+             ALLOCATED(context%spin(ispin)%band_rotation) .OR. &
+             ALLOCATED(context%spin(ispin)%coefficient_first)) THEN
+            CPABORT("ECD| Stage G8 state-response data are already allocated")
+         END IF
+
+         CALL ecd_project_real_operator_to_mo(context%ks_first_imag(ispin), context%spin(ispin)%mo_coeff, &
+                                              context%spin(ispin)%nao, nmo, hamiltonian_derivative_raw)
+         CALL ecd_project_real_operator_to_mo(context%overlap_first_imag(1), context%spin(ispin)%mo_coeff, &
+                                              context%spin(ispin)%nao, nmo, overlap_derivative_raw)
+         CALL cp_cfm_create(hamiltonian_derivative_mo, hamiltonian_derivative_raw%matrix_struct, &
+                            name='ECD G8 KS derivative in MO basis', set_zero=.TRUE.)
+         CALL cp_cfm_create(overlap_derivative_mo, overlap_derivative_raw%matrix_struct, &
+                            name='ECD G8 overlap derivative in MO basis', set_zero=.TRUE.)
+         CALL cp_fm_to_cfm(msourcei=hamiltonian_derivative_raw, mtarget=hamiltonian_derivative_mo)
+         CALL cp_fm_to_cfm(msourcei=overlap_derivative_raw, mtarget=overlap_derivative_mo)
+         CALL cp_fm_release(hamiltonian_derivative_raw)
+         CALL cp_fm_release(overlap_derivative_raw)
+
+         CALL ecd_band_first_order_response(eigenvalue_reference, eigenvalue_derivative, &
+                                            equation_residual_norm, normalization_residual_norm, &
+                                            manifold_residual_norm, eigenvector_derivative_norm, &
+                                            hamiltonian_derivative_mo, overlap_derivative_mo, &
+                                            context%spin(ispin)%eigenvalues, context%spin(ispin)%manifolds, &
+                                            context%spin(ispin)%band_rotation, context%spin(ispin)%coefficient_first)
+         ALLOCATE (context%spin(ispin)%eigenvalue_first(nmo))
+         context%spin(ispin)%eigenvalue_first = eigenvalue_derivative
+         ALLOCATE (context%spin(ispin)%eigenvalue_reference(nmo))
+         context%spin(ispin)%eigenvalue_reference = eigenvalue_reference
+
+         CALL rskp_transform(hamiltonian_plus_real_ao(ispin)%matrix, hamiltonian_plus_imag_ao(ispin)%matrix, &
+                             core_images, ispin, xkp_plus, cell_to_index, context%sab_orb)
+         CALL rskp_transform(hamiltonian_plus_real_ao(ispin)%matrix, hamiltonian_plus_imag_ao(ispin)%matrix, &
+                             local_images, ispin, xkp_plus, cell_to_index, context%sab_orb)
+         CALL cp_fm_create(hamiltonian_plus_real, context%spin(ispin)%mo_coeff%matrix_struct, nrow=nao, ncol=nao, &
+                           set_zero=.TRUE.)
+         CALL cp_fm_create(hamiltonian_plus_imag, context%spin(ispin)%mo_coeff%matrix_struct, nrow=nao, ncol=nao, &
+                           set_zero=.TRUE.)
+         CALL cp_fm_create(overlap_plus_real, context%spin(ispin)%mo_coeff%matrix_struct, nrow=nao, ncol=nao, &
+                           set_zero=.TRUE.)
+         CALL cp_fm_create(overlap_plus_imag, context%spin(ispin)%mo_coeff%matrix_struct, nrow=nao, ncol=nao, &
+                           set_zero=.TRUE.)
+         CALL copy_dbcsr_to_fm(hamiltonian_plus_real_ao(ispin)%matrix, hamiltonian_plus_real)
+         CALL copy_dbcsr_to_fm(hamiltonian_plus_imag_ao(ispin)%matrix, hamiltonian_plus_imag)
+         CALL copy_dbcsr_to_fm(overlap_plus_real_ao(1)%matrix, overlap_plus_real)
+         CALL copy_dbcsr_to_fm(overlap_plus_imag_ao(1)%matrix, overlap_plus_imag)
+         CALL cp_cfm_create(hamiltonian_plus, hamiltonian_plus_real%matrix_struct, &
+                            name='ECD G8 positive-q KS', set_zero=.TRUE.)
+         CALL cp_cfm_create(overlap_plus, overlap_plus_real%matrix_struct, &
+                            name='ECD G8 positive-q overlap', set_zero=.TRUE.)
+         CALL cp_fm_to_cfm(hamiltonian_plus_real, hamiltonian_plus_imag, hamiltonian_plus)
+         CALL cp_fm_to_cfm(overlap_plus_real, overlap_plus_imag, overlap_plus)
+         CALL cp_fm_release(hamiltonian_plus_imag)
+         CALL cp_fm_release(hamiltonian_plus_real)
+         CALL cp_fm_release(overlap_plus_imag)
+         CALL cp_fm_release(overlap_plus_real)
+         CALL cp_cfm_create(plus_eigenvectors, context%spin(ispin)%mo_coeff%matrix_struct, &
+                            name='ECD G8 positive-q eigenvectors', set_zero=.TRUE.)
+         CALL cp_cfm_create(plus_work, hamiltonian_plus%matrix_struct, &
+                            name='ECD G8 positive-q diagonalization work', set_zero=.TRUE.)
+         ALLOCATE (plus_eigenvalues(nmo))
+         CALL cp_cfm_geeig(hamiltonian_plus, overlap_plus, plus_eigenvectors, plus_eigenvalues, plus_work)
+         direct_energy_residual_norm = SQRT(SUM((plus_eigenvalues - &
+                                                 (eigenvalue_reference + fd_step*eigenvalue_derivative))**2))
+         direct_energy_residual_max = MAXVAL(ABS(plus_eigenvalues - &
+                                                 (eigenvalue_reference + fd_step*eigenvalue_derivative)))
+         IF (cp_logger_get_default_io_unit(logger) > 0) THEN
+            WRITE (cp_logger_get_default_io_unit(logger), '(T2,A,I2,T55,ES14.6)') &
+               'ECD| Stage G8 band-energy derivative norm spin', ispin, SQRT(SUM(eigenvalue_derivative**2))
+            WRITE (cp_logger_get_default_io_unit(logger), '(T2,A,I2,T55,ES14.6)') &
+               'ECD| Stage G8 manifold residual spin', ispin, manifold_residual_norm
+            WRITE (cp_logger_get_default_io_unit(logger), '(T2,A,I2,T55,ES14.6)') &
+               'ECD| Stage G8 eigenproblem residual spin', ispin, equation_residual_norm
+            WRITE (cp_logger_get_default_io_unit(logger), '(T2,A,I2,T55,ES14.6)') &
+               'ECD| Stage G8 normalization residual spin', ispin, normalization_residual_norm
+            WRITE (cp_logger_get_default_io_unit(logger), '(T2,A,I2,T55,ES14.6)') &
+               'ECD| Stage G8 eigenvector derivative norm spin', ispin, eigenvector_derivative_norm
+            WRITE (cp_logger_get_default_io_unit(logger), '(T2,A,I2,T55,ES14.6)') &
+               'ECD| Stage G8 positive-q energy residual spin', ispin, direct_energy_residual_norm
+            WRITE (cp_logger_get_default_io_unit(logger), '(T2,A,I2,T55,ES14.6)') &
+               'ECD| Stage G8 positive-q maximum residual spin', ispin, direct_energy_residual_max
+         END IF
+         DEALLOCATE (eigenvalue_derivative, eigenvalue_reference, plus_eigenvalues)
+         CALL cp_cfm_release(hamiltonian_derivative_mo)
+         CALL cp_cfm_release(overlap_derivative_mo)
+         CALL cp_cfm_release(hamiltonian_plus)
+         CALL cp_cfm_release(overlap_plus)
+         CALL cp_cfm_release(plus_eigenvectors)
+         CALL cp_cfm_release(plus_work)
+      END DO
+      IF (cp_logger_get_default_io_unit(logger) > 0) THEN
+         WRITE (cp_logger_get_default_io_unit(logger), '(T2,A,T55,ES14.6)') &
+            'ECD| Stage G8 positive-q step [bohr^-1]', fd_step
+      END IF
+      CALL dbcsr_deallocate_matrix_set(hamiltonian_plus_imag_ao)
+      CALL dbcsr_deallocate_matrix_set(hamiltonian_plus_real_ao)
+      CALL dbcsr_deallocate_matrix_set(overlap_plus_imag_ao)
+      CALL dbcsr_deallocate_matrix_set(overlap_plus_real_ao)
+
+   END SUBROUTINE ecd_periodic_implicit_gamma_state_g8
+
+! **************************************************************************************************
+!> \brief Assemble the complete first-order Gamma transition coefficient from retained providers.
+! **************************************************************************************************
+   SUBROUTINE ecd_periodic_implicit_gamma_transition_g9(context, transition_band_range)
+      TYPE(ecd_gamma_context_type), INTENT(IN), TARGET  :: context
+      INTEGER, DIMENSION(2), INTENT(IN)                 :: transition_band_range
+
+      REAL(KIND=dp), PARAMETER                          :: occupation_threshold = 1.0E-8_dp
+
+      COMPLEX(KIND=dp), ALLOCATABLE, DIMENSION(:, :)    :: current_first_mo, current_first_rotated, &
+                                                           current_zero_mo, current_zero_rotated, state_first, &
+                                                           transition_first
+      INTEGER                                           :: first_band, iband, idir, ispin, ivirt, last_band, nmo, &
+                                                           ntransitions
+      REAL(KIND=dp)                                     :: gap, operator_first_norm_sq, state_first_norm_sq, &
+                                                           total_first_norm_sq, zero_order_norm_sq
+      TYPE(cp_logger_type), POINTER                     :: logger
+
+      NULLIFY (logger)
+      IF (.NOT. ASSOCIATED(context%current_taylor_real) .OR. .NOT. ASSOCIATED(context%current_taylor_imag)) THEN
+         CPABORT("ECD| Stage G9 requires retained current Taylor coefficients")
+      END IF
+      IF (SIZE(context%current_taylor_real, 1) /= ncart .OR. SIZE(context%current_taylor_imag, 1) /= ncart .OR. &
+          SIZE(context%current_taylor_real, 2) < 2 .OR. SIZE(context%current_taylor_imag, 2) < 2) THEN
+         CPABORT("ECD| Stage G9 current Taylor coefficient dimensions are inconsistent")
+      END IF
+      logger => cp_get_default_logger()
+
+      DO ispin = 1, context%nspin
+         nmo = context%spin(ispin)%nmo
+         IF (nmo < 1 .OR. .NOT. ASSOCIATED(context%spin(ispin)%eigenvalues) .OR. &
+             .NOT. ASSOCIATED(context%spin(ispin)%eigenvalue_first) .OR. &
+             .NOT. ASSOCIATED(context%spin(ispin)%eigenvalue_reference) .OR. &
+             .NOT. ASSOCIATED(context%spin(ispin)%mo_coeff) .OR. &
+             .NOT. ASSOCIATED(context%spin(ispin)%manifolds) .OR. &
+             .NOT. ALLOCATED(context%spin(ispin)%band_rotation) .OR. &
+             .NOT. ALLOCATED(context%spin(ispin)%coefficient_first)) THEN
+            CPABORT("ECD| Stage G9 state-response data are incomplete")
+         END IF
+         IF (SIZE(context%spin(ispin)%eigenvalue_first) /= nmo .OR. &
+             SIZE(context%spin(ispin)%eigenvalue_reference) /= nmo .OR. &
+             SIZE(context%spin(ispin)%band_rotation, 1) /= nmo .OR. &
+             SIZE(context%spin(ispin)%band_rotation, 2) /= nmo .OR. &
+             SIZE(context%spin(ispin)%coefficient_first, 1) /= nmo .OR. &
+             SIZE(context%spin(ispin)%coefficient_first, 2) /= nmo) THEN
+            CPABORT("ECD| Stage G9 retained state-response dimensions are inconsistent")
+         END IF
+         IF (ALL(transition_band_range == -1)) THEN
+            first_band = 1
+            last_band = nmo
+         ELSE
+            first_band = transition_band_range(1)
+            last_band = transition_band_range(2)
+            CALL ecd_band_manifolds_validate_window(context%spin(ispin)%manifolds, transition_band_range)
+         END IF
+         IF (first_band < 1 .OR. last_band > nmo .OR. first_band > last_band) THEN
+            CPABORT("ECD| Stage G9 transition band range is inconsistent with the Gamma MO space")
+         END IF
+
+         ntransitions = 0
+         operator_first_norm_sq = 0.0_dp
+         state_first_norm_sq = 0.0_dp
+         total_first_norm_sq = 0.0_dp
+         zero_order_norm_sq = 0.0_dp
+         DO idir = 1, ncart
+            CALL ecd_project_complex_operator_to_mo(context%current_taylor_real(idir, 1), &
+                                                    context%current_taylor_imag(idir, 1), &
+                                                    context%spin(ispin)%mo_coeff, context%spin(ispin)%nao, nmo, &
+                                                    current_zero_mo)
+            CALL ecd_project_complex_operator_to_mo(context%current_taylor_real(idir, 2), &
+                                                    context%current_taylor_imag(idir, 2), &
+                                                    context%spin(ispin)%mo_coeff, context%spin(ispin)%nao, nmo, &
+                                                    current_first_mo)
+            ALLOCATE (current_first_rotated(nmo, nmo), current_zero_rotated(nmo, nmo), state_first(nmo, nmo), &
+                      transition_first(nmo, nmo))
+            current_zero_rotated = MATMUL(CONJG(TRANSPOSE(context%spin(ispin)%band_rotation)), &
+                                           MATMUL(current_zero_mo, context%spin(ispin)%band_rotation))
+            current_first_rotated = MATMUL(CONJG(TRANSPOSE(context%spin(ispin)%band_rotation)), &
+                                            MATMUL(current_first_mo, context%spin(ispin)%band_rotation))
+            state_first = 0.5_dp*(MATMUL(CONJG(TRANSPOSE(context%spin(ispin)%coefficient_first)), &
+                                          current_zero_rotated) - &
+                                    MATMUL(current_zero_rotated, context%spin(ispin)%coefficient_first))
+            transition_first = current_first_rotated + state_first
+
+            DO iband = first_band, last_band
+               IF (context%spin(ispin)%occupations(iband) <= occupation_threshold) CYCLE
+               DO ivirt = first_band, last_band
+                  IF (context%spin(ispin)%occupations(ivirt) > occupation_threshold) CYCLE
+                  gap = context%spin(ispin)%eigenvalue_reference(ivirt) - &
+                        context%spin(ispin)%eigenvalue_reference(iband)
+                  IF (gap <= SQRT(TINY(1.0_dp))) THEN
+                     CPABORT("ECD| Stage G9 requires positive occupied-to-empty transition gaps")
+                  END IF
+                  IF (idir == 1) ntransitions = ntransitions + 1
+                  zero_order_norm_sq = zero_order_norm_sq + ABS(current_zero_rotated(ivirt, iband))**2
+                  operator_first_norm_sq = operator_first_norm_sq + ABS(current_first_rotated(ivirt, iband))**2
+                  state_first_norm_sq = state_first_norm_sq + ABS(state_first(ivirt, iband))**2
+                  total_first_norm_sq = total_first_norm_sq + ABS(transition_first(ivirt, iband))**2
+               END DO
+            END DO
+            DEALLOCATE (current_first_mo, current_first_rotated, current_zero_mo, current_zero_rotated, &
+                        state_first, transition_first)
+         END DO
+         IF (ntransitions < 1) THEN
+            CPABORT("ECD| Stage G9 found no occupied-to-empty transitions")
+         END IF
+         IF (cp_logger_get_default_io_unit(logger) > 0) THEN
+            WRITE (cp_logger_get_default_io_unit(logger), '(T2,A,I2,T55,I10)') &
+               'ECD| Stage G9 selected transitions spin', ispin, ntransitions
+            WRITE (cp_logger_get_default_io_unit(logger), '(T2,A,I2,T55,ES14.6)') &
+               'ECD| Stage G9 zero-order transition norm spin', ispin, SQRT(zero_order_norm_sq)
+            WRITE (cp_logger_get_default_io_unit(logger), '(T2,A,I2,T55,ES14.6)') &
+               'ECD| Stage G9 operator first-order norm spin', ispin, SQRT(operator_first_norm_sq)
+            WRITE (cp_logger_get_default_io_unit(logger), '(T2,A,I2,T55,ES14.6)') &
+               'ECD| Stage G9 state first-order norm spin', ispin, SQRT(state_first_norm_sq)
+            WRITE (cp_logger_get_default_io_unit(logger), '(T2,A,I2,T55,ES14.6)') &
+               'ECD| Stage G9 complete first-order norm spin', ispin, SQRT(total_first_norm_sq)
+         END IF
+      END DO
+
+   END SUBROUTINE ecd_periodic_implicit_gamma_transition_g9
 
 ! **************************************************************************************************
 !> \brief Allocate external-translation matrices from the exact real-space task-list block contract.
@@ -741,7 +1159,7 @@ CONTAINS
    SUBROUTINE ecd_periodic_implicit_gamma_current_g4(qs_env, context, gamma_operators, &
                                                        pseudopotential_commutator)
       TYPE(qs_environment_type), POINTER                 :: qs_env
-      TYPE(ecd_gamma_context_type), INTENT(IN), TARGET   :: context
+      TYPE(ecd_gamma_context_type), INTENT(INOUT), TARGET :: context
       TYPE(ecd_gamma_zero_order_operators_type), INTENT(IN), TARGET :: gamma_operators
       LOGICAL, INTENT(IN)                                :: pseudopotential_commutator
 
@@ -767,6 +1185,9 @@ CONTAINS
                local_moments_rs, local_momentum_rs, logger, translation_cell_to_index, overlap_images, position)
       xkp_zero = 0.0_dp
       CALL ecd_gamma_context_overlap_images_get(context, overlap_images, translation_cell_to_index)
+      IF (ASSOCIATED(context%current_taylor_real) .OR. ASSOCIATED(context%current_taylor_imag)) THEN
+         CPABORT("ECD| Stage G4 current Taylor coefficients are already allocated")
+      END IF
       CALL ecd_gamma_zero_order_operators_get(gamma_operators, position, local_current, gth_current, complete_current, &
                                                gth_available)
 
@@ -811,8 +1232,9 @@ CONTAINS
       END DO
 
       CALL dbcsr_deallocate_matrix_set(current_residual)
-      CALL dbcsr_deallocate_matrix_set(current_taylor_imag)
-      CALL dbcsr_deallocate_matrix_set(current_taylor_real)
+      context%current_taylor_imag => current_taylor_imag
+      context%current_taylor_real => current_taylor_real
+      NULLIFY (current_taylor_imag, current_taylor_real)
       CALL dbcsr_deallocate_matrix_set(gth_current_taylor_imag)
       CALL dbcsr_deallocate_matrix_set(gth_current_taylor_real)
       CALL ecd_periodic_gth_operators_release(gth_operators)
