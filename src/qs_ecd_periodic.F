@@ -10,10 +10,12 @@
 ! **************************************************************************************************
 MODULE qs_ecd_periodic
    USE cell_types,                      ONLY: cell_type
+   USE cp_blacs_env,                    ONLY: cp_blacs_env_type
    USE commutator_rpnl,                 ONLY: build_com_mom_nl
    USE cp_control_types,                ONLY: dft_control_type
    USE cp_cfm_diag,                     ONLY: cp_cfm_geeig
    USE cp_cfm_types,                    ONLY: cp_cfm_create,&
+                                              cp_cfm_set_submatrix,&
                                               cp_cfm_release,&
                                               cp_cfm_type,&
                                               cp_fm_to_cfm
@@ -30,15 +32,19 @@ MODULE qs_ecd_periodic
                                               dbcsr_type_symmetric
    USE cp_dbcsr_contrib,                ONLY: dbcsr_dot
    USE cp_dbcsr_cp2k_link,              ONLY: cp_dbcsr_alloc_block_from_nbl
-   USE cp_dbcsr_operations,             ONLY: dbcsr_allocate_matrix_set,&
+   USE cp_dbcsr_operations,             ONLY: cp_dbcsr_sm_fm_multiply,&
+                                              dbcsr_allocate_matrix_set,&
                                               copy_dbcsr_to_fm,&
                                               dbcsr_deallocate_matrix_set
    USE cp_fm_basic_linalg,              ONLY: cp_fm_trace
-   USE cp_fm_struct,                    ONLY: cp_fm_struct_type
+   USE cp_fm_struct,                    ONLY: cp_fm_struct_create,&
+                                              cp_fm_struct_release,&
+                                              cp_fm_struct_type
    USE cp_fm_types,                     ONLY: cp_fm_create,&
                                               cp_fm_get_info,&
                                               cp_fm_get_submatrix,&
                                               cp_fm_release,&
+                                              cp_fm_to_fm,&
                                               cp_fm_type
    USE cp_log_handling,                 ONLY: cp_get_default_logger,&
                                               cp_logger_get_default_io_unit,&
@@ -49,6 +55,8 @@ MODULE qs_ecd_periodic
    USE input_section_types,             ONLY: section_vals_get_subs_vals,&
                                               section_vals_type,&
                                               section_vals_val_get
+   USE input_constants,                 ONLY: cholesky_restore,&
+                                              tddfpt_kernel_none
    USE kinds,                           ONLY: default_path_length,&
                                               default_string_length,&
                                               dp
@@ -98,8 +106,12 @@ MODULE qs_ecd_periodic
    USE qs_neighbor_list_types,          ONLY: neighbor_list_set_p_type
    USE qs_operators_ao,                 ONLY: build_lin_mom_matrix
    USE qs_rho_types,                    ONLY: qs_rho_type
+   USE qs_tddfpt2_types,                ONLY: tddfpt_ground_state_mos
+   USE qs_tddfpt2_utils,                ONLY: tddfpt_init_ground_state_mos,&
+                                              tddfpt_release_ground_state_mos
    USE qs_vxc,                          ONLY: qs_vxc_create
    USE particle_types,                  ONLY: particle_type
+   USE parallel_gemm_api,               ONLY: parallel_gemm
    USE physcon,                         ONLY: c_light_au,&
                                               evolt
    USE pw_env_types,                    ONLY: pw_env_get,&
@@ -139,9 +151,1519 @@ MODULE qs_ecd_periodic
          DIMENSION(:)                                         :: spin
    END TYPE ecd_periodic_gamma_data_type
 
-   PUBLIC :: ecd_periodic_ipa_response
+   TYPE, PRIVATE :: ecd_periodic_tddfpt_spin_type
+      INTEGER                                                  :: nactive = 0, nframe = 0, nocc = 0, nvirt = 0
+      INTEGER, ALLOCATABLE, DIMENSION(:)                      :: active_index
+      REAL(KIND=dp), ALLOCATABLE, DIMENSION(:)                :: evals_frame, evals_occ, evals_virt
+      TYPE(cp_fm_type), POINTER                               :: mos_active => NULL(), mos_frame => NULL(), &
+                                                                 mos_occ => NULL(), mos_virt => NULL()
+   END TYPE ecd_periodic_tddfpt_spin_type
+
+   TYPE, PRIVATE :: ecd_periodic_tddfpt_orbitals_type
+      INTEGER                                                  :: nspin = 0
+      TYPE(ecd_periodic_tddfpt_spin_type), ALLOCATABLE, &
+         DIMENSION(:)                                         :: spin
+   END TYPE ecd_periodic_tddfpt_orbitals_type
+
+   TYPE, PRIVATE :: ecd_periodic_tddfpt_phase_spin_type
+      COMPLEX(KIND=dp), ALLOCATABLE, DIMENSION(:, :)           :: hamiltonian_first, overlap_first
+   END TYPE ecd_periodic_tddfpt_phase_spin_type
+
+   TYPE, PRIVATE :: ecd_periodic_tddfpt_phase_type
+      INTEGER                                                  :: nspin = 0
+      TYPE(ecd_periodic_tddfpt_phase_spin_type), ALLOCATABLE, &
+         DIMENSION(:)                                         :: spin
+   END TYPE ecd_periodic_tddfpt_phase_type
+
+   TYPE, PRIVATE :: ecd_periodic_tddfpt_complete_spin_type
+      INTEGER                                                  :: nframe = 0
+      REAL(KIND=dp), ALLOCATABLE, DIMENSION(:)                :: evals_frame
+      TYPE(cp_fm_type), POINTER                               :: mos_frame => NULL()
+   END TYPE ecd_periodic_tddfpt_complete_spin_type
+
+   TYPE, PRIVATE :: ecd_periodic_tddfpt_complete_type
+      INTEGER                                                  :: nspin = 0
+      TYPE(ecd_periodic_tddfpt_complete_spin_type), ALLOCATABLE, &
+         DIMENSION(:)                                         :: spin
+   END TYPE ecd_periodic_tddfpt_complete_type
+
+   TYPE, PRIVATE :: ecd_periodic_tddfpt_orbital_response_spin_type
+      COMPLEX(KIND=dp), ALLOCATABLE, DIMENSION(:, :)          :: coefficient_first, energy_first, frame_map
+   END TYPE ecd_periodic_tddfpt_orbital_response_spin_type
+
+   TYPE, PRIVATE :: ecd_periodic_tddfpt_orbital_response_type
+      INTEGER                                                  :: nspin = 0
+      TYPE(ecd_periodic_tddfpt_orbital_response_spin_type), ALLOCATABLE, &
+         DIMENSION(:)                                         :: spin
+   END TYPE ecd_periodic_tddfpt_orbital_response_type
+
+   TYPE, PRIVATE :: ecd_periodic_tddfpt_energy_action_spin_type
+      COMPLEX(KIND=dp), ALLOCATABLE, DIMENSION(:, :, :)       :: state, value
+   END TYPE ecd_periodic_tddfpt_energy_action_spin_type
+
+   TYPE, PRIVATE :: ecd_periodic_tddfpt_energy_action_type
+      INTEGER                                                  :: nspin = 0, nstates = 0
+      TYPE(ecd_periodic_tddfpt_energy_action_spin_type), ALLOCATABLE, &
+         DIMENSION(:)                                         :: spin
+   END TYPE ecd_periodic_tddfpt_energy_action_type
+
+   TYPE, PRIVATE :: ecd_periodic_tddfpt_tangent_spin_type
+      COMPLEX(KIND=dp), ALLOCATABLE, DIMENSION(:, :, :)       :: coefficient
+   END TYPE ecd_periodic_tddfpt_tangent_spin_type
+
+   TYPE, PRIVATE :: ecd_periodic_tddfpt_tangent_type
+      INTEGER                                                  :: nspin = 0, nstates = 0
+      COMPLEX(KIND=dp), ALLOCATABLE, DIMENSION(:)             :: energy_first
+      TYPE(ecd_periodic_tddfpt_tangent_spin_type), ALLOCATABLE, &
+         DIMENSION(:)                                         :: spin
+   END TYPE ecd_periodic_tddfpt_tangent_type
+
+   PUBLIC :: ecd_periodic_ipa_response, ecd_periodic_lr_tddfpt_kernel_none_spectra, &
+             ecd_periodic_lr_tddfpt_validate
 
 CONTAINS
+
+! **************************************************************************************************
+!> \brief Validate the periodic implicit-Gamma LR-TDDFT/TDA input contract.
+!> \param qs_env Quickstep environment
+!> \param ecd_section ECD input section
+!> \param lr_tddfpt_section ECD/LR_TDDFT input section
+!> \param tddfpt_kernel TDDFPT kernel selector
+!> \param tddfpt_nstates Requested TDDFPT states
+!> \param broadening ECD broadening selector
+!> \param fwhm ECD full width at half maximum
+! **************************************************************************************************
+   SUBROUTINE ecd_periodic_lr_tddfpt_validate(qs_env, ecd_section, lr_tddfpt_section, &
+                                               tddfpt_kernel, tddfpt_nstates, broadening, fwhm)
+      TYPE(qs_environment_type), POINTER                 :: qs_env
+      TYPE(section_vals_type), POINTER                   :: ecd_section, lr_tddfpt_section
+      INTEGER, INTENT(IN)                                :: tddfpt_kernel, tddfpt_nstates, broadening
+      REAL(KIND=dp), INTENT(IN)                          :: fwhm
+
+      INTEGER                                            :: electric_gauge, npoints, spatial_order
+      LOGICAL                                            :: direction_explicit, do_kpoints, energy_range_explicit
+      REAL(KIND=dp)                                      :: direction_norm, eps_degeneracy
+      REAL(KIND=dp), DIMENSION(:), POINTER               :: direction_ptr, energy_range
+      TYPE(cell_type), POINTER                           :: cell
+      TYPE(section_vals_type), POINTER                   :: print_section, spectrum_section
+
+      NULLIFY (cell, direction_ptr, energy_range, print_section, spectrum_section)
+      CALL get_qs_env(qs_env, cell=cell, do_kpoints=do_kpoints)
+      CPASSERT(ASSOCIATED(cell))
+
+      IF (.NOT. ALL(cell%perd == 1)) THEN
+         CPABORT("ECD| Periodic LR_TDDFT requires CELL%PERIODIC XYZ")
+      END IF
+      IF (do_kpoints) THEN
+         CPABORT("ECD| Periodic LR_TDDFT requires the implicit-Gamma SCF layout")
+      END IF
+      IF (tddfpt_kernel /= tddfpt_kernel_none) THEN
+         CPABORT("ECD| Periodic LR_TDDFT currently requires TDDFPT KERNEL NONE")
+      END IF
+      IF (tddfpt_nstates <= 0) THEN
+         CPABORT("ECD| Periodic LR_TDDFT requires positive TDDFPT NSTATES")
+      END IF
+
+      CALL section_vals_val_get(ecd_section, "EPS_DEGENERACY", r_val=eps_degeneracy)
+      CALL section_vals_val_get(ecd_section, "SPATIAL_ORDER", i_val=spatial_order)
+      CALL section_vals_val_get(ecd_section, "PROPAGATION_DIRECTION", explicit=direction_explicit)
+      IF (direction_explicit) THEN
+         CALL section_vals_val_get(ecd_section, "PROPAGATION_DIRECTION", r_vals=direction_ptr)
+      END IF
+      CALL section_vals_val_get(lr_tddfpt_section, "ELECTRIC_GAUGE", i_val=electric_gauge)
+
+      IF (eps_degeneracy <= 0.0_dp) THEN
+         CPABORT("ECD| EPS_DEGENERACY must be positive")
+      END IF
+      IF (spatial_order /= 1) THEN
+         CPABORT("ECD| Periodic LR_TDDFT currently requires SPATIAL_ORDER 1")
+      END IF
+      IF (.NOT. direction_explicit .OR. .NOT. ASSOCIATED(direction_ptr)) THEN
+         CPABORT("ECD| Periodic LR_TDDFT requires PROPAGATION_DIRECTION")
+      END IF
+      IF (SIZE(direction_ptr) /= ncart) THEN
+         CPABORT("ECD| PROPAGATION_DIRECTION expects three Cartesian components")
+      END IF
+      direction_norm = SQRT(SUM(direction_ptr**2))
+      IF (direction_norm <= SQRT(TINY(1.0_dp))) THEN
+         CPABORT("ECD| PROPAGATION_DIRECTION must have non-zero length")
+      END IF
+      IF (electric_gauge /= ecd_gauge_length .AND. electric_gauge /= ecd_gauge_velocity) THEN
+         CPABORT("ECD| Unknown periodic LR_TDDFT ELECTRIC_GAUGE")
+      END IF
+      IF (broadening /= ecd_broadening_lorentzian .OR. fwhm <= 0.0_dp) THEN
+         CPABORT("ECD| Periodic LR_TDDFT requires positive Lorentzian broadening")
+      END IF
+
+      print_section => section_vals_get_subs_vals(ecd_section, "PRINT")
+      spectrum_section => section_vals_get_subs_vals(print_section, "SPECTRUM")
+      CALL section_vals_val_get(spectrum_section, "ENERGY_RANGE", explicit=energy_range_explicit)
+      IF (energy_range_explicit) THEN
+         CALL section_vals_val_get(spectrum_section, "ENERGY_RANGE", r_vals=energy_range)
+      END IF
+      CALL section_vals_val_get(spectrum_section, "NPOINTS", i_val=npoints)
+      IF (.NOT. energy_range_explicit .OR. .NOT. ASSOCIATED(energy_range)) THEN
+         CPABORT("ECD| Periodic LR_TDDFT requires PRINT%SPECTRUM%ENERGY_RANGE")
+      END IF
+      IF (SIZE(energy_range) /= 2 .OR. energy_range(1) <= 0.0_dp .OR. &
+          energy_range(1) >= energy_range(2) .OR. npoints < 2) THEN
+         CPABORT("ECD| Periodic LR_TDDFT received an invalid response grid")
+      END IF
+
+   END SUBROUTINE ecd_periodic_lr_tddfpt_validate
+
+! **************************************************************************************************
+!> \brief Contract zero-order implicit-Gamma ECD vertices with TDDFPT/TDA response vectors.
+!> \param context Implicit-Gamma ECD data context
+!> \param operators Folded position and complete-current AO operators
+!> \param orbitals TDDFPT active occupied and virtual orbital data
+!> \param evects Converged TDDFPT response orbitals [spin, state]
+!> \param position_state Length-form state transitions [state, Cartesian]
+!> \param current_state Complete-current state transitions [state, Cartesian]
+! **************************************************************************************************
+   SUBROUTINE ecd_periodic_tddfpt_zero_order_state_actions(context, operators, orbitals, evects, &
+                                                           position_state, current_state)
+      TYPE(ecd_gamma_context_type), INTENT(IN)            :: context
+      TYPE(ecd_gamma_zero_order_operators_type), INTENT(IN), TARGET :: operators
+      TYPE(ecd_periodic_tddfpt_orbitals_type), INTENT(IN) :: orbitals
+      TYPE(cp_fm_type), DIMENSION(:, :), INTENT(IN)       :: evects
+      COMPLEX(KIND=dp), ALLOCATABLE, DIMENSION(:, :), INTENT(OUT) :: position_state, current_state
+
+      TYPE(dbcsr_p_type), DIMENSION(:), POINTER          :: complete_current, gth_current, local_current, position
+
+      NULLIFY (complete_current, gth_current, local_current, position)
+      IF (orbitals%nspin /= context%nspin) THEN
+         CPABORT("ECD| Periodic LR_TDDFT response-vector spin or state dimensions are inconsistent")
+      END IF
+      CALL ecd_gamma_zero_order_operators_get(operators, position, local_current, gth_current, complete_current)
+      CALL ecd_periodic_tddfpt_state_action_from_ao(orbitals, evects, position, position_state)
+      CALL ecd_periodic_tddfpt_state_action_from_ao(orbitals, evects, complete_current, current_state)
+
+   END SUBROUTINE ecd_periodic_tddfpt_zero_order_state_actions
+
+! **************************************************************************************************
+!> \brief Contract a real or complex AO vertex with converged TDDFPT/TDA states.
+!> \param orbitals TDDFPT occupied, virtual, and active orbital frame
+!> \param evects Converged TDDFPT response orbitals [spin, state]
+!> \param operator_real Real AO vertex components
+!> \param state_action State vertices [state, Cartesian]
+!> \param operator_imag Imaginary AO vertex components
+! **************************************************************************************************
+   SUBROUTINE ecd_periodic_tddfpt_state_action_from_ao(orbitals, evects, operator_real, state_action, &
+                                                        operator_imag)
+      TYPE(ecd_periodic_tddfpt_orbitals_type), INTENT(IN) :: orbitals
+      TYPE(cp_fm_type), DIMENSION(:, :), INTENT(IN)       :: evects
+      TYPE(dbcsr_p_type), DIMENSION(:), INTENT(IN)        :: operator_real
+      COMPLEX(KIND=dp), ALLOCATABLE, DIMENSION(:, :), INTENT(OUT) :: state_action
+      TYPE(dbcsr_p_type), DIMENSION(:), INTENT(IN), OPTIONAL :: operator_imag
+
+      INTEGER                                            :: idir, ispin, nactive, nao, nresponse, nrow_response, &
+                                                            nstates
+      REAL(KIND=dp), ALLOCATABLE, DIMENSION(:, :, :)     :: state_imag_spin, state_real_spin
+      TYPE(cp_fm_struct_type), POINTER                   :: fm_struct
+      TYPE(cp_fm_type), ALLOCATABLE, DIMENSION(:)        :: action_imag, action_real
+
+      NULLIFY (fm_struct)
+      nstates = SIZE(evects, 2)
+      IF (orbitals%nspin < 1 .OR. orbitals%nspin > 2 .OR. SIZE(evects, 1) /= orbitals%nspin .OR. nstates < 1) THEN
+         CPABORT("ECD| Periodic LR_TDDFT response-vector spin or state dimensions are inconsistent")
+      END IF
+      IF (SIZE(operator_real) /= ncart) THEN
+         CPABORT("ECD| Periodic LR_TDDFT AO vertex requires three Cartesian components")
+      END IF
+      IF (PRESENT(operator_imag)) THEN
+         IF (SIZE(operator_imag) /= ncart) THEN
+            CPABORT("ECD| Periodic LR_TDDFT imaginary AO vertex requires three Cartesian components")
+         END IF
+      END IF
+
+      ALLOCATE (state_real_spin(nstates, ncart, orbitals%nspin), state_imag_spin(nstates, ncart, orbitals%nspin))
+      state_real_spin = 0.0_dp
+      state_imag_spin = 0.0_dp
+      DO ispin = 1, orbitals%nspin
+         IF (.NOT. ASSOCIATED(orbitals%spin(ispin)%mos_active) .OR. &
+             .NOT. ASSOCIATED(orbitals%spin(ispin)%mos_frame) .OR. &
+             .NOT. ASSOCIATED(orbitals%spin(ispin)%mos_occ) .OR. &
+             .NOT. ASSOCIATED(orbitals%spin(ispin)%mos_virt) .OR. &
+             .NOT. ALLOCATED(orbitals%spin(ispin)%active_index)) THEN
+            CPABORT("ECD| Periodic LR_TDDFT ground-state orbitals are unavailable")
+         END IF
+         NULLIFY (fm_struct)
+         CALL cp_fm_get_info(orbitals%spin(ispin)%mos_active, matrix_struct=fm_struct, ncol_global=nactive, &
+                             nrow_global=nao)
+         CALL cp_fm_get_info(evects(ispin, 1), ncol_global=nresponse, nrow_global=nrow_response)
+         IF (.NOT. ASSOCIATED(fm_struct) .OR. nactive < 1 .OR. nresponse /= nactive .OR. &
+             nao < 1 .OR. nrow_response /= nao .OR. orbitals%spin(ispin)%nactive /= nactive .OR. &
+             orbitals%spin(ispin)%nocc < 1 .OR. orbitals%spin(ispin)%nvirt < 1 .OR. &
+             orbitals%spin(ispin)%nframe /= orbitals%spin(ispin)%nocc + orbitals%spin(ispin)%nvirt .OR. &
+             SIZE(orbitals%spin(ispin)%active_index) /= nactive .OR. &
+             MINVAL(orbitals%spin(ispin)%active_index) < 1 .OR. &
+             MAXVAL(orbitals%spin(ispin)%active_index) > orbitals%spin(ispin)%nocc) THEN
+            CPABORT("ECD| Periodic LR_TDDFT active-orbital and response-vector layouts are inconsistent")
+         END IF
+         ALLOCATE (action_real(ncart))
+         IF (PRESENT(operator_imag)) ALLOCATE (action_imag(ncart))
+         DO idir = 1, ncart
+            CALL cp_fm_create(action_real(idir), fm_struct)
+            CALL cp_dbcsr_sm_fm_multiply(operator_real(idir)%matrix, orbitals%spin(ispin)%mos_active, &
+                                         action_real(idir), ncol=nactive, alpha=1.0_dp, beta=0.0_dp)
+            CALL cp_fm_trace(evects(ispin, :), action_real(idir), state_real_spin(:, idir, ispin))
+            CALL cp_fm_release(action_real(idir))
+            IF (PRESENT(operator_imag)) THEN
+               CALL cp_fm_create(action_imag(idir), fm_struct)
+               CALL cp_dbcsr_sm_fm_multiply(operator_imag(idir)%matrix, orbitals%spin(ispin)%mos_active, &
+                                            action_imag(idir), ncol=nactive, alpha=1.0_dp, beta=0.0_dp)
+               CALL cp_fm_trace(evects(ispin, :), action_imag(idir), state_imag_spin(:, idir, ispin))
+               CALL cp_fm_release(action_imag(idir))
+            END IF
+         END DO
+         DEALLOCATE (action_real)
+         IF (PRESENT(operator_imag)) DEALLOCATE (action_imag)
+      END DO
+
+      ALLOCATE (state_action(nstates, ncart))
+      IF (orbitals%nspin == 1) THEN
+         state_action = SQRT(2.0_dp)*CMPLX(state_real_spin(:, :, 1), state_imag_spin(:, :, 1), KIND=dp)
+      ELSE
+         state_action = CMPLX(state_real_spin(:, :, 1) + state_real_spin(:, :, 2), &
+                              state_imag_spin(:, :, 1) + state_imag_spin(:, :, 2), KIND=dp)
+      END IF
+      DEALLOCATE (state_imag_spin, state_real_spin)
+
+   END SUBROUTINE ecd_periodic_tddfpt_state_action_from_ao
+
+! **************************************************************************************************
+!> \brief Contract the explicit first-order Gamma ECD vertices with fixed TDDFPT/TDA states.
+!> \param context Implicit-Gamma ECD data context
+!> \param orbitals TDDFPT occupied, virtual, and active orbital frame
+!> \param evects Converged TDDFPT response orbitals [spin, state]
+!> \param length_first_state Explicit length-vertex contribution [state, Cartesian]
+!> \param current_first_state Explicit complete-current contribution [state, Cartesian]
+! **************************************************************************************************
+   SUBROUTINE ecd_periodic_tddfpt_first_order_state_actions(context, orbitals, evects, &
+                                                            length_first_state, current_first_state)
+      TYPE(ecd_gamma_context_type), INTENT(IN)            :: context
+      TYPE(ecd_periodic_tddfpt_orbitals_type), INTENT(IN) :: orbitals
+      TYPE(cp_fm_type), DIMENSION(:, :), INTENT(IN)       :: evects
+      COMPLEX(KIND=dp), ALLOCATABLE, DIMENSION(:, :), INTENT(OUT) :: length_first_state, current_first_state
+
+      IF (.NOT. ASSOCIATED(context%current_taylor_real) .OR. .NOT. ASSOCIATED(context%current_taylor_imag) .OR. &
+          .NOT. ASSOCIATED(context%length_taylor_real) .OR. .NOT. ASSOCIATED(context%length_taylor_imag)) THEN
+         CPABORT("ECD| Periodic LR_TDDFT requires retained first-order Gamma ECD vertices")
+      END IF
+      IF (SIZE(context%current_taylor_real, 1) /= ncart .OR. SIZE(context%current_taylor_imag, 1) /= ncart .OR. &
+          SIZE(context%length_taylor_real, 1) /= ncart .OR. SIZE(context%length_taylor_imag, 1) /= ncart .OR. &
+          SIZE(context%current_taylor_real, 2) < 2 .OR. SIZE(context%current_taylor_imag, 2) < 2 .OR. &
+          SIZE(context%length_taylor_real, 2) < 2 .OR. SIZE(context%length_taylor_imag, 2) < 2) THEN
+         CPABORT("ECD| Periodic LR_TDDFT first-order Gamma ECD vertex dimensions are inconsistent")
+      END IF
+
+      CALL ecd_periodic_tddfpt_state_action_from_ao(orbitals, evects, context%length_taylor_real(:, 2), &
+                                                     length_first_state, context%length_taylor_imag(:, 2))
+      CALL ecd_periodic_tddfpt_state_action_from_ao(orbitals, evects, context%current_taylor_real(:, 2), &
+                                                     current_first_state, context%current_taylor_imag(:, 2))
+
+   END SUBROUTINE ecd_periodic_tddfpt_first_order_state_actions
+
+! **************************************************************************************************
+!> \brief Borrow the TDDFPT orbital frame used by periodic TDA ECD.
+!> \param orbitals Borrowed TDDFPT occupied, virtual, and active orbital data
+!> \param context Implicit-Gamma ECD AO context
+!> \param gs_mos TDDFPT ground-state orbital data
+! **************************************************************************************************
+   SUBROUTINE ecd_periodic_tddfpt_orbitals_create(orbitals, context, gs_mos)
+      TYPE(ecd_periodic_tddfpt_orbitals_type), INTENT(OUT) :: orbitals
+      TYPE(ecd_gamma_context_type), INTENT(IN)            :: context
+      TYPE(tddfpt_ground_state_mos), DIMENSION(:), POINTER :: gs_mos
+
+      INTEGER                                            :: ispin, nao_active, nao_occ, nao_virt, nactive, nocc, nvirt
+      TYPE(cp_fm_struct_type), POINTER                   :: frame_struct
+
+      NULLIFY (frame_struct)
+      IF (.NOT. ASSOCIATED(gs_mos)) THEN
+         CPABORT("ECD| Periodic LR_TDDFT requires TDDFPT ground-state orbitals")
+      END IF
+      IF (SIZE(gs_mos) /= context%nspin .OR. context%nspin < 1 .OR. context%nspin > 2) THEN
+         CPABORT("ECD| Periodic LR_TDDFT TDDFPT and Gamma spin channels are inconsistent")
+      END IF
+      orbitals%nspin = context%nspin
+      ALLOCATE (orbitals%spin(orbitals%nspin))
+
+      DO ispin = 1, orbitals%nspin
+         IF (.NOT. ASSOCIATED(gs_mos(ispin)%mos_occ) .OR. .NOT. ASSOCIATED(gs_mos(ispin)%mos_virt) .OR. &
+             .NOT. ASSOCIATED(gs_mos(ispin)%mos_active) .OR. .NOT. ALLOCATED(gs_mos(ispin)%evals_occ) .OR. &
+             .NOT. ALLOCATED(gs_mos(ispin)%evals_virt) .OR. .NOT. ALLOCATED(gs_mos(ispin)%index_active)) THEN
+            CPABORT("ECD| Periodic LR_TDDFT ground-state orbital data are incomplete")
+         END IF
+         CALL cp_fm_get_info(gs_mos(ispin)%mos_occ, nrow_global=nao_occ, ncol_global=nocc)
+         CALL cp_fm_get_info(gs_mos(ispin)%mos_virt, nrow_global=nao_virt, ncol_global=nvirt)
+         CALL cp_fm_get_info(gs_mos(ispin)%mos_active, nrow_global=nao_active, ncol_global=nactive)
+         IF (nao_occ /= context%spin(ispin)%nao .OR. nao_virt /= nao_occ .OR. nao_active /= nao_occ .OR. &
+             nocc /= SIZE(gs_mos(ispin)%evals_occ) .OR. nvirt /= SIZE(gs_mos(ispin)%evals_virt) .OR. &
+             nactive /= SIZE(gs_mos(ispin)%index_active) .OR. nocc < 1 .OR. nvirt < 1 .OR. nactive < 1) THEN
+            CPABORT("ECD| Periodic LR_TDDFT orbital dimensions are inconsistent with Gamma AO data")
+         END IF
+         IF (MINVAL(gs_mos(ispin)%index_active) < 1 .OR. MAXVAL(gs_mos(ispin)%index_active) > nocc) THEN
+            CPABORT("ECD| Periodic LR_TDDFT active occupied-orbital map is inconsistent")
+         END IF
+         orbitals%spin(ispin)%nocc = nocc
+         orbitals%spin(ispin)%nvirt = nvirt
+         orbitals%spin(ispin)%nactive = nactive
+         orbitals%spin(ispin)%nframe = nocc + nvirt
+         orbitals%spin(ispin)%mos_occ => gs_mos(ispin)%mos_occ
+         orbitals%spin(ispin)%mos_virt => gs_mos(ispin)%mos_virt
+         orbitals%spin(ispin)%mos_active => gs_mos(ispin)%mos_active
+         ALLOCATE (orbitals%spin(ispin)%active_index(nactive), orbitals%spin(ispin)%evals_occ(nocc), &
+                   orbitals%spin(ispin)%evals_virt(nvirt), orbitals%spin(ispin)%evals_frame(nocc + nvirt))
+         orbitals%spin(ispin)%active_index = gs_mos(ispin)%index_active
+         orbitals%spin(ispin)%evals_occ = gs_mos(ispin)%evals_occ
+         orbitals%spin(ispin)%evals_virt = gs_mos(ispin)%evals_virt
+         orbitals%spin(ispin)%evals_frame(1:nocc) = gs_mos(ispin)%evals_occ
+         orbitals%spin(ispin)%evals_frame(nocc + 1:nocc + nvirt) = gs_mos(ispin)%evals_virt
+         NULLIFY (frame_struct)
+         CALL cp_fm_struct_create(frame_struct, template_fmstruct=gs_mos(ispin)%mos_occ%matrix_struct, &
+                                  ncol_global=nocc + nvirt)
+         ALLOCATE (orbitals%spin(ispin)%mos_frame)
+         CALL cp_fm_create(orbitals%spin(ispin)%mos_frame, frame_struct, name='ECD TDDFPT orbital frame', &
+                           set_zero=.TRUE.)
+         CALL cp_fm_struct_release(frame_struct)
+         CALL cp_fm_to_fm(gs_mos(ispin)%mos_occ, orbitals%spin(ispin)%mos_frame, ncol=nocc, &
+                           source_start=1, target_start=1)
+         CALL cp_fm_to_fm(gs_mos(ispin)%mos_virt, orbitals%spin(ispin)%mos_frame, ncol=nvirt, &
+                           source_start=1, target_start=nocc + 1)
+      END DO
+
+   END SUBROUTINE ecd_periodic_tddfpt_orbitals_create
+
+! **************************************************************************************************
+!> \brief Release ECD-owned TDDFPT orbital-frame metadata.
+!> \param orbitals Borrowed TDDFPT orbital-frame metadata
+! **************************************************************************************************
+   SUBROUTINE ecd_periodic_tddfpt_orbitals_release(orbitals)
+      TYPE(ecd_periodic_tddfpt_orbitals_type), INTENT(INOUT) :: orbitals
+
+      INTEGER                                            :: ispin
+
+      IF (ALLOCATED(orbitals%spin)) THEN
+         DO ispin = 1, SIZE(orbitals%spin)
+            IF (ASSOCIATED(orbitals%spin(ispin)%mos_frame)) THEN
+               CALL cp_fm_release(orbitals%spin(ispin)%mos_frame)
+               DEALLOCATE (orbitals%spin(ispin)%mos_frame)
+            END IF
+            NULLIFY (orbitals%spin(ispin)%mos_active, orbitals%spin(ispin)%mos_frame, &
+                     orbitals%spin(ispin)%mos_occ, orbitals%spin(ispin)%mos_virt)
+         END DO
+         DEALLOCATE (orbitals%spin)
+      END IF
+      orbitals%nspin = 0
+
+   END SUBROUTINE ecd_periodic_tddfpt_orbitals_release
+
+! **************************************************************************************************
+!> \brief Project first-order Gamma KS and overlap coefficients to the TDDFPT orbital frame.
+!> \param phase Projected first-order TDA orbital-frame data
+!> \param context Implicit-Gamma ECD data context
+!> \param orbitals TDDFPT occupied and virtual orbital frame
+! **************************************************************************************************
+   SUBROUTINE ecd_periodic_tddfpt_phase_create(phase, context, orbitals)
+      TYPE(ecd_periodic_tddfpt_phase_type), INTENT(OUT)  :: phase
+      TYPE(ecd_gamma_context_type), INTENT(IN)           :: context
+      TYPE(ecd_periodic_tddfpt_orbitals_type), INTENT(IN) :: orbitals
+
+      INTEGER                                            :: ispin, nao, nframe
+
+      IF (orbitals%nspin /= context%nspin .OR. context%nspin < 1 .OR. context%nspin > 2) THEN
+         CPABORT("ECD| Periodic LR_TDDFT TDDFPT and Gamma spin channels are inconsistent")
+      END IF
+      IF (.NOT. ASSOCIATED(context%ks_first_real) .OR. .NOT. ASSOCIATED(context%ks_first_imag) .OR. &
+          .NOT. ASSOCIATED(context%overlap_first_real) .OR. .NOT. ASSOCIATED(context%overlap_first_imag)) THEN
+         CPABORT("ECD| Periodic LR_TDDFT requires retained first-order KS and overlap coefficients")
+      END IF
+      IF (SIZE(context%ks_first_real) /= context%nspin .OR. SIZE(context%ks_first_imag) /= context%nspin .OR. &
+          SIZE(context%overlap_first_real) /= 1 .OR. SIZE(context%overlap_first_imag) /= 1) THEN
+         CPABORT("ECD| Periodic LR_TDDFT first-order KS/overlap dimensions are inconsistent")
+      END IF
+
+      phase%nspin = context%nspin
+      ALLOCATE (phase%spin(phase%nspin))
+      DO ispin = 1, phase%nspin
+         IF (.NOT. ASSOCIATED(orbitals%spin(ispin)%mos_frame)) THEN
+            CPABORT("ECD| Periodic LR_TDDFT orbital frame is unavailable")
+         END IF
+         nframe = orbitals%spin(ispin)%nframe
+         nao = context%spin(ispin)%nao
+         IF (nframe < 1 .OR. nframe > nao .OR. .NOT. ALLOCATED(orbitals%spin(ispin)%evals_frame) .OR. &
+             SIZE(orbitals%spin(ispin)%evals_frame) /= nframe) THEN
+            CPABORT("ECD| Periodic LR_TDDFT orbital-frame dimensions are inconsistent")
+         END IF
+         CALL ecd_project_complex_operator_to_mo(context%ks_first_real(ispin), context%ks_first_imag(ispin), &
+                                                 orbitals%spin(ispin)%mos_frame, nao, nframe, &
+                                                 phase%spin(ispin)%hamiltonian_first)
+         CALL ecd_project_complex_operator_to_mo(context%overlap_first_real(1), context%overlap_first_imag(1), &
+                                                 orbitals%spin(ispin)%mos_frame, nao, nframe, &
+                                                 phase%spin(ispin)%overlap_first)
+      END DO
+
+   END SUBROUTINE ecd_periodic_tddfpt_phase_create
+
+! **************************************************************************************************
+!> \brief Release projected first-order TDDFPT orbital-frame data.
+!> \param phase Projected first-order TDA orbital-frame data
+! **************************************************************************************************
+   SUBROUTINE ecd_periodic_tddfpt_phase_release(phase)
+      TYPE(ecd_periodic_tddfpt_phase_type), INTENT(INOUT) :: phase
+
+      IF (ALLOCATED(phase%spin)) DEALLOCATE (phase%spin)
+      phase%nspin = 0
+
+   END SUBROUTINE ecd_periodic_tddfpt_phase_release
+
+! **************************************************************************************************
+!> \brief Generate a complete TDDFPT-compatible AO orbital frame for Gamma tangent equations.
+!> \param complete Complete occupied-plus-virtual auxiliary orbital frame
+!> \param qs_env Quickstep environment
+!> \param context Implicit-Gamma ECD data context
+!> \param orbitals Target TDDFPT occupied and virtual orbital frame
+! **************************************************************************************************
+   SUBROUTINE ecd_periodic_tddfpt_complete_create(complete, qs_env, context, orbitals)
+      TYPE(ecd_periodic_tddfpt_complete_type), INTENT(OUT) :: complete
+      TYPE(qs_environment_type), POINTER                 :: qs_env
+      TYPE(ecd_gamma_context_type), INTENT(IN)           :: context
+      TYPE(ecd_periodic_tddfpt_orbitals_type), INTENT(IN) :: orbitals
+
+      INTEGER                                            :: ispin, nao, nocc, nvirt
+      REAL(KIND=dp), DIMENSION(:), POINTER               :: evals_virt
+      TYPE(cp_blacs_env_type), POINTER                   :: blacs_env
+      TYPE(cp_fm_struct_type), POINTER                   :: frame_struct
+      TYPE(cp_fm_type), POINTER                          :: mos_virt
+      TYPE(mo_set_type), DIMENSION(:), POINTER           :: mos
+      TYPE(tddfpt_ground_state_mos), ALLOCATABLE, DIMENSION(:) :: full_mos
+
+      NULLIFY (blacs_env, evals_virt, frame_struct, mos, mos_virt)
+      IF (orbitals%nspin /= context%nspin .OR. context%nspin < 1 .OR. context%nspin > 2) THEN
+         CPABORT("ECD| Periodic LR_TDDFT TDDFPT and Gamma spin channels are inconsistent")
+      END IF
+      CALL get_qs_env(qs_env, blacs_env=blacs_env, mos=mos)
+      IF (.NOT. ASSOCIATED(blacs_env) .OR. .NOT. ASSOCIATED(mos) .OR. SIZE(mos) /= context%nspin) THEN
+         CPABORT("ECD| Periodic LR_TDDFT complete orbital frame requires SCF MO and BLACS data")
+      END IF
+
+      complete%nspin = context%nspin
+      ALLOCATE (complete%spin(complete%nspin), full_mos(complete%nspin))
+      DO ispin = 1, complete%nspin
+         NULLIFY (evals_virt, mos_virt)
+         CALL tddfpt_init_ground_state_mos(full_mos(ispin), mos(ispin), -1, blacs_env, cholesky_restore, &
+                                            context%matrix_ks(ispin)%matrix, context%matrix_s(1)%matrix, &
+                                            mos_virt, evals_virt, qs_env)
+         CALL cp_fm_get_info(full_mos(ispin)%mos_occ, nrow_global=nao, ncol_global=nocc)
+         CALL cp_fm_get_info(full_mos(ispin)%mos_virt, ncol_global=nvirt)
+         IF (nao /= context%spin(ispin)%nao .OR. nocc /= orbitals%spin(ispin)%nocc .OR. &
+             nocc + nvirt /= nao .OR. nvirt < 1) THEN
+            CPABORT("ECD| Periodic LR_TDDFT complete orbital-frame dimensions are inconsistent")
+         END IF
+         complete%spin(ispin)%nframe = nao
+         ALLOCATE (complete%spin(ispin)%evals_frame(nao), complete%spin(ispin)%mos_frame)
+         complete%spin(ispin)%evals_frame(1:nocc) = full_mos(ispin)%evals_occ
+         complete%spin(ispin)%evals_frame(nocc + 1:nao) = full_mos(ispin)%evals_virt
+         NULLIFY (frame_struct)
+         CALL cp_fm_struct_create(frame_struct, template_fmstruct=full_mos(ispin)%mos_occ%matrix_struct, &
+                                  ncol_global=nao)
+         CALL cp_fm_create(complete%spin(ispin)%mos_frame, frame_struct, name='ECD TDDFPT complete orbital frame', &
+                           set_zero=.TRUE.)
+         CALL cp_fm_struct_release(frame_struct)
+         CALL cp_fm_to_fm(full_mos(ispin)%mos_occ, complete%spin(ispin)%mos_frame, ncol=nocc, &
+                           source_start=1, target_start=1)
+         CALL cp_fm_to_fm(full_mos(ispin)%mos_virt, complete%spin(ispin)%mos_frame, ncol=nvirt, &
+                           source_start=1, target_start=nocc + 1)
+         CALL tddfpt_release_ground_state_mos(full_mos(ispin))
+      END DO
+      DEALLOCATE (full_mos)
+
+   END SUBROUTINE ecd_periodic_tddfpt_complete_create
+
+! **************************************************************************************************
+!> \brief Release the complete TDDFPT-compatible AO orbital frame.
+!> \param complete Complete occupied-plus-virtual auxiliary orbital frame
+! **************************************************************************************************
+   SUBROUTINE ecd_periodic_tddfpt_complete_release(complete)
+      TYPE(ecd_periodic_tddfpt_complete_type), INTENT(INOUT) :: complete
+
+      INTEGER                                            :: ispin
+
+      IF (ALLOCATED(complete%spin)) THEN
+         DO ispin = 1, SIZE(complete%spin)
+            IF (ASSOCIATED(complete%spin(ispin)%mos_frame)) THEN
+               CALL cp_fm_release(complete%spin(ispin)%mos_frame)
+               DEALLOCATE (complete%spin(ispin)%mos_frame)
+            END IF
+            NULLIFY (complete%spin(ispin)%mos_frame)
+         END DO
+         DEALLOCATE (complete%spin)
+      END IF
+      complete%nspin = 0
+
+   END SUBROUTINE ecd_periodic_tddfpt_complete_release
+
+! **************************************************************************************************
+!> \brief Build target-TDDFPT orbital derivatives in the complete Gamma eigenvector frame.
+!> \param response Target-orbital first derivatives in the complete AO eigenvector frame
+!> \param context Implicit-Gamma ECD data context
+!> \param orbitals Target TDDFPT occupied and virtual orbital frame
+!> \param complete Complete TDDFPT-compatible auxiliary orbital frame
+! **************************************************************************************************
+   SUBROUTINE ecd_periodic_tddfpt_orbital_response_create(response, context, orbitals, complete)
+      TYPE(ecd_periodic_tddfpt_orbital_response_type), INTENT(OUT) :: response
+      TYPE(ecd_gamma_context_type), INTENT(IN)           :: context
+      TYPE(ecd_periodic_tddfpt_orbitals_type), INTENT(IN) :: orbitals
+      TYPE(ecd_periodic_tddfpt_complete_type), INTENT(IN) :: complete
+
+      COMPLEX(KIND=dp), ALLOCATABLE, DIMENSION(:, :)     :: complete_coefficient_first, complete_rotation, &
+                                                            complete_energy_matrix, hamiltonian_first, overlap_first, &
+                                                            target_map
+      INTEGER                                            :: ispin, jband, nao, ncomplete, ntarget
+      REAL(KIND=dp), ALLOCATABLE, DIMENSION(:)           :: complete_energy_first, complete_energy_reference
+      REAL(KIND=dp), ALLOCATABLE, DIMENSION(:, :)        :: frame_map_real
+      REAL(KIND=dp)                                      :: equation_residual, manifold_residual, &
+                                                            normalization_residual, response_norm
+      TYPE(cp_cfm_type)                                  :: hamiltonian_first_cfm, overlap_first_cfm
+      TYPE(cp_fm_struct_type), POINTER                   :: map_struct
+      TYPE(cp_fm_type)                                   :: overlap_action, overlap_map
+      TYPE(ecd_band_manifold_type), DIMENSION(:), POINTER :: manifolds
+
+      NULLIFY (manifolds, map_struct)
+      IF (orbitals%nspin /= context%nspin .OR. complete%nspin /= context%nspin .OR. &
+          context%nspin < 1 .OR. context%nspin > 2) THEN
+         CPABORT("ECD| Periodic LR_TDDFT orbital-response spin channels are inconsistent")
+      END IF
+      IF (context%eps_degeneracy <= 0.0_dp) THEN
+         CPABORT("ECD| Periodic LR_TDDFT requires a positive Gamma degeneracy threshold")
+      END IF
+      IF (.NOT. ASSOCIATED(context%ks_first_real) .OR. .NOT. ASSOCIATED(context%ks_first_imag) .OR. &
+          .NOT. ASSOCIATED(context%overlap_first_real) .OR. .NOT. ASSOCIATED(context%overlap_first_imag)) THEN
+         CPABORT("ECD| Periodic LR_TDDFT requires retained first-order KS and overlap coefficients")
+      END IF
+
+      response%nspin = context%nspin
+      ALLOCATE (response%spin(response%nspin))
+      DO ispin = 1, response%nspin
+         nao = context%spin(ispin)%nao
+         ncomplete = complete%spin(ispin)%nframe
+         ntarget = orbitals%spin(ispin)%nframe
+         IF (.NOT. ASSOCIATED(complete%spin(ispin)%mos_frame) .OR. &
+             .NOT. ASSOCIATED(orbitals%spin(ispin)%mos_frame) .OR. ncomplete /= nao .OR. &
+             ntarget < 1 .OR. ntarget > ncomplete .OR. .NOT. ALLOCATED(complete%spin(ispin)%evals_frame)) THEN
+            CPABORT("ECD| Periodic LR_TDDFT complete or target orbital frame is inconsistent")
+         END IF
+         IF (SIZE(complete%spin(ispin)%evals_frame) /= ncomplete) THEN
+            CPABORT("ECD| Periodic LR_TDDFT complete orbital energies are inconsistent")
+         END IF
+
+         CALL ecd_project_complex_operator_to_mo(context%ks_first_real(ispin), context%ks_first_imag(ispin), &
+                                                 complete%spin(ispin)%mos_frame, nao, ncomplete, hamiltonian_first)
+         CALL ecd_project_complex_operator_to_mo(context%overlap_first_real(1), context%overlap_first_imag(1), &
+                                                 complete%spin(ispin)%mos_frame, nao, ncomplete, overlap_first)
+         CALL cp_cfm_create(hamiltonian_first_cfm, complete%spin(ispin)%mos_frame%matrix_struct, &
+                            name='ECD TDDFPT complete H first', set_zero=.TRUE.)
+         CALL cp_cfm_create(overlap_first_cfm, complete%spin(ispin)%mos_frame%matrix_struct, &
+                            name='ECD TDDFPT complete S first', set_zero=.TRUE.)
+         CALL cp_cfm_set_submatrix(hamiltonian_first_cfm, hamiltonian_first)
+         CALL cp_cfm_set_submatrix(overlap_first_cfm, overlap_first)
+         CALL ecd_band_manifolds_build(manifolds, complete%spin(ispin)%evals_frame, context%eps_degeneracy)
+         CALL ecd_band_first_order_response(complete_energy_reference, complete_energy_first, equation_residual, &
+                                            normalization_residual, manifold_residual, response_norm, &
+                                            hamiltonian_first_cfm, overlap_first_cfm, complete%spin(ispin)%evals_frame, &
+                                            manifolds, complete_rotation, complete_coefficient_first)
+         CALL cp_cfm_release(overlap_first_cfm)
+         CALL cp_cfm_release(hamiltonian_first_cfm)
+         CALL ecd_band_manifolds_release(manifolds)
+         NULLIFY (manifolds)
+
+         NULLIFY (map_struct)
+         CALL cp_fm_create(overlap_action, orbitals%spin(ispin)%mos_frame%matrix_struct, &
+                           name='ECD TDDFPT target S frame', set_zero=.TRUE.)
+         CALL cp_dbcsr_sm_fm_multiply(context%matrix_s(1)%matrix, orbitals%spin(ispin)%mos_frame, overlap_action, &
+                                      ncol=ntarget, alpha=1.0_dp, beta=0.0_dp)
+         CALL cp_fm_struct_create(map_struct, template_fmstruct=complete%spin(ispin)%mos_frame%matrix_struct, &
+                                  nrow_global=ncomplete, ncol_global=ntarget)
+         CALL cp_fm_create(overlap_map, map_struct, name='ECD TDDFPT complete-to-target map', set_zero=.TRUE.)
+         CALL cp_fm_struct_release(map_struct)
+         CALL parallel_gemm('T', 'N', ncomplete, ntarget, nao, 1.0_dp, complete%spin(ispin)%mos_frame, &
+                            overlap_action, 0.0_dp, overlap_map)
+         ALLOCATE (frame_map_real(ncomplete, ntarget))
+         CALL cp_fm_get_submatrix(overlap_map, frame_map_real)
+         CALL cp_fm_release(overlap_map)
+         CALL cp_fm_release(overlap_action)
+
+         ALLOCATE (response%spin(ispin)%frame_map(ncomplete, ntarget), &
+                   response%spin(ispin)%coefficient_first(ncomplete, ntarget), &
+                   response%spin(ispin)%energy_first(ntarget, ntarget), &
+                   complete_energy_matrix(ncomplete, ncomplete))
+         response%spin(ispin)%frame_map = CMPLX(frame_map_real, 0.0_dp, KIND=dp)
+         target_map = MATMUL(CONJG(TRANSPOSE(complete_rotation)), response%spin(ispin)%frame_map)
+         response%spin(ispin)%coefficient_first = MATMUL(complete_rotation, &
+                                                          MATMUL(complete_coefficient_first, target_map))
+         complete_energy_matrix = CMPLX(0.0_dp, 0.0_dp, KIND=dp)
+         DO jband = 1, ncomplete
+            complete_energy_matrix(jband, jband) = CMPLX(complete_energy_first(jband), 0.0_dp, KIND=dp)
+         END DO
+         complete_energy_matrix = MATMUL(complete_rotation, &
+                                         MATMUL(complete_energy_matrix, CONJG(TRANSPOSE(complete_rotation))))
+         response%spin(ispin)%energy_first = MATMUL(CONJG(TRANSPOSE(response%spin(ispin)%frame_map)), &
+                                                     MATMUL(complete_energy_matrix, response%spin(ispin)%frame_map))
+
+         DEALLOCATE (complete_coefficient_first, complete_energy_first, complete_energy_reference, &
+                     complete_energy_matrix, complete_rotation, frame_map_real, hamiltonian_first, overlap_first, &
+                     target_map)
+      END DO
+
+   END SUBROUTINE ecd_periodic_tddfpt_orbital_response_create
+
+! **************************************************************************************************
+!> \brief Release complete-frame target-TDDFPT orbital derivatives.
+!> \param response Target-orbital first derivatives in the complete AO eigenvector frame
+! **************************************************************************************************
+   SUBROUTINE ecd_periodic_tddfpt_orbital_response_release(response)
+      TYPE(ecd_periodic_tddfpt_orbital_response_type), INTENT(INOUT) :: response
+
+      IF (ALLOCATED(response%spin)) DEALLOCATE (response%spin)
+      response%nspin = 0
+
+   END SUBROUTINE ecd_periodic_tddfpt_orbital_response_release
+
+! **************************************************************************************************
+!> \brief Build the first-order KERNEL NONE energy-difference action in TDDFPT virtual coordinates.
+!> \param context Implicit-Gamma ECD data context
+!> \param orbitals Target TDDFPT occupied, virtual, and active orbital frame
+!> \param response Target-orbital first derivatives in the complete eigenvector frame
+!> \param evects Converged TDDFPT response orbitals [spin, state]
+!> \param action First directional energy-difference action [virtual, active, state]
+! **************************************************************************************************
+   SUBROUTINE ecd_periodic_tddfpt_energy_difference_first_action(context, orbitals, response, evects, action)
+      TYPE(ecd_gamma_context_type), INTENT(IN)            :: context
+      TYPE(ecd_periodic_tddfpt_orbitals_type), INTENT(IN) :: orbitals
+      TYPE(ecd_periodic_tddfpt_orbital_response_type), INTENT(IN) :: response
+      TYPE(cp_fm_type), DIMENSION(:, :), INTENT(IN)       :: evects
+      TYPE(ecd_periodic_tddfpt_energy_action_type), INTENT(OUT) :: action
+
+      COMPLEX(KIND=dp), ALLOCATABLE, DIMENSION(:, :)     :: active_energy_first, virtual_energy_first, &
+                                                            virtual_state
+      INTEGER                                            :: ispin, istate, nactive, nao, nocc, nresponse, &
+                                                            nrow_response, nstates, ntarget, nvirt
+      REAL(KIND=dp), ALLOCATABLE, DIMENSION(:, :)        :: virtual_state_real
+      TYPE(cp_fm_struct_type), POINTER                   :: coordinate_struct
+      TYPE(cp_fm_type)                                   :: coordinate_fm, overlap_evect
+
+      NULLIFY (coordinate_struct)
+      nstates = SIZE(evects, 2)
+      IF (nstates < 1 .OR. context%nspin < 1 .OR. context%nspin > 2 .OR. &
+          orbitals%nspin /= context%nspin .OR. response%nspin /= context%nspin .OR. &
+          SIZE(evects, 1) /= context%nspin) THEN
+         CPABORT("ECD| Periodic LR_TDDFT first energy-difference action dimensions are inconsistent")
+      END IF
+
+      action%nspin = context%nspin
+      action%nstates = nstates
+      ALLOCATE (action%spin(action%nspin))
+      DO ispin = 1, action%nspin
+         nao = context%spin(ispin)%nao
+         nocc = orbitals%spin(ispin)%nocc
+         nvirt = orbitals%spin(ispin)%nvirt
+         nactive = orbitals%spin(ispin)%nactive
+         ntarget = orbitals%spin(ispin)%nframe
+         IF (nao < 1 .OR. nocc < 1 .OR. nvirt < 1 .OR. nactive < 1 .OR. ntarget /= nocc + nvirt .OR. &
+             .NOT. ASSOCIATED(orbitals%spin(ispin)%mos_virt) .OR. &
+             .NOT. ALLOCATED(orbitals%spin(ispin)%active_index) .OR. &
+             .NOT. ALLOCATED(response%spin(ispin)%energy_first)) THEN
+            CPABORT("ECD| Periodic LR_TDDFT first energy-difference data are incomplete")
+         END IF
+         IF (SIZE(orbitals%spin(ispin)%active_index) /= nactive .OR. &
+             MINVAL(orbitals%spin(ispin)%active_index) < 1 .OR. &
+             MAXVAL(orbitals%spin(ispin)%active_index) > nocc .OR. &
+             SIZE(response%spin(ispin)%energy_first, 1) /= ntarget .OR. &
+             SIZE(response%spin(ispin)%energy_first, 2) /= ntarget) THEN
+            CPABORT("ECD| Periodic LR_TDDFT first energy-difference frame data are inconsistent")
+         END IF
+         CALL cp_fm_get_info(evects(ispin, 1), nrow_global=nrow_response, ncol_global=nresponse)
+         IF (nrow_response /= nao .OR. nresponse /= nactive) THEN
+            CPABORT("ECD| Periodic LR_TDDFT first energy-difference response-vector layout is inconsistent")
+         END IF
+
+         ALLOCATE (active_energy_first(nactive, nactive), virtual_energy_first(nvirt, nvirt), &
+                   action%spin(ispin)%state(nvirt, nactive, nstates), &
+                   action%spin(ispin)%value(nvirt, nactive, nstates))
+         active_energy_first = response%spin(ispin)%energy_first(orbitals%spin(ispin)%active_index, &
+                                                                   orbitals%spin(ispin)%active_index)
+         virtual_energy_first = response%spin(ispin)%energy_first(nocc + 1:ntarget, nocc + 1:ntarget)
+         action%spin(ispin)%state = CMPLX(0.0_dp, 0.0_dp, KIND=dp)
+         action%spin(ispin)%value = CMPLX(0.0_dp, 0.0_dp, KIND=dp)
+
+         DO istate = 1, nstates
+            CALL cp_fm_create(overlap_evect, evects(ispin, istate)%matrix_struct, &
+                              name='ECD TDDFPT S response vector', set_zero=.TRUE.)
+            CALL cp_dbcsr_sm_fm_multiply(context%matrix_s(1)%matrix, evects(ispin, istate), overlap_evect, &
+                                         ncol=nactive, alpha=1.0_dp, beta=0.0_dp)
+            NULLIFY (coordinate_struct)
+            CALL cp_fm_struct_create(coordinate_struct, template_fmstruct=orbitals%spin(ispin)%mos_virt%matrix_struct, &
+                                     nrow_global=nvirt, ncol_global=nactive)
+            CALL cp_fm_create(coordinate_fm, coordinate_struct, name='ECD TDDFPT virtual response coordinates', &
+                              set_zero=.TRUE.)
+            CALL cp_fm_struct_release(coordinate_struct)
+            CALL parallel_gemm('T', 'N', nvirt, nactive, nao, 1.0_dp, orbitals%spin(ispin)%mos_virt, &
+                               overlap_evect, 0.0_dp, coordinate_fm)
+            ALLOCATE (virtual_state_real(nvirt, nactive), virtual_state(nvirt, nactive))
+            CALL cp_fm_get_submatrix(coordinate_fm, virtual_state_real)
+            virtual_state = CMPLX(virtual_state_real, 0.0_dp, KIND=dp)
+            action%spin(ispin)%state(:, :, istate) = virtual_state
+            ! The virtual and occupied branches are shifted by plus and minus q/2, respectively.
+            action%spin(ispin)%value(:, :, istate) = 0.5_dp*(MATMUL(virtual_energy_first, virtual_state) + &
+                                                              MATMUL(virtual_state, active_energy_first))
+            DEALLOCATE (virtual_state, virtual_state_real)
+            CALL cp_fm_release(coordinate_fm)
+            CALL cp_fm_release(overlap_evect)
+         END DO
+         DEALLOCATE (active_energy_first, virtual_energy_first)
+      END DO
+
+   END SUBROUTINE ecd_periodic_tddfpt_energy_difference_first_action
+
+! **************************************************************************************************
+!> \brief Release first-order KERNEL NONE energy-difference actions.
+!> \param action First directional energy-difference action data
+! **************************************************************************************************
+   SUBROUTINE ecd_periodic_tddfpt_energy_action_release(action)
+      TYPE(ecd_periodic_tddfpt_energy_action_type), INTENT(INOUT) :: action
+
+      IF (ALLOCATED(action%spin)) DEALLOCATE (action%spin)
+      action%nspin = 0
+      action%nstates = 0
+
+   END SUBROUTINE ecd_periodic_tddfpt_energy_action_release
+
+! **************************************************************************************************
+!> \brief Solve isolated KERNEL NONE TDA tangents in the full TDDFPT pair space.
+!> \param context Implicit-Gamma ECD data context
+!> \param orbitals Target TDDFPT occupied, virtual, and active orbital frame
+!> \param evals Zero-order TDDFPT/TDA excitation energies
+!> \param action First directional energy-difference action
+!> \param tangent First directional TDA eigenvalue and eigenvector coefficients
+! **************************************************************************************************
+   SUBROUTINE ecd_periodic_tddfpt_kernel_none_tangent(context, orbitals, evals, action, tangent)
+      TYPE(ecd_gamma_context_type), INTENT(IN)            :: context
+      TYPE(ecd_periodic_tddfpt_orbitals_type), INTENT(IN) :: orbitals
+      REAL(KIND=dp), DIMENSION(:), INTENT(IN)             :: evals
+      TYPE(ecd_periodic_tddfpt_energy_action_type), INTENT(IN) :: action
+      TYPE(ecd_periodic_tddfpt_tangent_type), INTENT(OUT) :: tangent
+
+      COMPLEX(KIND=dp)                                    :: energy_first
+      INTEGER                                             :: iactive, ispin, istate, ivirt, nactive, nocc, nstates, nvirt
+      REAL(KIND=dp)                                       :: denominator, gap, norm, residual_norm, scale, tolerance
+
+      nstates = SIZE(evals)
+      IF (nstates < 1 .OR. context%nspin < 1 .OR. context%nspin > 2 .OR. &
+          orbitals%nspin /= context%nspin .OR. action%nspin /= context%nspin .OR. &
+          action%nstates /= nstates .OR. context%eps_degeneracy <= 0.0_dp) THEN
+         CPABORT("ECD| Periodic LR_TDDFT KERNEL NONE tangent dimensions are inconsistent")
+      END IF
+
+      tangent%nspin = context%nspin
+      tangent%nstates = nstates
+      ALLOCATE (tangent%energy_first(nstates), tangent%spin(tangent%nspin))
+      tangent%energy_first = CMPLX(0.0_dp, 0.0_dp, KIND=dp)
+      DO ispin = 1, tangent%nspin
+         nocc = orbitals%spin(ispin)%nocc
+         nvirt = orbitals%spin(ispin)%nvirt
+         nactive = orbitals%spin(ispin)%nactive
+         IF (nocc < 1 .OR. nvirt < 1 .OR. nactive < 1 .OR. &
+             .NOT. ALLOCATED(orbitals%spin(ispin)%active_index) .OR. &
+             .NOT. ALLOCATED(orbitals%spin(ispin)%evals_occ) .OR. &
+             .NOT. ALLOCATED(orbitals%spin(ispin)%evals_virt) .OR. &
+             .NOT. ALLOCATED(action%spin(ispin)%state) .OR. &
+             .NOT. ALLOCATED(action%spin(ispin)%value)) THEN
+            CPABORT("ECD| Periodic LR_TDDFT KERNEL NONE tangent data are incomplete")
+         END IF
+         IF (SIZE(orbitals%spin(ispin)%active_index) /= nactive .OR. &
+             MINVAL(orbitals%spin(ispin)%active_index) < 1 .OR. &
+             MAXVAL(orbitals%spin(ispin)%active_index) > nocc .OR. &
+             SIZE(action%spin(ispin)%state, 1) /= nvirt .OR. &
+             SIZE(action%spin(ispin)%state, 2) /= nactive .OR. &
+             SIZE(action%spin(ispin)%state, 3) /= nstates .OR. &
+             ANY(SHAPE(action%spin(ispin)%value) /= SHAPE(action%spin(ispin)%state))) THEN
+            CPABORT("ECD| Periodic LR_TDDFT KERNEL NONE tangent pair-space data are inconsistent")
+         END IF
+         ALLOCATE (tangent%spin(ispin)%coefficient(nvirt, nactive, nstates))
+         tangent%spin(ispin)%coefficient = CMPLX(0.0_dp, 0.0_dp, KIND=dp)
+      END DO
+
+      DO istate = 1, nstates
+         norm = 0.0_dp
+         energy_first = CMPLX(0.0_dp, 0.0_dp, KIND=dp)
+         DO ispin = 1, tangent%nspin
+            norm = norm + SUM(ABS(action%spin(ispin)%state(:, :, istate))**2)
+            energy_first = energy_first + SUM(CONJG(action%spin(ispin)%state(:, :, istate))* &
+                                               action%spin(ispin)%value(:, :, istate))
+         END DO
+         IF (norm <= SQRT(TINY(1.0_dp))) THEN
+            CPABORT("ECD| Periodic LR_TDDFT KERNEL NONE tangent received a zero-norm TDA state")
+         END IF
+         energy_first = energy_first/norm
+         tangent%energy_first(istate) = energy_first
+
+         residual_norm = 0.0_dp
+         scale = MAX(1.0_dp, ABS(evals(istate)))
+         DO ispin = 1, tangent%nspin
+            nvirt = orbitals%spin(ispin)%nvirt
+            nactive = orbitals%spin(ispin)%nactive
+            DO iactive = 1, nactive
+               DO ivirt = 1, nvirt
+                  gap = orbitals%spin(ispin)%evals_virt(ivirt) - &
+                        orbitals%spin(ispin)%evals_occ(orbitals%spin(ispin)%active_index(iactive))
+                  scale = MAX(scale, ABS(gap))
+               END DO
+            END DO
+         END DO
+         tolerance = MAX(context%eps_degeneracy, 100.0_dp*SQRT(EPSILON(1.0_dp))*scale)
+         DO ispin = 1, tangent%nspin
+            nvirt = orbitals%spin(ispin)%nvirt
+            nactive = orbitals%spin(ispin)%nactive
+            DO iactive = 1, nactive
+               DO ivirt = 1, nvirt
+                  gap = orbitals%spin(ispin)%evals_virt(ivirt) - &
+                        orbitals%spin(ispin)%evals_occ(orbitals%spin(ispin)%active_index(iactive))
+                  denominator = gap - evals(istate)
+                  IF (ABS(denominator) <= tolerance) THEN
+                     IF (ABS(action%spin(ispin)%value(ivirt, iactive, istate) - &
+                             energy_first*action%spin(ispin)%state(ivirt, iactive, istate)) > tolerance) THEN
+                        CPABORT("ECD| Periodic LR_TDDFT KERNEL NONE tangent requires a complete excitation manifold")
+                     END IF
+                     CYCLE
+                  END IF
+                  tangent%spin(ispin)%coefficient(ivirt, iactive, istate) = - &
+                     (action%spin(ispin)%value(ivirt, iactive, istate) - &
+                      energy_first*action%spin(ispin)%state(ivirt, iactive, istate))/denominator
+                  residual_norm = residual_norm + ABS(denominator* &
+                     tangent%spin(ispin)%coefficient(ivirt, iactive, istate) + &
+                     action%spin(ispin)%value(ivirt, iactive, istate) - &
+                     energy_first*action%spin(ispin)%state(ivirt, iactive, istate))**2
+               END DO
+            END DO
+         END DO
+         IF (SQRT(residual_norm) > tolerance) THEN
+            CPABORT("ECD| Periodic LR_TDDFT KERNEL NONE tangent residual exceeds the pair-space tolerance")
+         END IF
+      END DO
+
+   END SUBROUTINE ecd_periodic_tddfpt_kernel_none_tangent
+
+! **************************************************************************************************
+!> \brief Release KERNEL NONE first-order TDA tangent data.
+!> \param tangent First directional TDA eigenvalue and eigenvector coefficients
+! **************************************************************************************************
+   SUBROUTINE ecd_periodic_tddfpt_tangent_release(tangent)
+      TYPE(ecd_periodic_tddfpt_tangent_type), INTENT(INOUT) :: tangent
+
+      IF (ALLOCATED(tangent%spin)) DEALLOCATE (tangent%spin)
+      IF (ALLOCATED(tangent%energy_first)) DEALLOCATE (tangent%energy_first)
+      tangent%nspin = 0
+      tangent%nstates = 0
+
+   END SUBROUTINE ecd_periodic_tddfpt_tangent_release
+
+! **************************************************************************************************
+!> \brief Contract first-order TDA amplitudes with zero-order length and current vertices.
+!> \param context Implicit-Gamma ECD data context
+!> \param operators Folded position and complete-current AO operators
+!> \param orbitals Target TDDFPT occupied, virtual, and active orbital frame
+!> \param tangent First directional TDA eigenvalue and eigenvector coefficients
+!> \param position_tangent Length contribution from the TDA tangent [state, Cartesian]
+!> \param current_tangent Complete-current contribution from the TDA tangent [state, Cartesian]
+! **************************************************************************************************
+   SUBROUTINE ecd_periodic_tddfpt_tangent_state_actions(context, operators, orbitals, tangent, &
+                                                         position_tangent, current_tangent)
+      TYPE(ecd_gamma_context_type), INTENT(IN)            :: context
+      TYPE(ecd_gamma_zero_order_operators_type), INTENT(IN), TARGET :: operators
+      TYPE(ecd_periodic_tddfpt_orbitals_type), INTENT(IN) :: orbitals
+      TYPE(ecd_periodic_tddfpt_tangent_type), INTENT(IN) :: tangent
+      COMPLEX(KIND=dp), ALLOCATABLE, DIMENSION(:, :), INTENT(OUT) :: position_tangent, current_tangent
+
+      COMPLEX(KIND=dp), ALLOCATABLE, DIMENSION(:, :)     :: current_pair, position_pair
+      COMPLEX(KIND=dp), ALLOCATABLE, DIMENSION(:, :, :)  :: current_spin, position_spin
+      INTEGER                                            :: idir, ispin, istate, nactive, nao, nocc, nstates, nvirt
+      REAL(KIND=dp), ALLOCATABLE, DIMENSION(:, :)        :: pair_real
+      TYPE(cp_fm_struct_type), POINTER                   :: pair_struct
+      TYPE(cp_fm_type)                                   :: operator_active, pair_fm
+      TYPE(dbcsr_p_type), DIMENSION(:), POINTER          :: complete_current, gth_current, local_current, position
+
+      NULLIFY (complete_current, gth_current, local_current, pair_struct, position)
+      nstates = tangent%nstates
+      IF (nstates < 1 .OR. context%nspin < 1 .OR. context%nspin > 2 .OR. &
+          orbitals%nspin /= context%nspin .OR. tangent%nspin /= context%nspin) THEN
+         CPABORT("ECD| Periodic LR_TDDFT tangent-vertex dimensions are inconsistent")
+      END IF
+      CALL ecd_gamma_zero_order_operators_get(operators, position, local_current, gth_current, complete_current)
+      ALLOCATE (position_spin(nstates, ncart, context%nspin), current_spin(nstates, ncart, context%nspin))
+      position_spin = CMPLX(0.0_dp, 0.0_dp, KIND=dp)
+      current_spin = CMPLX(0.0_dp, 0.0_dp, KIND=dp)
+
+      DO ispin = 1, context%nspin
+         nao = context%spin(ispin)%nao
+         nocc = orbitals%spin(ispin)%nocc
+         nvirt = orbitals%spin(ispin)%nvirt
+         nactive = orbitals%spin(ispin)%nactive
+         IF (nao < 1 .OR. nocc < 1 .OR. nvirt < 1 .OR. nactive < 1 .OR. &
+             .NOT. ASSOCIATED(orbitals%spin(ispin)%mos_active) .OR. &
+             .NOT. ASSOCIATED(orbitals%spin(ispin)%mos_virt) .OR. &
+             .NOT. ALLOCATED(tangent%spin(ispin)%coefficient)) THEN
+            CPABORT("ECD| Periodic LR_TDDFT tangent-vertex data are incomplete")
+         END IF
+         IF (SIZE(tangent%spin(ispin)%coefficient, 1) /= nvirt .OR. &
+             SIZE(tangent%spin(ispin)%coefficient, 2) /= nactive .OR. &
+             SIZE(tangent%spin(ispin)%coefficient, 3) /= nstates) THEN
+            CPABORT("ECD| Periodic LR_TDDFT tangent-vertex pair-space data are inconsistent")
+         END IF
+         DO idir = 1, ncart
+            CALL cp_fm_create(operator_active, orbitals%spin(ispin)%mos_active%matrix_struct, &
+                              name='ECD TDDFPT tangent position action', set_zero=.TRUE.)
+            CALL cp_dbcsr_sm_fm_multiply(position(idir)%matrix, orbitals%spin(ispin)%mos_active, operator_active, &
+                                         ncol=nactive, alpha=1.0_dp, beta=0.0_dp)
+            NULLIFY (pair_struct)
+            CALL cp_fm_struct_create(pair_struct, template_fmstruct=orbitals%spin(ispin)%mos_virt%matrix_struct, &
+                                     nrow_global=nvirt, ncol_global=nactive)
+            CALL cp_fm_create(pair_fm, pair_struct, name='ECD TDDFPT tangent position pair vertex', set_zero=.TRUE.)
+            CALL cp_fm_struct_release(pair_struct)
+            CALL parallel_gemm('T', 'N', nvirt, nactive, nao, 1.0_dp, orbitals%spin(ispin)%mos_virt, &
+                               operator_active, 0.0_dp, pair_fm)
+            ALLOCATE (pair_real(nvirt, nactive), position_pair(nvirt, nactive))
+            CALL cp_fm_get_submatrix(pair_fm, pair_real)
+            position_pair = CMPLX(pair_real, 0.0_dp, KIND=dp)
+            DEALLOCATE (pair_real)
+            CALL cp_fm_release(pair_fm)
+            CALL cp_fm_release(operator_active)
+
+            CALL cp_fm_create(operator_active, orbitals%spin(ispin)%mos_active%matrix_struct, &
+                              name='ECD TDDFPT tangent current action', set_zero=.TRUE.)
+            CALL cp_dbcsr_sm_fm_multiply(complete_current(idir)%matrix, orbitals%spin(ispin)%mos_active, &
+                                         operator_active, ncol=nactive, alpha=1.0_dp, beta=0.0_dp)
+            NULLIFY (pair_struct)
+            CALL cp_fm_struct_create(pair_struct, template_fmstruct=orbitals%spin(ispin)%mos_virt%matrix_struct, &
+                                     nrow_global=nvirt, ncol_global=nactive)
+            CALL cp_fm_create(pair_fm, pair_struct, name='ECD TDDFPT tangent current pair vertex', set_zero=.TRUE.)
+            CALL cp_fm_struct_release(pair_struct)
+            CALL parallel_gemm('T', 'N', nvirt, nactive, nao, 1.0_dp, orbitals%spin(ispin)%mos_virt, &
+                               operator_active, 0.0_dp, pair_fm)
+            ALLOCATE (pair_real(nvirt, nactive), current_pair(nvirt, nactive))
+            CALL cp_fm_get_submatrix(pair_fm, pair_real)
+            current_pair = CMPLX(pair_real, 0.0_dp, KIND=dp)
+            DEALLOCATE (pair_real)
+            CALL cp_fm_release(pair_fm)
+            CALL cp_fm_release(operator_active)
+
+            DO istate = 1, nstates
+               position_spin(istate, idir, ispin) = SUM(tangent%spin(ispin)%coefficient(:, :, istate)*position_pair)
+               current_spin(istate, idir, ispin) = SUM(tangent%spin(ispin)%coefficient(:, :, istate)*current_pair)
+            END DO
+            DEALLOCATE (current_pair, position_pair)
+         END DO
+      END DO
+
+      ALLOCATE (position_tangent(nstates, ncart), current_tangent(nstates, ncart))
+      IF (context%nspin == 1) THEN
+         position_tangent = SQRT(2.0_dp)*position_spin(:, :, 1)
+         current_tangent = SQRT(2.0_dp)*current_spin(:, :, 1)
+      ELSE
+         position_tangent = position_spin(:, :, 1) + position_spin(:, :, 2)
+         current_tangent = current_spin(:, :, 1) + current_spin(:, :, 2)
+      END IF
+      DEALLOCATE (current_spin, position_spin)
+
+   END SUBROUTINE ecd_periodic_tddfpt_tangent_state_actions
+
+! **************************************************************************************************
+!> \brief Assemble periodic implicit-Gamma ECD from converged KERNEL NONE TDDFPT/TDA states.
+!> \param qs_env Quickstep environment
+!> \param ecd_section ECD input section
+!> \param lr_tddfpt_section ECD/LR_TDDFT input section
+!> \param evects Converged TDDFPT response orbitals [spin, state]
+!> \param evals TDDFPT/TDA excitation energies
+!> \param gs_mos TDDFPT ground-state orbital data
+!> \param pseudopotential_commutator Include the GTH non-local current
+!> \param ref_point Spatial-expansion reference point
+!> \param fwhm Lorentzian full width at half maximum
+! **************************************************************************************************
+   SUBROUTINE ecd_periodic_lr_tddfpt_kernel_none_spectra(qs_env, ecd_section, lr_tddfpt_section, evects, evals, &
+                                                          gs_mos, pseudopotential_commutator, ref_point, fwhm)
+      TYPE(qs_environment_type), POINTER                 :: qs_env
+      TYPE(section_vals_type), POINTER                   :: ecd_section, lr_tddfpt_section
+      TYPE(cp_fm_type), DIMENSION(:, :), INTENT(IN)      :: evects
+      REAL(KIND=dp), DIMENSION(:), INTENT(IN)            :: evals
+      TYPE(tddfpt_ground_state_mos), DIMENSION(:), POINTER :: gs_mos
+      LOGICAL, INTENT(IN)                                 :: pseudopotential_commutator
+      REAL(KIND=dp), DIMENSION(ncart), INTENT(IN)        :: ref_point
+      REAL(KIND=dp), INTENT(IN)                          :: fwhm
+
+      CHARACTER(LEN=default_string_length)               :: gauge_label
+      COMPLEX(KIND=dp), ALLOCATABLE, DIMENSION(:, :)     :: current_explicit, current_orbital, current_state, &
+                                                            current_tangent, length_explicit, length_orbital, &
+                                                            position_state, position_tangent
+      INTEGER                                            :: electric_gauge, npoints, spatial_order
+      LOGICAL                                            :: direction_explicit, do_kpoints, energy_range_explicit
+      LOGICAL, ALLOCATABLE, DIMENSION(:)                 :: selected
+      REAL(KIND=dp)                                      :: direction_norm, eps_degeneracy
+      REAL(KIND=dp), DIMENSION(:), POINTER               :: direction_ptr, energy_range
+      REAL(KIND=dp), DIMENSION(ncart)                    :: direction
+      TYPE(cell_type), POINTER                           :: cell
+      TYPE(ecd_gamma_context_type)                       :: context
+      TYPE(ecd_gamma_zero_order_operators_type)          :: operators
+      TYPE(ecd_periodic_tddfpt_complete_type)            :: complete
+      TYPE(ecd_periodic_tddfpt_energy_action_type)       :: energy_action
+      TYPE(ecd_periodic_tddfpt_orbitals_type)            :: orbitals
+      TYPE(ecd_periodic_tddfpt_orbital_response_type)    :: response
+      TYPE(ecd_periodic_tddfpt_tangent_type)             :: tangent
+      TYPE(section_vals_type), POINTER                   :: print_section, spectrum_section
+
+      NULLIFY (cell, direction_ptr, energy_range, print_section, spectrum_section)
+      CALL get_qs_env(qs_env, cell=cell, do_kpoints=do_kpoints)
+      IF (.NOT. ASSOCIATED(cell) .OR. .NOT. ASSOCIATED(gs_mos)) THEN
+         CPABORT("ECD| Periodic LR_TDDFT KERNEL NONE requires cell and TDDFPT orbital data")
+      END IF
+      IF (.NOT. ALL(cell%perd == 1) .OR. do_kpoints) THEN
+         CPABORT("ECD| Periodic LR_TDDFT KERNEL NONE requires implicit-Gamma CELL%PERIODIC XYZ")
+      END IF
+      IF (SIZE(evals) < 1 .OR. SIZE(evects, 1) /= SIZE(gs_mos) .OR. SIZE(evects, 2) /= SIZE(evals) .OR. &
+          fwhm <= 0.0_dp) THEN
+         CPABORT("ECD| Periodic LR_TDDFT KERNEL NONE state or broadening data are inconsistent")
+      END IF
+
+      CALL section_vals_val_get(ecd_section, "EPS_DEGENERACY", r_val=eps_degeneracy)
+      CALL section_vals_val_get(ecd_section, "SPATIAL_ORDER", i_val=spatial_order)
+      CALL section_vals_val_get(ecd_section, "PROPAGATION_DIRECTION", explicit=direction_explicit)
+      IF (direction_explicit) THEN
+         CALL section_vals_val_get(ecd_section, "PROPAGATION_DIRECTION", r_vals=direction_ptr)
+      END IF
+      CALL section_vals_val_get(lr_tddfpt_section, "ELECTRIC_GAUGE", i_val=electric_gauge)
+      IF (eps_degeneracy <= 0.0_dp .OR. spatial_order /= 1 .OR. .NOT. direction_explicit .OR. &
+          .NOT. ASSOCIATED(direction_ptr) .OR. &
+          SIZE(direction_ptr) /= ncart) THEN
+         CPABORT("ECD| Periodic LR_TDDFT KERNEL NONE requires first order and a Cartesian direction")
+      END IF
+      direction = direction_ptr
+      direction_norm = SQRT(SUM(direction**2))
+      IF (direction_norm <= SQRT(TINY(1.0_dp))) THEN
+         CPABORT("ECD| Periodic LR_TDDFT KERNEL NONE requires a non-zero propagation direction")
+      END IF
+      direction = direction/direction_norm
+      SELECT CASE (electric_gauge)
+      CASE (ecd_gauge_length)
+         gauge_label = 'LENGTH'
+      CASE (ecd_gauge_velocity)
+         gauge_label = 'VELOCITY'
+      CASE DEFAULT
+         CPABORT("ECD| Unknown periodic LR_TDDFT ELECTRIC_GAUGE")
+      END SELECT
+
+      print_section => section_vals_get_subs_vals(ecd_section, 'PRINT')
+      spectrum_section => section_vals_get_subs_vals(print_section, 'SPECTRUM')
+      CALL section_vals_val_get(spectrum_section, 'ENERGY_RANGE', explicit=energy_range_explicit)
+      IF (energy_range_explicit) THEN
+         CALL section_vals_val_get(spectrum_section, 'ENERGY_RANGE', r_vals=energy_range)
+      END IF
+      CALL section_vals_val_get(spectrum_section, 'NPOINTS', i_val=npoints)
+      IF (.NOT. energy_range_explicit .OR. .NOT. ASSOCIATED(energy_range) .OR. SIZE(energy_range) /= 2 .OR. &
+          energy_range(1) <= 0.0_dp .OR. energy_range(1) >= energy_range(2) .OR. npoints < 2) THEN
+         CPABORT("ECD| Periodic LR_TDDFT KERNEL NONE received an invalid response grid")
+      END IF
+
+      CALL ecd_gamma_context_create_implicit(context, qs_env, direction, ref_point, spatial_order, eps_degeneracy)
+      CALL ecd_gamma_zero_order_operators_build(operators, qs_env, context, pseudopotential_commutator)
+      CALL ecd_periodic_implicit_gamma_g1(context, operators, gauge_label)
+      CALL ecd_periodic_implicit_gamma_overlap_g3(context)
+      CALL ecd_periodic_implicit_gamma_core_g5(context)
+      CALL ecd_periodic_implicit_gamma_current_g4(qs_env, context, operators, pseudopotential_commutator)
+      CALL ecd_periodic_implicit_gamma_length_g11(qs_env, context, operators)
+      CALL ecd_periodic_implicit_gamma_ks_g6(qs_env, context)
+      CALL ecd_periodic_implicit_gamma_ks_phase_g7(context)
+
+      CALL ecd_periodic_tddfpt_orbitals_create(orbitals, context, gs_mos)
+      CALL ecd_periodic_tddfpt_complete_create(complete, qs_env, context, orbitals)
+      CALL ecd_periodic_tddfpt_orbital_response_create(response, context, orbitals, complete)
+      CALL ecd_periodic_tddfpt_zero_order_state_actions(context, operators, orbitals, evects, position_state, current_state)
+      CALL ecd_periodic_tddfpt_first_order_state_actions(context, orbitals, evects, length_explicit, current_explicit)
+      CALL ecd_periodic_tddfpt_orbital_state_actions(context, operators, orbitals, complete, response, evects, &
+                                                      length_orbital, current_orbital)
+      CALL ecd_periodic_tddfpt_energy_difference_first_action(context, orbitals, response, evects, energy_action)
+      CALL ecd_periodic_tddfpt_kernel_none_tangent(context, orbitals, evals, energy_action, tangent)
+      CALL ecd_periodic_tddfpt_tangent_state_actions(context, operators, orbitals, tangent, position_tangent, current_tangent)
+      CALL ecd_periodic_tddfpt_select_states(lr_tddfpt_section, SIZE(evals), selected)
+      CALL ecd_periodic_tddfpt_kernel_none_response(qs_env, ecd_section, context, operators, electric_gauge, &
+                                                     energy_range, npoints, fwhm, selected, evals, tangent%energy_first, &
+                                                     position_state, current_state, length_explicit + length_orbital + &
+                                                     position_tangent, current_explicit + current_orbital + current_tangent)
+
+      DEALLOCATE (current_explicit, current_orbital, current_state, current_tangent, length_explicit, length_orbital, &
+                  position_state, position_tangent, selected)
+      CALL ecd_periodic_tddfpt_tangent_release(tangent)
+      CALL ecd_periodic_tddfpt_energy_action_release(energy_action)
+      CALL ecd_periodic_tddfpt_orbital_response_release(response)
+      CALL ecd_periodic_tddfpt_complete_release(complete)
+      CALL ecd_periodic_tddfpt_orbitals_release(orbitals)
+      CALL ecd_gamma_zero_order_operators_release(operators)
+      CALL ecd_gamma_context_release(context)
+
+   END SUBROUTINE ecd_periodic_lr_tddfpt_kernel_none_spectra
+
+! **************************************************************************************************
+!> \brief Assemble selected KERNEL NONE TDA state poles in both electric representations.
+!> \param qs_env Quickstep environment
+!> \param ecd_section ECD input section
+!> \param context Implicit-Gamma ECD data context
+!> \param operators Folded position and complete-current AO operators
+!> \param electric_gauge Selected electric representation
+!> \param energy_range Response energy interval
+!> \param npoints Number of response grid points
+!> \param fwhm Lorentzian full width at half maximum
+!> \param selected Selected TDDFPT state mask
+!> \param evals TDA excitation energies
+!> \param energy_first TDA excitation-energy first coefficients
+!> \param position_zero Zero-order length transitions
+!> \param current_zero Zero-order complete-current transitions
+!> \param position_first First-order length transitions
+!> \param current_first First-order complete-current transitions
+! **************************************************************************************************
+   SUBROUTINE ecd_periodic_tddfpt_kernel_none_response(qs_env, ecd_section, context, operators, electric_gauge, &
+                                                        energy_range, npoints, fwhm, selected, evals, energy_first, &
+                                                        position_zero, current_zero, position_first, current_first)
+      TYPE(qs_environment_type), POINTER                 :: qs_env
+      TYPE(section_vals_type), POINTER                   :: ecd_section
+      TYPE(ecd_gamma_context_type), INTENT(IN)           :: context
+      TYPE(ecd_gamma_zero_order_operators_type), INTENT(IN), TARGET :: operators
+      INTEGER, INTENT(IN)                                :: electric_gauge, npoints
+      REAL(KIND=dp), DIMENSION(2), INTENT(IN)            :: energy_range
+      REAL(KIND=dp), INTENT(IN)                          :: fwhm
+      LOGICAL, DIMENSION(:), INTENT(IN)                  :: selected
+      REAL(KIND=dp), DIMENSION(:), INTENT(IN)            :: evals
+      COMPLEX(KIND=dp), DIMENSION(:), INTENT(IN)         :: energy_first
+      COMPLEX(KIND=dp), DIMENSION(:, :), INTENT(IN)      :: position_zero, current_zero, position_first, current_first
+
+      COMPLEX(KIND=dp), ALLOCATABLE, DIMENSION(:, :, :)  :: counter_taylor, length_counter, length_first_counter, &
+                                                            length_first_resonant, length_resonant, length_response, &
+                                                            resonant_taylor, velocity_counter, velocity_first_counter, &
+                                                            velocity_first_resonant, velocity_resonant, velocity_response
+      COMPLEX(KIND=dp), DIMENSION(ncart, 0:1)            :: length_taylor, velocity_taylor
+      INTEGER                                            :: ipoint, istate, nstates
+      INTEGER, DIMENSION(2)                              :: state_window
+      LOGICAL                                            :: gth_available
+      REAL(KIND=dp)                                      :: gauge_first_residual, gauge_first_residual_max, &
+                                                            gauge_zero_residual, gauge_zero_residual_max, photon_energy, &
+                                                            prefactor
+      REAL(KIND=dp), DIMENSION(0:1)                      :: gap_taylor
+      REAL(KIND=dp), DIMENSION(ncart, ncart)             :: diamagnetic_kernel
+      TYPE(cp_logger_type), POINTER                      :: logger
+      TYPE(dbcsr_p_type), DIMENSION(:), POINTER          :: complete_current, gth_current, local_current, position
+
+      NULLIFY (complete_current, gth_current, local_current, logger, position)
+      nstates = SIZE(evals)
+      IF (nstates < 1 .OR. SIZE(selected) /= nstates .OR. SIZE(energy_first) /= nstates .OR. &
+          SIZE(position_zero, 1) /= nstates .OR. SIZE(current_zero, 1) /= nstates .OR. &
+          SIZE(position_first, 1) /= nstates .OR. SIZE(current_first, 1) /= nstates .OR. &
+          SIZE(position_zero, 2) /= ncart .OR. SIZE(current_zero, 2) /= ncart .OR. &
+          SIZE(position_first, 2) /= ncart .OR. SIZE(current_first, 2) /= ncart .OR. &
+          COUNT(selected) < 1 .OR. npoints < 2 .OR. fwhm <= 0.0_dp .OR. energy_range(1) <= 0.0_dp .OR. &
+          energy_range(1) >= energy_range(2)) THEN
+         CPABORT("ECD| Periodic LR_TDDFT KERNEL NONE response data are inconsistent")
+      END IF
+      IF (electric_gauge /= ecd_gauge_length .AND. electric_gauge /= ecd_gauge_velocity) THEN
+         CPABORT("ECD| Periodic LR_TDDFT KERNEL NONE received an unsupported electric gauge")
+      END IF
+      CALL ecd_gamma_zero_order_operators_get(operators, position, local_current, gth_current, complete_current, &
+                                               gth_available)
+      CALL ecd_periodic_implicit_gamma_diamagnetic_kernel(qs_env, context, gth_available, diamagnetic_kernel)
+
+      ALLOCATE (counter_taylor(ncart, ncart, 0:1), length_counter(ncart, ncart, npoints), &
+                length_first_counter(ncart, ncart, npoints), length_first_resonant(ncart, ncart, npoints), &
+                length_resonant(ncart, ncart, npoints), length_response(ncart, ncart, npoints), &
+                resonant_taylor(ncart, ncart, 0:1), velocity_counter(ncart, ncart, npoints), &
+                velocity_first_counter(ncart, ncart, npoints), velocity_first_resonant(ncart, ncart, npoints), &
+                velocity_resonant(ncart, ncart, npoints), velocity_response(ncart, ncart, npoints))
+      length_counter = CMPLX(0.0_dp, 0.0_dp, KIND=dp)
+      length_first_counter = CMPLX(0.0_dp, 0.0_dp, KIND=dp)
+      length_first_resonant = CMPLX(0.0_dp, 0.0_dp, KIND=dp)
+      length_resonant = CMPLX(0.0_dp, 0.0_dp, KIND=dp)
+      velocity_counter = CMPLX(0.0_dp, 0.0_dp, KIND=dp)
+      velocity_first_counter = CMPLX(0.0_dp, 0.0_dp, KIND=dp)
+      velocity_first_resonant = CMPLX(0.0_dp, 0.0_dp, KIND=dp)
+      velocity_resonant = CMPLX(0.0_dp, 0.0_dp, KIND=dp)
+
+      DO istate = 1, nstates
+         IF (.NOT. selected(istate)) CYCLE
+         IF (evals(istate) <= SQRT(TINY(1.0_dp)) .OR. &
+             ABS(AIMAG(energy_first(istate))) > MAX(context%eps_degeneracy, 100.0_dp*EPSILON(1.0_dp))) THEN
+            CPABORT("ECD| Periodic LR_TDDFT KERNEL NONE received an invalid first-order excitation energy")
+         END IF
+         gap_taylor(0) = evals(istate)
+         gap_taylor(1) = REAL(energy_first(istate), KIND=dp)
+         velocity_taylor(:, 0) = current_zero(istate, :)
+         velocity_taylor(:, 1) = current_first(istate, :)
+         length_taylor(:, 0) = -gap_taylor(0)*position_zero(istate, :)
+         length_taylor(:, 1) = -gap_taylor(1)*position_zero(istate, :) - &
+                                gap_taylor(0)*position_first(istate, :)
+         CALL ecd_periodic_response_add_transition(velocity_taylor, gap_taylor, 1.0_dp, ABS(context%cell%deth), &
+                                                   energy_range, fwhm, velocity_resonant, velocity_counter, &
+                                                   velocity_first_resonant, velocity_first_counter, resonant_taylor, &
+                                                   counter_taylor)
+         CALL ecd_periodic_response_add_transition(length_taylor, gap_taylor, 1.0_dp, ABS(context%cell%deth), &
+                                                   energy_range, fwhm, length_resonant, length_counter, &
+                                                   length_first_resonant, length_first_counter, resonant_taylor, &
+                                                   counter_taylor)
+      END DO
+
+      velocity_response = velocity_resonant + velocity_counter
+      length_response = length_resonant + length_counter
+      velocity_first_resonant = velocity_first_resonant + velocity_first_counter
+      length_first_resonant = length_first_resonant + length_first_counter
+      gauge_zero_residual_max = 0.0_dp
+      gauge_first_residual_max = 0.0_dp
+      DO ipoint = 1, npoints
+         photon_energy = energy_range(1) + REAL(ipoint - 1, KIND=dp)* &
+                         (energy_range(2) - energy_range(1))/REAL(npoints - 1, KIND=dp)
+         prefactor = 2.0_dp*twopi/(ABS(context%cell%deth)*photon_energy**2)
+         velocity_response(:, :, ipoint) = velocity_response(:, :, ipoint) + &
+                                            CMPLX(prefactor*diamagnetic_kernel, 0.0_dp, KIND=dp)
+         length_response(:, :, ipoint) = length_response(:, :, ipoint) + &
+                                          CMPLX(prefactor*diamagnetic_kernel, 0.0_dp, KIND=dp)
+         gauge_zero_residual = SQRT(SUM(ABS(velocity_response(:, :, ipoint) - length_response(:, :, ipoint))**2))
+         gauge_first_residual = SQRT(SUM(ABS(velocity_first_resonant(:, :, ipoint) - &
+                                              length_first_resonant(:, :, ipoint))**2))
+         gauge_zero_residual_max = MAX(gauge_zero_residual_max, gauge_zero_residual)
+         gauge_first_residual_max = MAX(gauge_first_residual_max, gauge_first_residual)
+      END DO
+      ipoint = (npoints + 1)/2
+      photon_energy = energy_range(1) + REAL(ipoint - 1, KIND=dp)* &
+                      (energy_range(2) - energy_range(1))/REAL(npoints - 1, KIND=dp)
+      gauge_zero_residual = SQRT(SUM(ABS(velocity_response(:, :, ipoint) - length_response(:, :, ipoint))**2))
+      gauge_first_residual = SQRT(SUM(ABS(velocity_first_resonant(:, :, ipoint) - &
+                                           length_first_resonant(:, :, ipoint))**2))
+      logger => cp_get_default_logger()
+      IF (cp_logger_get_default_io_unit(logger) > 0) THEN
+         WRITE (cp_logger_get_default_io_unit(logger), '(T2,A,T55,I10)') &
+            'ECD| Stage T1 KERNEL NONE selected TDA states', COUNT(selected)
+         WRITE (cp_logger_get_default_io_unit(logger), '(T2,A,T55,ES14.6)') &
+            'ECD| Stage T1 midpoint photon energy [hartree]', photon_energy
+         WRITE (cp_logger_get_default_io_unit(logger), '(T2,A,T55,ES14.6)') &
+            'ECD| Stage T1 midpoint length-velocity zero residual', gauge_zero_residual
+         WRITE (cp_logger_get_default_io_unit(logger), '(T2,A,T55,ES14.6)') &
+            'ECD| Stage T1 midpoint length-velocity first residual', gauge_first_residual
+         WRITE (cp_logger_get_default_io_unit(logger), '(T2,A,T55,ES14.6)') &
+            'ECD| Stage T1 maximum length-velocity zero residual', gauge_zero_residual_max
+         WRITE (cp_logger_get_default_io_unit(logger), '(T2,A,T55,ES14.6)') &
+            'ECD| Stage T1 maximum length-velocity first residual', gauge_first_residual_max
+      END IF
+
+      state_window = [-1, -1]
+      IF (electric_gauge == ecd_gauge_velocity) THEN
+         CALL ecd_periodic_print_response_tensor(ecd_section, energy_range, velocity_response, velocity_first_resonant, &
+                                                  context, 'VELOCITY', gth_available, fwhm, state_window, COUNT(selected), &
+                                                  'TDDFPT_TDA')
+         CALL ecd_periodic_print_maxwell_spectrum(ecd_section, energy_range, context%direction, velocity_response, &
+                                                  velocity_first_resonant, context, 'VELOCITY', gth_available, fwhm, &
+                                                  state_window, COUNT(selected), 'TDDFPT_TDA')
+      ELSE
+         CALL ecd_periodic_print_response_tensor(ecd_section, energy_range, length_response, length_first_resonant, &
+                                                  context, 'LENGTH', gth_available, fwhm, state_window, COUNT(selected), &
+                                                  'TDDFPT_TDA')
+         CALL ecd_periodic_print_maxwell_spectrum(ecd_section, energy_range, context%direction, length_response, &
+                                                  length_first_resonant, context, 'LENGTH', gth_available, fwhm, &
+                                                  state_window, COUNT(selected), 'TDDFPT_TDA')
+      END IF
+      DEALLOCATE (counter_taylor, length_counter, length_first_counter, length_first_resonant, length_resonant, &
+                  length_response, resonant_taylor, velocity_counter, velocity_first_counter, velocity_first_resonant, &
+                  velocity_resonant, velocity_response)
+
+   END SUBROUTINE ecd_periodic_tddfpt_kernel_none_response
+
+! **************************************************************************************************
+!> \brief Contract the shifted-orbital contribution to TDDFPT state vertices at fixed TDA amplitudes.
+!> \param context Implicit-Gamma ECD data context
+!> \param operators Folded position and complete-current AO operators
+!> \param orbitals Target TDDFPT occupied and virtual orbital frame
+!> \param complete Complete TDDFPT-compatible auxiliary orbital frame
+!> \param response Target-orbital first derivatives in the complete AO eigenvector frame
+!> \param evects Converged TDDFPT response orbitals [spin, state]
+!> \param position_orbital_first Shifted-orbital length contribution [state, Cartesian]
+!> \param current_orbital_first Shifted-orbital current contribution [state, Cartesian]
+! **************************************************************************************************
+   SUBROUTINE ecd_periodic_tddfpt_orbital_state_actions(context, operators, orbitals, complete, response, evects, &
+                                                         position_orbital_first, current_orbital_first)
+      TYPE(ecd_gamma_context_type), INTENT(IN)            :: context
+      TYPE(ecd_gamma_zero_order_operators_type), INTENT(IN), TARGET :: operators
+      TYPE(ecd_periodic_tddfpt_orbitals_type), INTENT(IN) :: orbitals
+      TYPE(ecd_periodic_tddfpt_complete_type), INTENT(IN) :: complete
+      TYPE(ecd_periodic_tddfpt_orbital_response_type), INTENT(IN) :: response
+      TYPE(cp_fm_type), DIMENSION(:, :), INTENT(IN)       :: evects
+      COMPLEX(KIND=dp), ALLOCATABLE, DIMENSION(:, :), INTENT(OUT) :: position_orbital_first, &
+                                                                       current_orbital_first
+
+      COMPLEX(KIND=dp), ALLOCATABLE, DIMENSION(:, :)     :: active_derivative, active_map, evect_derivative, &
+                                                            operator_active, operator_active_derivative, &
+                                                            virtual_derivative, virtual_map, virtual_state
+      COMPLEX(KIND=dp), ALLOCATABLE, DIMENSION(:, :, :)  :: current_spin, position_spin
+      INTEGER                                            :: idir, ispin, istate, nactive, ncomplete, nocc, nresponse, &
+                                                            nrow_response, nstates, ntarget, nvirt
+      REAL(KIND=dp), ALLOCATABLE, DIMENSION(:, :)        :: evect_full
+      REAL(KIND=dp), ALLOCATABLE, DIMENSION(:, :, :)     :: current_complete, position_complete
+      TYPE(cp_fm_struct_type), POINTER                   :: coordinate_struct
+      TYPE(cp_fm_type)                                   :: coordinate_fm, overlap_evect, operator_mo
+      TYPE(dbcsr_p_type), DIMENSION(:), POINTER          :: complete_current, gth_current, local_current, position
+
+      NULLIFY (complete_current, coordinate_struct, gth_current, local_current, position)
+      nstates = SIZE(evects, 2)
+      IF (nstates < 1 .OR. orbitals%nspin /= context%nspin .OR. complete%nspin /= context%nspin .OR. &
+          response%nspin /= context%nspin .OR. SIZE(evects, 1) /= context%nspin) THEN
+         CPABORT("ECD| Periodic LR_TDDFT orbital-state action dimensions are inconsistent")
+      END IF
+      CALL ecd_gamma_zero_order_operators_get(operators, position, local_current, gth_current, complete_current)
+      ALLOCATE (position_spin(nstates, ncart, context%nspin), current_spin(nstates, ncart, context%nspin))
+      position_spin = CMPLX(0.0_dp, 0.0_dp, KIND=dp)
+      current_spin = CMPLX(0.0_dp, 0.0_dp, KIND=dp)
+
+      DO ispin = 1, context%nspin
+         ncomplete = complete%spin(ispin)%nframe
+         ntarget = orbitals%spin(ispin)%nframe
+         nocc = orbitals%spin(ispin)%nocc
+         nvirt = orbitals%spin(ispin)%nvirt
+         nactive = orbitals%spin(ispin)%nactive
+         IF (ncomplete /= context%spin(ispin)%nao .OR. ntarget /= nocc + nvirt .OR. nactive < 1 .OR. &
+             .NOT. ASSOCIATED(complete%spin(ispin)%mos_frame) .OR. &
+             .NOT. ALLOCATED(orbitals%spin(ispin)%active_index) .OR. &
+             .NOT. ALLOCATED(response%spin(ispin)%frame_map) .OR. &
+             .NOT. ALLOCATED(response%spin(ispin)%coefficient_first)) THEN
+            CPABORT("ECD| Periodic LR_TDDFT orbital-state data are incomplete")
+         END IF
+         IF (SIZE(response%spin(ispin)%frame_map, 1) /= ncomplete .OR. &
+             SIZE(response%spin(ispin)%frame_map, 2) /= ntarget .OR. &
+             SIZE(response%spin(ispin)%coefficient_first, 1) /= ncomplete .OR. &
+             SIZE(response%spin(ispin)%coefficient_first, 2) /= ntarget .OR. &
+             SIZE(orbitals%spin(ispin)%active_index) /= nactive .OR. &
+             MINVAL(orbitals%spin(ispin)%active_index) < 1 .OR. &
+             MAXVAL(orbitals%spin(ispin)%active_index) > nocc) THEN
+            CPABORT("ECD| Periodic LR_TDDFT orbital-state frame maps are inconsistent")
+         END IF
+         CALL cp_fm_get_info(evects(ispin, 1), nrow_global=nrow_response, ncol_global=nresponse)
+         IF (nrow_response /= ncomplete .OR. nresponse /= nactive) THEN
+            CPABORT("ECD| Periodic LR_TDDFT response-vector layout is inconsistent with active orbitals")
+         END IF
+
+         ALLOCATE (active_derivative(ncomplete, nactive), active_map(ncomplete, nactive), &
+                   virtual_derivative(ncomplete, nvirt), virtual_map(ncomplete, nvirt))
+         active_map = response%spin(ispin)%frame_map(:, orbitals%spin(ispin)%active_index)
+         active_derivative = response%spin(ispin)%coefficient_first(:, orbitals%spin(ispin)%active_index)
+         virtual_map = response%spin(ispin)%frame_map(:, nocc + 1:ntarget)
+         virtual_derivative = response%spin(ispin)%coefficient_first(:, nocc + 1:ntarget)
+         ALLOCATE (position_complete(ncomplete, ncomplete, ncart), current_complete(ncomplete, ncomplete, ncart))
+         DO idir = 1, ncart
+            CALL ecd_project_real_operator_to_mo(position(idir), complete%spin(ispin)%mos_frame, ncomplete, &
+                                                 ncomplete, operator_mo)
+            CALL cp_fm_get_submatrix(operator_mo, position_complete(:, :, idir))
+            CALL cp_fm_release(operator_mo)
+            CALL ecd_project_real_operator_to_mo(complete_current(idir), complete%spin(ispin)%mos_frame, ncomplete, &
+                                                 ncomplete, operator_mo)
+            CALL cp_fm_get_submatrix(operator_mo, current_complete(:, :, idir))
+            CALL cp_fm_release(operator_mo)
+         END DO
+
+         DO istate = 1, nstates
+            NULLIFY (coordinate_struct)
+            CALL cp_fm_create(overlap_evect, evects(ispin, istate)%matrix_struct, &
+                              name='ECD TDDFPT S response vector', set_zero=.TRUE.)
+            CALL cp_dbcsr_sm_fm_multiply(context%matrix_s(1)%matrix, evects(ispin, istate), overlap_evect, &
+                                         ncol=nactive, alpha=1.0_dp, beta=0.0_dp)
+            CALL cp_fm_struct_create(coordinate_struct, template_fmstruct=complete%spin(ispin)%mos_frame%matrix_struct, &
+                                     nrow_global=ncomplete, ncol_global=nactive)
+            CALL cp_fm_create(coordinate_fm, coordinate_struct, name='ECD TDDFPT complete response coordinates', &
+                              set_zero=.TRUE.)
+            CALL cp_fm_struct_release(coordinate_struct)
+            CALL parallel_gemm('T', 'N', ncomplete, nactive, ncomplete, 1.0_dp, complete%spin(ispin)%mos_frame, &
+                               overlap_evect, 0.0_dp, coordinate_fm)
+            ALLOCATE (evect_full(ncomplete, nactive), virtual_state(nvirt, nactive))
+            CALL cp_fm_get_submatrix(coordinate_fm, evect_full)
+            CALL cp_fm_release(coordinate_fm)
+            CALL cp_fm_release(overlap_evect)
+            virtual_state = MATMUL(CONJG(TRANSPOSE(virtual_map)), CMPLX(evect_full, 0.0_dp, KIND=dp))
+            ALLOCATE (evect_derivative(ncomplete, nactive))
+            evect_derivative = MATMUL(virtual_derivative, virtual_state)
+
+            DO idir = 1, ncart
+               ALLOCATE (operator_active(ncomplete, nactive), operator_active_derivative(ncomplete, nactive))
+               operator_active = MATMUL(CMPLX(position_complete(:, :, idir), 0.0_dp, KIND=dp), active_map)
+               operator_active_derivative = MATMUL(CMPLX(position_complete(:, :, idir), 0.0_dp, KIND=dp), &
+                                                    active_derivative)
+               position_spin(istate, idir, ispin) = 0.5_dp*(SUM(CONJG(evect_derivative)*operator_active) - &
+                                                             SUM(evect_full*operator_active_derivative))
+               operator_active = MATMUL(CMPLX(current_complete(:, :, idir), 0.0_dp, KIND=dp), active_map)
+               operator_active_derivative = MATMUL(CMPLX(current_complete(:, :, idir), 0.0_dp, KIND=dp), &
+                                                    active_derivative)
+               current_spin(istate, idir, ispin) = 0.5_dp*(SUM(CONJG(evect_derivative)*operator_active) - &
+                                                            SUM(evect_full*operator_active_derivative))
+               DEALLOCATE (operator_active, operator_active_derivative)
+            END DO
+            DEALLOCATE (evect_derivative, evect_full, virtual_state)
+         END DO
+         DEALLOCATE (active_derivative, active_map, current_complete, position_complete, virtual_derivative, virtual_map)
+      END DO
+
+      ALLOCATE (position_orbital_first(nstates, ncart), current_orbital_first(nstates, ncart))
+      IF (context%nspin == 1) THEN
+         position_orbital_first = SQRT(2.0_dp)*position_spin(:, :, 1)
+         current_orbital_first = SQRT(2.0_dp)*current_spin(:, :, 1)
+      ELSE
+         position_orbital_first = position_spin(:, :, 1) + position_spin(:, :, 2)
+         current_orbital_first = current_spin(:, :, 1) + current_spin(:, :, 2)
+      END IF
+      DEALLOCATE (current_spin, position_spin)
+
+   END SUBROUTINE ecd_periodic_tddfpt_orbital_state_actions
+
+! **************************************************************************************************
+!> \brief Decode the periodic TDDFPT/TDA state selection.
+!> \param lr_tddfpt_section ECD/LR_TDDFT input section
+!> \param nstates Number of converged TDDFPT states
+!> \param selected Selected-state mask [state]
+! **************************************************************************************************
+   SUBROUTINE ecd_periodic_tddfpt_select_states(lr_tddfpt_section, nstates, selected)
+      TYPE(section_vals_type), POINTER                   :: lr_tddfpt_section
+      INTEGER, INTENT(IN)                                :: nstates
+      LOGICAL, ALLOCATABLE, DIMENSION(:), INTENT(OUT)    :: selected
+
+      INTEGER                                            :: iout, state
+      INTEGER, DIMENSION(:), POINTER                     :: state_list
+
+      NULLIFY (state_list)
+      IF (nstates < 1) THEN
+         CPABORT("ECD| Periodic LR_TDDFT requires at least one converged TDDFPT state")
+      END IF
+      CALL section_vals_val_get(lr_tddfpt_section, "STATE_LIST", i_vals=state_list)
+      IF (.NOT. ASSOCIATED(state_list)) THEN
+         CPABORT("ECD| Periodic LR_TDDFT STATE_LIST data are unavailable")
+      END IF
+      ALLOCATE (selected(nstates))
+      selected = .FALSE.
+      IF (SIZE(state_list) == 1 .AND. state_list(1) == -1) THEN
+         selected = .TRUE.
+      ELSE
+         IF (SIZE(state_list) < 1 .OR. ANY(state_list < 1)) THEN
+            CPABORT("ECD| Periodic LR_TDDFT STATE_LIST uses -1 alone or positive state numbers")
+         END IF
+         DO iout = 1, SIZE(state_list)
+            state = state_list(iout)
+            IF (state > nstates) THEN
+               CPABORT("ECD| Periodic LR_TDDFT STATE_LIST exceeds TDDFPT NSTATES")
+            END IF
+            selected(state) = .TRUE.
+         END DO
+      END IF
+      IF (COUNT(selected) < 1) THEN
+         CPABORT("ECD| Periodic LR_TDDFT STATE_LIST selected no TDDFPT states")
+      END IF
+
+   END SUBROUTINE ecd_periodic_tddfpt_select_states
 
 ! **************************************************************************************************
 !> \brief Validate and dispatch the periodic independent-particle ECD response.
@@ -3833,7 +5355,7 @@ CONTAINS
 !> \brief Write common reproducibility metadata for implicit-Gamma periodic ECD files.
 ! **************************************************************************************************
    SUBROUTINE ecd_periodic_write_output_metadata(output_unit, context, gauge_label, gth_available, fwhm, &
-                                                 transition_band_range, ntransitions, energy_range, npoints)
+                                                 transition_band_range, ntransitions, energy_range, npoints, transition_source)
       INTEGER, INTENT(IN)                                :: output_unit
       TYPE(ecd_gamma_context_type), INTENT(IN)           :: context
       CHARACTER(LEN=*), INTENT(IN)                       :: gauge_label
@@ -3843,10 +5365,15 @@ CONTAINS
       INTEGER, INTENT(IN)                                :: npoints
       REAL(KIND=dp), INTENT(IN)                          :: fwhm
       REAL(KIND=dp), DIMENSION(2), INTENT(IN)            :: energy_range
+      CHARACTER(LEN=*), INTENT(IN), OPTIONAL             :: transition_source
+
+      CHARACTER(LEN=12)                                  :: source_label
 
       IF (output_unit <= 0 .OR. .NOT. ASSOCIATED(context%cell)) THEN
          CPABORT('ECD| Periodic output metadata require an open unit and a cell')
       END IF
+      source_label = 'IPA'
+      IF (PRESENT(transition_source)) source_label = transition_source
       WRITE (output_unit, '(A,1X,A)') '# Gamma_layout', 'IMPLICIT'
       WRITE (output_unit, '(A,1X,A)') '# Electric_gauge', TRIM(gauge_label)
       WRITE (output_unit, '(A,1X,L1)') '# GTH_current_available', gth_available
@@ -3859,7 +5386,14 @@ CONTAINS
       WRITE (output_unit, '(A,1X,ES18.10E3)') '# Cell_volume_bohr3', ABS(context%cell%deth)
       WRITE (output_unit, '(A,1X,I0)') '# Spin_channels', context%nspin
       WRITE (output_unit, '(A,2(1X,I0))') '# Transition_band_range', transition_band_range
-      WRITE (output_unit, '(A,1X,I0)') '# Selected_occupied_empty_pairs', ntransitions
+      SELECT CASE (TRIM(source_label))
+      CASE ('IPA')
+         WRITE (output_unit, '(A,1X,I0)') '# Selected_occupied_empty_pairs', ntransitions
+      CASE ('TDDFPT_TDA')
+         WRITE (output_unit, '(A,1X,I0)') '# Selected_TDA_states', ntransitions
+      CASE DEFAULT
+         CPABORT('ECD| Unsupported periodic output transition source')
+      END SELECT
       WRITE (output_unit, '(A,2(1X,ES18.10E3))') '# Energy_range_hartree', energy_range
       WRITE (output_unit, '(A,1X,I0)') '# NPOINTS', npoints
 
@@ -4054,7 +5588,7 @@ CONTAINS
 ! **************************************************************************************************
    SUBROUTINE ecd_periodic_print_response_tensor(ecd_section, energy_range, response_zero, response_first, &
                                                  context, gauge_label, gth_available, fwhm, transition_band_range, &
-                                                 ntransitions)
+                                                 ntransitions, transition_source)
       TYPE(section_vals_type), POINTER                   :: ecd_section
       REAL(KIND=dp), DIMENSION(2), INTENT(IN)            :: energy_range
       COMPLEX(KIND=dp), DIMENSION(:, :, :), INTENT(IN)   :: response_first, response_zero
@@ -4064,8 +5598,10 @@ CONTAINS
       INTEGER, DIMENSION(2), INTENT(IN), OPTIONAL        :: transition_band_range
       INTEGER, INTENT(IN), OPTIONAL                      :: ntransitions
       REAL(KIND=dp), INTENT(IN), OPTIONAL                :: fwhm
+      CHARACTER(LEN=*), INTENT(IN), OPTIONAL             :: transition_source
 
       CHARACTER(LEN=default_path_length)                 :: response_filename
+      CHARACTER(LEN=12)                                  :: source_label
       COMPLEX(KIND=dp)                                   :: epsilon_zero
       INTEGER                                            :: ia, ib, ipoint, iounit, response_unit
       REAL(KIND=dp)                                      :: photon_energy
@@ -4080,6 +5616,8 @@ CONTAINS
       CPASSERT(SIZE(response_zero, 3) >= 2)
 
       NULLIFY (logger, tensor_print_key)
+      source_label = 'IPA'
+      IF (PRESENT(transition_source)) source_label = transition_source
       logger => cp_get_default_logger()
       tensor_print_key => section_vals_get_subs_vals(ecd_section, "PRINT%RESPONSE_TENSOR")
       response_filename = cp_print_key_generate_filename(logger, tensor_print_key, &
@@ -4101,7 +5639,8 @@ CONTAINS
          END IF
          WRITE (response_unit, '(A)') '# Format_version 2'
          CALL ecd_periodic_write_output_metadata(response_unit, context, gauge_label, gth_available, fwhm, &
-                                                 transition_band_range, ntransitions, energy_range, SIZE(response_zero, 3))
+                                                 transition_band_range, ntransitions, energy_range, SIZE(response_zero, 3), &
+                                                 source_label)
       END IF
       WRITE (response_unit, '(A)') '# epsilon0 includes the vacuum identity and diamagnetic baseline'
       WRITE (response_unit, '(A)') '# epsilon1 is the directional Taylor coefficient in bohr'
@@ -4155,7 +5694,7 @@ CONTAINS
 ! **************************************************************************************************
    SUBROUTINE ecd_periodic_print_maxwell_spectrum(ecd_section, energy_range, direction, response_zero, &
                                                    response_first, context, gauge_label, gth_available, fwhm, &
-                                                   transition_band_range, ntransitions)
+                                                   transition_band_range, ntransitions, transition_source)
       TYPE(section_vals_type), POINTER                   :: ecd_section
       REAL(KIND=dp), DIMENSION(2), INTENT(IN)            :: energy_range
       REAL(KIND=dp), DIMENSION(ncart), INTENT(IN)        :: direction
@@ -4166,8 +5705,10 @@ CONTAINS
       INTEGER, DIMENSION(2), INTENT(IN), OPTIONAL        :: transition_band_range
       INTEGER, INTENT(IN), OPTIONAL                      :: ntransitions
       REAL(KIND=dp), INTENT(IN), OPTIONAL                :: fwhm
+      CHARACTER(LEN=*), INTENT(IN), OPTIONAL             :: transition_source
 
       CHARACTER(LEN=default_path_length)                 :: spectrum_filename
+      CHARACTER(LEN=12)                                  :: source_label
       COMPLEX(KIND=dp), DIMENSION(2, 2)                  :: epsilon_first_transverse, &
                                                             epsilon_zero_transverse, maxwell_matrix, &
                                                             polarizations
@@ -4191,6 +5732,8 @@ CONTAINS
 
       CALL ecd_periodic_transverse_basis(direction, transverse_basis)
       NULLIFY (logger, spectrum_print_key)
+      source_label = 'IPA'
+      IF (PRESENT(transition_source)) source_label = transition_source
       logger => cp_get_default_logger()
       spectrum_print_key => section_vals_get_subs_vals(ecd_section, "PRINT%SPECTRUM")
       spectrum_filename = cp_print_key_generate_filename(logger, spectrum_print_key, &
@@ -4209,7 +5752,8 @@ CONTAINS
          END IF
          WRITE (spectrum_unit, '(A)') '# Format_version 2'
          CALL ecd_periodic_write_output_metadata(spectrum_unit, context, gauge_label, gth_available, fwhm, &
-                                                 transition_band_range, ntransitions, energy_range, SIZE(response_zero, 3))
+                                                 transition_band_range, ntransitions, energy_range, SIZE(response_zero, 3), &
+                                                 source_label)
       END IF
       WRITE (spectrum_unit, '(A,3(1X,ES18.10E3))') '# Propagation_direction', direction
       WRITE (spectrum_unit, '(A,3(1X,ES18.10E3))') '# Transverse_e1', transverse_basis(:, 1)

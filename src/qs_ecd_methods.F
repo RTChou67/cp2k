@@ -57,7 +57,9 @@ MODULE qs_ecd_methods
    USE particle_types,                  ONLY: particle_type
    USE physcon,                         ONLY: evolt
    USE qs_ecd_operators,                ONLY: ecd_project_real_operator_to_mo
-   USE qs_ecd_periodic,                 ONLY: ecd_periodic_ipa_response
+   USE qs_ecd_periodic,                 ONLY: ecd_periodic_ipa_response,&
+                                              ecd_periodic_lr_tddfpt_kernel_none_spectra,&
+                                              ecd_periodic_lr_tddfpt_validate
    USE qs_environment_types,            ONLY: get_qs_env,&
                                               qs_environment_type
    USE qs_kind_types,                   ONLY: qs_kind_type
@@ -106,7 +108,8 @@ CONTAINS
 
       CHARACTER(LEN=default_string_length)               :: broadening_label
       INTEGER                                            :: broadening, handle, iounit, &
-                                                            ntransitions, reference
+                                                            ntransitions, reference, tddfpt_kernel, &
+                                                            tddfpt_nstates
       INTEGER, DIMENSION(2)                              :: transition_band_range
       INTEGER, DIMENSION(:), POINTER                     :: transition_band_range_ptr
       LOGICAL                                            :: do_ecd, do_hfx, do_ipa, do_lr_tddft, &
@@ -218,11 +221,18 @@ CONTAINS
       END IF
 
       IF (do_lr_tddft) THEN
-         CALL ecd_require_molecular_boundary(qs_env)
          tddfpt_section => section_vals_get_subs_vals(qs_env%input, "PROPERTIES%TDDFPT")
          CALL section_vals_get(tddfpt_section, explicit=do_lr_tddft)
          IF (.NOT. do_lr_tddft) THEN
             CPABORT("ECD| LR_TDDFT source requires the same-level TDDFPT section")
+         END IF
+         IF (is_periodic) THEN
+            CALL section_vals_val_get(tddfpt_section, "KERNEL", i_val=tddfpt_kernel)
+            CALL section_vals_val_get(tddfpt_section, "NSTATES", i_val=tddfpt_nstates)
+            CALL ecd_periodic_lr_tddfpt_validate(qs_env, ecd_section, lr_tddft_section, &
+                                                 tddfpt_kernel, tddfpt_nstates, broadening, fwhm)
+         ELSE
+            CALL ecd_require_molecular_boundary(qs_env)
          END IF
          CALL timestop(handle)
          RETURN
@@ -531,12 +541,13 @@ CONTAINS
       TYPE(cp_fm_struct_type), POINTER                   :: fm_struct
       TYPE(cp_fm_type), ALLOCATABLE, DIMENSION(:)        :: magnetic_active, position_active
       TYPE(cp_fm_type), ALLOCATABLE, DIMENSION(:, :)     :: magnetic_occ, position_occ
+      TYPE(cell_type), POINTER                           :: cell
       TYPE(section_vals_type), POINTER                   :: ecd_section, hfx_section, ipa_section, &
                                                             lr_tddfpt_section
 
       CALL timeset(routineN, handle)
 
-      NULLIFY (ecd_section, fm_struct, hfx_section, ipa_section, lr_tddfpt_section, ref_point, state_list)
+      NULLIFY (cell, ecd_section, fm_struct, hfx_section, ipa_section, lr_tddfpt_section, ref_point, state_list)
       ecd_section => section_vals_get_subs_vals(qs_env%input, "PROPERTIES%ECD")
       CALL section_vals_val_get(ecd_section, "_SECTION_PARAMETERS_", l_val=do_ecd)
       IF (.NOT. do_ecd) THEN
@@ -560,7 +571,6 @@ CONTAINS
          CPABORT("ECD| LR_TDDFT ECD supports TDDFPT KERNEL FULL and KERNEL NONE")
       END IF
 
-      CALL ecd_require_molecular_boundary(qs_env)
       hfx_section => section_vals_get_subs_vals(qs_env%input, "DFT%XC%HF")
       CALL section_vals_get(hfx_section, explicit=do_hfx)
       IF (do_hfx) THEN
@@ -582,6 +592,18 @@ CONTAINS
          IF (ref_point_explicit) CPWARN("ECD| REF_POINT is used only with REFERENCE USER_DEFINED")
          CALL get_reference_point(rcc, qs_env=qs_env, reference=reference)
       END IF
+
+      CALL get_qs_env(qs_env, cell=cell)
+      IF (.NOT. ASSOCIATED(cell)) THEN
+         CPABORT("ECD| LR_TDDFT ECD cannot obtain the simulation cell")
+      END IF
+      IF (ANY(cell%perd /= 0)) THEN
+         CALL ecd_periodic_lr_tddfpt_kernel_none_spectra(qs_env, ecd_section, lr_tddfpt_section, evects, evals, &
+                                                          gs_mos, pseudopotential_commutator, rcc, fwhm)
+         CALL timestop(handle)
+         RETURN
+      END IF
+      CALL ecd_require_molecular_boundary(qs_env)
 
       nspins = SIZE(gs_mos)
       nstates = SIZE(evals)

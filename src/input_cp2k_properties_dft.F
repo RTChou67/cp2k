@@ -2312,10 +2312,17 @@ CONTAINS
 
       CALL section_create(subsection, __LOCATION__, name="LR_TDDFT", &
                           description="Controls ECD spectra assembled from an existing TDDFPT calculation.", &
-                          n_keywords=2, repeats=.FALSE.)
+                          n_keywords=3, repeats=.FALSE.)
       CALL keyword_create(keyword, __LOCATION__, name="_SECTION_PARAMETERS_", &
                           description="Controls the activation of the TDDFT ECD source.", &
                           default_l_val=.FALSE., lone_keyword_l_val=.TRUE.)
+      CALL section_add_keyword(subsection, keyword)
+      CALL keyword_release(keyword)
+      CALL keyword_create(keyword, __LOCATION__, name="ELECTRIC_GAUGE", &
+                          description="Primary electric representation for periodic TDDFPT/TDA ECD response.", &
+                          usage="ELECTRIC_GAUGE VELOCITY", &
+                          enum_c_vals=s2a("LENGTH", "VELOCITY"), &
+                          enum_i_vals=[1, 2], default_i_val=2)
       CALL section_add_keyword(subsection, keyword)
       CALL keyword_release(keyword)
       CALL keyword_create(keyword, __LOCATION__, name="STATE_LIST", &

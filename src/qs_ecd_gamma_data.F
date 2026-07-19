@@ -74,6 +74,7 @@ MODULE qs_ecd_gamma_data
    TYPE, PUBLIC :: ecd_gamma_context_type
       INTEGER                                                  :: nspin = 0, spatial_order = 0
       REAL(KIND=dp), DIMENSION(3)                            :: direction = 0.0_dp, ref_point = 0.0_dp
+      REAL(KIND=dp)                                          :: eps_degeneracy = 0.0_dp
       TYPE(cell_type), POINTER                                :: cell => NULL()
       TYPE(dbcsr_p_type), DIMENSION(:), POINTER               :: matrix_h => NULL(), matrix_ks => NULL(), &
                                                                   matrix_s => NULL()
@@ -166,6 +167,7 @@ CONTAINS
       END IF
       context%direction = direction
       context%ref_point = ref_point
+      context%eps_degeneracy = eps_degeneracy
       context%spatial_order = spatial_order
       IF (spatial_order >= 1) THEN
          IF (.NOT. ASSOCIATED(blacs_env) .OR. .NOT. ASSOCIATED(para_env)) THEN
@@ -471,6 +473,7 @@ CONTAINS
                context%sab_all, context%sap_ppnl, context%particle_set, context%qs_kind_set)
       context%nspin = 0
       context%spatial_order = 0
+      context%eps_degeneracy = 0.0_dp
       context%direction = 0.0_dp
       context%ref_point = 0.0_dp
 
