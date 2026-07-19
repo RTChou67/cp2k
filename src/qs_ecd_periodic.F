@@ -66,6 +66,7 @@ MODULE qs_ecd_periodic
    USE kpoint_methods,                  ONLY: rskp_directional_taylor_transform,&
                                               rskp_transform
    USE mathconstants,                   ONLY: twopi
+   USE mathlib,                         ONLY: diag_complex
    USE orbital_pointers,                 ONLY: coset, ncoset
    USE qs_commutators,                  ONLY: build_com_hr_matrix
    USE qs_ecd_subspace,                 ONLY: ecd_band_manifold_type,&
@@ -214,6 +215,7 @@ MODULE qs_ecd_periodic
    TYPE, PRIVATE :: ecd_periodic_tddfpt_tangent_type
       INTEGER                                                  :: nspin = 0, nstates = 0
       COMPLEX(KIND=dp), ALLOCATABLE, DIMENSION(:)             :: energy_first
+      COMPLEX(KIND=dp), ALLOCATABLE, DIMENSION(:, :)          :: rotation
       TYPE(ecd_periodic_tddfpt_tangent_spin_type), ALLOCATABLE, &
          DIMENSION(:)                                         :: spin
    END TYPE ecd_periodic_tddfpt_tangent_type
@@ -940,7 +942,7 @@ CONTAINS
    END SUBROUTINE ecd_periodic_tddfpt_energy_action_release
 
 ! **************************************************************************************************
-!> \brief Solve isolated KERNEL NONE TDA tangents in the full TDDFPT pair space.
+!> \brief Solve KERNEL NONE TDA tangents in the complete TDDFPT pair space.
 !> \param context Implicit-Gamma ECD data context
 !> \param orbitals Target TDDFPT occupied, virtual, and active orbital frame
 !> \param evals Zero-order TDDFPT/TDA excitation energies
@@ -954,9 +956,15 @@ CONTAINS
       TYPE(ecd_periodic_tddfpt_energy_action_type), INTENT(IN) :: action
       TYPE(ecd_periodic_tddfpt_tangent_type), INTENT(OUT) :: tangent
 
-      COMPLEX(KIND=dp)                                    :: energy_first
-      INTEGER                                             :: iactive, ispin, istate, ivirt, nactive, nocc, nstates, nvirt
-      REAL(KIND=dp)                                       :: denominator, gap, norm, residual_norm, scale, tolerance
+      COMPLEX(KIND=dp)                                    :: action_rotated, energy_first, state_rotated
+      COMPLEX(KIND=dp), ALLOCATABLE, DIMENSION(:, :)      :: manifold_action, manifold_overlap, rotation_block
+      INTEGER                                             :: iactive, imember, ispin, istate, ivirt, jmember, member, &
+                                                             nactive, nmanifold, nocc, npairs, nstates, nvirt
+      INTEGER, ALLOCATABLE, DIMENSION(:)                  :: manifold_states
+      LOGICAL, ALLOCATABLE, DIMENSION(:)                  :: assigned
+      REAL(KIND=dp)                                       :: denominator, energy_scale, gap, hermitian_residual, &
+                                                             normalization_residual, residual_norm, tolerance
+      REAL(KIND=dp), ALLOCATABLE, DIMENSION(:)            :: manifold_energy_first
 
       nstates = SIZE(evals)
       IF (nstates < 1 .OR. context%nspin < 1 .OR. context%nspin > 2 .OR. &
@@ -967,8 +975,12 @@ CONTAINS
 
       tangent%nspin = context%nspin
       tangent%nstates = nstates
-      ALLOCATE (tangent%energy_first(nstates), tangent%spin(tangent%nspin))
+      ALLOCATE (tangent%energy_first(nstates), tangent%rotation(nstates, nstates), tangent%spin(tangent%nspin))
       tangent%energy_first = CMPLX(0.0_dp, 0.0_dp, KIND=dp)
+      tangent%rotation = CMPLX(0.0_dp, 0.0_dp, KIND=dp)
+      DO istate = 1, nstates
+         tangent%rotation(istate, istate) = CMPLX(1.0_dp, 0.0_dp, KIND=dp)
+      END DO
       DO ispin = 1, tangent%nspin
          nocc = orbitals%spin(ispin)%nocc
          nvirt = orbitals%spin(ispin)%nvirt
@@ -994,65 +1006,158 @@ CONTAINS
          tangent%spin(ispin)%coefficient = CMPLX(0.0_dp, 0.0_dp, KIND=dp)
       END DO
 
-      DO istate = 1, nstates
-         norm = 0.0_dp
-         energy_first = CMPLX(0.0_dp, 0.0_dp, KIND=dp)
-         DO ispin = 1, tangent%nspin
-            norm = norm + SUM(ABS(action%spin(ispin)%state(:, :, istate))**2)
-            energy_first = energy_first + SUM(CONJG(action%spin(ispin)%state(:, :, istate))* &
-                                               action%spin(ispin)%value(:, :, istate))
-         END DO
-         IF (norm <= SQRT(TINY(1.0_dp))) THEN
-            CPABORT("ECD| Periodic LR_TDDFT KERNEL NONE tangent received a zero-norm TDA state")
-         END IF
-         energy_first = energy_first/norm
-         tangent%energy_first(istate) = energy_first
-
-         residual_norm = 0.0_dp
-         scale = MAX(1.0_dp, ABS(evals(istate)))
-         DO ispin = 1, tangent%nspin
-            nvirt = orbitals%spin(ispin)%nvirt
-            nactive = orbitals%spin(ispin)%nactive
-            DO iactive = 1, nactive
-               DO ivirt = 1, nvirt
-                  gap = orbitals%spin(ispin)%evals_virt(ivirt) - &
-                        orbitals%spin(ispin)%evals_occ(orbitals%spin(ispin)%active_index(iactive))
-                  scale = MAX(scale, ABS(gap))
-               END DO
+      energy_scale = MAX(1.0_dp, MAXVAL(ABS(evals)))
+      DO ispin = 1, tangent%nspin
+         nvirt = orbitals%spin(ispin)%nvirt
+         nactive = orbitals%spin(ispin)%nactive
+         DO iactive = 1, nactive
+            DO ivirt = 1, nvirt
+               gap = orbitals%spin(ispin)%evals_virt(ivirt) - &
+                     orbitals%spin(ispin)%evals_occ(orbitals%spin(ispin)%active_index(iactive))
+               energy_scale = MAX(energy_scale, ABS(gap))
             END DO
          END DO
-         tolerance = MAX(context%eps_degeneracy, 100.0_dp*SQRT(EPSILON(1.0_dp))*scale)
-         DO ispin = 1, tangent%nspin
-            nvirt = orbitals%spin(ispin)%nvirt
-            nactive = orbitals%spin(ispin)%nactive
-            DO iactive = 1, nactive
-               DO ivirt = 1, nvirt
-                  gap = orbitals%spin(ispin)%evals_virt(ivirt) - &
-                        orbitals%spin(ispin)%evals_occ(orbitals%spin(ispin)%active_index(iactive))
-                  denominator = gap - evals(istate)
-                  IF (ABS(denominator) <= tolerance) THEN
-                     IF (ABS(action%spin(ispin)%value(ivirt, iactive, istate) - &
-                             energy_first*action%spin(ispin)%state(ivirt, iactive, istate)) > tolerance) THEN
-                        CPABORT("ECD| Periodic LR_TDDFT KERNEL NONE tangent requires a complete excitation manifold")
-                     END IF
-                     CYCLE
-                  END IF
-                  tangent%spin(ispin)%coefficient(ivirt, iactive, istate) = - &
-                     (action%spin(ispin)%value(ivirt, iactive, istate) - &
-                      energy_first*action%spin(ispin)%state(ivirt, iactive, istate))/denominator
-                  residual_norm = residual_norm + ABS(denominator* &
-                     tangent%spin(ispin)%coefficient(ivirt, iactive, istate) + &
-                     action%spin(ispin)%value(ivirt, iactive, istate) - &
-                     energy_first*action%spin(ispin)%state(ivirt, iactive, istate))**2
-               END DO
-            END DO
-         END DO
-         IF (SQRT(residual_norm) > tolerance) THEN
-            CPABORT("ECD| Periodic LR_TDDFT KERNEL NONE tangent residual exceeds the pair-space tolerance")
-         END IF
       END DO
+      tolerance = MAX(context%eps_degeneracy, 100.0_dp*SQRT(EPSILON(1.0_dp))*energy_scale)
+      ALLOCATE (assigned(nstates), manifold_states(nstates))
+      assigned = .FALSE.
+
+      DO istate = 1, nstates
+         IF (assigned(istate)) CYCLE
+         nmanifold = 0
+         DO member = 1, nstates
+            IF (ABS(evals(member) - evals(istate)) <= tolerance) THEN
+               nmanifold = nmanifold + 1
+               manifold_states(nmanifold) = member
+               assigned(member) = .TRUE.
+            END IF
+         END DO
+
+         npairs = 0
+         DO ispin = 1, tangent%nspin
+            nvirt = orbitals%spin(ispin)%nvirt
+            nactive = orbitals%spin(ispin)%nactive
+            DO iactive = 1, nactive
+               DO ivirt = 1, nvirt
+                  gap = orbitals%spin(ispin)%evals_virt(ivirt) - &
+                        orbitals%spin(ispin)%evals_occ(orbitals%spin(ispin)%active_index(iactive))
+                  IF (ABS(gap - evals(istate)) <= tolerance) npairs = npairs + 1
+               END DO
+            END DO
+         END DO
+         IF (npairs /= nmanifold) THEN
+            CPABORT("ECD| Periodic LR_TDDFT KERNEL NONE tangent requires complete excitation manifolds")
+         END IF
+
+         ALLOCATE (manifold_action(nmanifold, nmanifold), manifold_overlap(nmanifold, nmanifold), &
+                   manifold_energy_first(nmanifold), rotation_block(nmanifold, nmanifold))
+         manifold_action = CMPLX(0.0_dp, 0.0_dp, KIND=dp)
+         manifold_overlap = CMPLX(0.0_dp, 0.0_dp, KIND=dp)
+         DO jmember = 1, nmanifold
+            DO imember = 1, nmanifold
+               DO ispin = 1, tangent%nspin
+                  manifold_action(imember, jmember) = manifold_action(imember, jmember) + &
+                     SUM(CONJG(action%spin(ispin)%state(:, :, manifold_states(imember)))* &
+                         action%spin(ispin)%value(:, :, manifold_states(jmember)))
+                  manifold_overlap(imember, jmember) = manifold_overlap(imember, jmember) + &
+                     SUM(CONJG(action%spin(ispin)%state(:, :, manifold_states(imember)))* &
+                         action%spin(ispin)%state(:, :, manifold_states(jmember)))
+               END DO
+            END DO
+         END DO
+
+         DO imember = 1, nmanifold
+            manifold_overlap(imember, imember) = manifold_overlap(imember, imember) - &
+                                                   CMPLX(1.0_dp, 0.0_dp, KIND=dp)
+         END DO
+         normalization_residual = MAXVAL(ABS(manifold_overlap))
+         IF (normalization_residual > tolerance) THEN
+            CPABORT("ECD| Periodic LR_TDDFT KERNEL NONE states are not orthonormal")
+         END IF
+
+         hermitian_residual = MAXVAL(ABS(manifold_action - CONJG(TRANSPOSE(manifold_action))))
+         IF (hermitian_residual > tolerance) THEN
+            CPABORT("ECD| Periodic LR_TDDFT KERNEL NONE first action is not Hermitian")
+         END IF
+         manifold_action = 0.5_dp*(manifold_action + CONJG(TRANSPOSE(manifold_action)))
+         rotation_block = CMPLX(0.0_dp, 0.0_dp, KIND=dp)
+         IF (nmanifold == 1) THEN
+            manifold_energy_first(1) = REAL(manifold_action(1, 1), KIND=dp)
+            rotation_block(1, 1) = CMPLX(1.0_dp, 0.0_dp, KIND=dp)
+         ELSE
+            CALL diag_complex(manifold_action, rotation_block, manifold_energy_first)
+         END IF
+         DO jmember = 1, nmanifold
+            tangent%energy_first(manifold_states(jmember)) = &
+               CMPLX(manifold_energy_first(jmember), 0.0_dp, KIND=dp)
+            DO imember = 1, nmanifold
+               tangent%rotation(manifold_states(imember), manifold_states(jmember)) = rotation_block(imember, jmember)
+            END DO
+         END DO
+
+         DO jmember = 1, nmanifold
+            residual_norm = 0.0_dp
+            energy_first = CMPLX(manifold_energy_first(jmember), 0.0_dp, KIND=dp)
+            DO ispin = 1, tangent%nspin
+               nvirt = orbitals%spin(ispin)%nvirt
+               nactive = orbitals%spin(ispin)%nactive
+               DO iactive = 1, nactive
+                  DO ivirt = 1, nvirt
+                     state_rotated = CMPLX(0.0_dp, 0.0_dp, KIND=dp)
+                     action_rotated = CMPLX(0.0_dp, 0.0_dp, KIND=dp)
+                     DO imember = 1, nmanifold
+                        state_rotated = state_rotated + action%spin(ispin)%state(ivirt, iactive, &
+                           manifold_states(imember))*rotation_block(imember, jmember)
+                        action_rotated = action_rotated + action%spin(ispin)%value(ivirt, iactive, &
+                           manifold_states(imember))*rotation_block(imember, jmember)
+                     END DO
+                     gap = orbitals%spin(ispin)%evals_virt(ivirt) - &
+                           orbitals%spin(ispin)%evals_occ(orbitals%spin(ispin)%active_index(iactive))
+                     denominator = gap - evals(manifold_states(jmember))
+                     IF (ABS(denominator) <= tolerance) THEN
+                        residual_norm = residual_norm + ABS(action_rotated - energy_first*state_rotated)**2
+                        CYCLE
+                     END IF
+                     tangent%spin(ispin)%coefficient(ivirt, iactive, manifold_states(jmember)) = - &
+                        (action_rotated - energy_first*state_rotated)/denominator
+                     residual_norm = residual_norm + ABS(denominator* &
+                        tangent%spin(ispin)%coefficient(ivirt, iactive, manifold_states(jmember)) + &
+                        action_rotated - energy_first*state_rotated)**2
+                  END DO
+               END DO
+            END DO
+            IF (SQRT(residual_norm) > tolerance) THEN
+               CPABORT("ECD| Periodic LR_TDDFT KERNEL NONE tangent residual exceeds the pair-space tolerance")
+            END IF
+         END DO
+         DEALLOCATE (manifold_action, manifold_energy_first, manifold_overlap, rotation_block)
+      END DO
+      DEALLOCATE (assigned, manifold_states)
 
    END SUBROUTINE ecd_periodic_tddfpt_kernel_none_tangent
+
+! **************************************************************************************************
+!> \brief Rotate state-labelled ECD vertices into the first-order TDA manifold frame.
+!> \param rotation State rotation with columns in the output-state order
+!> \param state_actions State-labelled Cartesian ECD vertices
+! **************************************************************************************************
+   SUBROUTINE ecd_periodic_tddfpt_rotate_state_actions(rotation, state_actions)
+      COMPLEX(KIND=dp), DIMENSION(:, :), INTENT(IN)      :: rotation
+      COMPLEX(KIND=dp), DIMENSION(:, :), INTENT(INOUT)   :: state_actions
+
+      COMPLEX(KIND=dp), ALLOCATABLE, DIMENSION(:, :)     :: rotated_actions
+      INTEGER                                            :: nstates
+
+      nstates = SIZE(rotation, 1)
+      IF (nstates < 1 .OR. SIZE(rotation, 2) /= nstates .OR. SIZE(state_actions, 1) /= nstates) THEN
+         CPABORT("ECD| Periodic LR_TDDFT state-rotation dimensions are inconsistent")
+      END IF
+      ALLOCATE (rotated_actions(nstates, SIZE(state_actions, 2)))
+      rotated_actions = MATMUL(TRANSPOSE(rotation), state_actions)
+      state_actions = rotated_actions
+      DEALLOCATE (rotated_actions)
+
+   END SUBROUTINE ecd_periodic_tddfpt_rotate_state_actions
 
 ! **************************************************************************************************
 !> \brief Release KERNEL NONE first-order TDA tangent data.
@@ -1063,6 +1168,7 @@ CONTAINS
 
       IF (ALLOCATED(tangent%spin)) DEALLOCATE (tangent%spin)
       IF (ALLOCATED(tangent%energy_first)) DEALLOCATE (tangent%energy_first)
+      IF (ALLOCATED(tangent%rotation)) DEALLOCATE (tangent%rotation)
       tangent%nspin = 0
       tangent%nstates = 0
 
@@ -1291,8 +1397,14 @@ CONTAINS
                                                       length_orbital, current_orbital)
       CALL ecd_periodic_tddfpt_energy_difference_first_action(context, orbitals, response, evects, energy_action)
       CALL ecd_periodic_tddfpt_kernel_none_tangent(context, orbitals, evals, energy_action, tangent)
+      CALL ecd_periodic_tddfpt_rotate_state_actions(tangent%rotation, position_state)
+      CALL ecd_periodic_tddfpt_rotate_state_actions(tangent%rotation, current_state)
+      CALL ecd_periodic_tddfpt_rotate_state_actions(tangent%rotation, length_explicit)
+      CALL ecd_periodic_tddfpt_rotate_state_actions(tangent%rotation, current_explicit)
+      CALL ecd_periodic_tddfpt_rotate_state_actions(tangent%rotation, length_orbital)
+      CALL ecd_periodic_tddfpt_rotate_state_actions(tangent%rotation, current_orbital)
       CALL ecd_periodic_tddfpt_tangent_state_actions(context, operators, orbitals, tangent, position_tangent, current_tangent)
-      CALL ecd_periodic_tddfpt_select_states(lr_tddfpt_section, SIZE(evals), selected)
+      CALL ecd_periodic_tddfpt_select_states(lr_tddfpt_section, context, evals, selected)
       CALL ecd_periodic_tddfpt_kernel_none_response(qs_env, ecd_section, context, operators, electric_gauge, &
                                                      energy_range, npoints, fwhm, selected, evals, tangent%energy_first, &
                                                      position_state, current_state, length_explicit + length_orbital + &
@@ -1624,18 +1736,22 @@ CONTAINS
 ! **************************************************************************************************
 !> \brief Decode the periodic TDDFPT/TDA state selection.
 !> \param lr_tddfpt_section ECD/LR_TDDFT input section
-!> \param nstates Number of converged TDDFPT states
+!> \param context Implicit-Gamma ECD data context
+!> \param evals Converged TDDFPT excitation energies
 !> \param selected Selected-state mask [state]
 ! **************************************************************************************************
-   SUBROUTINE ecd_periodic_tddfpt_select_states(lr_tddfpt_section, nstates, selected)
+   SUBROUTINE ecd_periodic_tddfpt_select_states(lr_tddfpt_section, context, evals, selected)
       TYPE(section_vals_type), POINTER                   :: lr_tddfpt_section
-      INTEGER, INTENT(IN)                                :: nstates
+      TYPE(ecd_gamma_context_type), INTENT(IN)           :: context
+      REAL(KIND=dp), DIMENSION(:), INTENT(IN)             :: evals
       LOGICAL, ALLOCATABLE, DIMENSION(:), INTENT(OUT)    :: selected
 
-      INTEGER                                            :: iout, state
+      INTEGER                                            :: iout, jstate, nstates, state
       INTEGER, DIMENSION(:), POINTER                     :: state_list
+      REAL(KIND=dp)                                      :: energy_scale, tolerance
 
       NULLIFY (state_list)
+      nstates = SIZE(evals)
       IF (nstates < 1) THEN
          CPABORT("ECD| Periodic LR_TDDFT requires at least one converged TDDFPT state")
       END IF
@@ -1662,6 +1778,16 @@ CONTAINS
       IF (COUNT(selected) < 1) THEN
          CPABORT("ECD| Periodic LR_TDDFT STATE_LIST selected no TDDFPT states")
       END IF
+      energy_scale = MAX(1.0_dp, MAXVAL(ABS(evals)))
+      tolerance = MAX(context%eps_degeneracy, 100.0_dp*SQRT(EPSILON(1.0_dp))*energy_scale)
+      DO state = 1, nstates
+         DO jstate = state + 1, nstates
+            IF (ABS(evals(jstate) - evals(state)) <= tolerance .AND. &
+                (selected(jstate) .NEQV. selected(state))) THEN
+               CPABORT("ECD| Periodic LR_TDDFT STATE_LIST must include complete excitation manifolds")
+            END IF
+         END DO
+      END DO
 
    END SUBROUTINE ecd_periodic_tddfpt_select_states
 
