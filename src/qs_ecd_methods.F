@@ -57,9 +57,7 @@ MODULE qs_ecd_methods
    USE particle_types,                  ONLY: particle_type
    USE physcon,                         ONLY: evolt
    USE qs_ecd_operators,                ONLY: ecd_project_real_operator_to_mo
-   USE qs_ecd_periodic,                 ONLY: ecd_periodic_ipa_response,&
-                                              ecd_periodic_lr_tddfpt_kernel_none_spectra,&
-                                              ecd_periodic_lr_tddfpt_validate
+   USE qs_ecd_periodic,                 ONLY: ecd_periodic_ipa_response
    USE qs_environment_types,            ONLY: get_qs_env,&
                                               qs_environment_type
    USE qs_kind_types,                   ONLY: qs_kind_type
@@ -108,8 +106,7 @@ CONTAINS
 
       CHARACTER(LEN=default_string_length)               :: broadening_label
       INTEGER                                            :: broadening, handle, iounit, &
-                                                            ntransitions, reference, tddfpt_kernel, &
-                                                            tddfpt_nstates
+                                                            ntransitions, reference, tddfpt_kernel
       INTEGER, DIMENSION(2)                              :: transition_band_range
       INTEGER, DIMENSION(:), POINTER                     :: transition_band_range_ptr
       LOGICAL                                            :: do_ecd, do_hfx, do_ipa, do_lr_tddft, &
@@ -228,9 +225,14 @@ CONTAINS
          END IF
          IF (is_periodic) THEN
             CALL section_vals_val_get(tddfpt_section, "KERNEL", i_val=tddfpt_kernel)
-            CALL section_vals_val_get(tddfpt_section, "NSTATES", i_val=tddfpt_nstates)
-            CALL ecd_periodic_lr_tddfpt_validate(qs_env, ecd_section, lr_tddft_section, &
-                                                 tddfpt_kernel, tddfpt_nstates, broadening, fwhm)
+            SELECT CASE (tddfpt_kernel)
+            CASE (tddfpt_kernel_none)
+               CPABORT("ECD| Periodic LR_TDDFT KERNEL NONE duplicates IPA; use ECD%IPA")
+            CASE (tddfpt_kernel_full)
+               CPABORT("ECD| Periodic LR_TDDFT KERNEL FULL requires the directional TDA action")
+            CASE DEFAULT
+               CPABORT("ECD| Periodic LR_TDDFT reserves ECD for KERNEL FULL")
+            END SELECT
          ELSE
             CALL ecd_require_molecular_boundary(qs_env)
          END IF
@@ -598,10 +600,7 @@ CONTAINS
          CPABORT("ECD| LR_TDDFT ECD cannot obtain the simulation cell")
       END IF
       IF (ANY(cell%perd /= 0)) THEN
-         CALL ecd_periodic_lr_tddfpt_kernel_none_spectra(qs_env, ecd_section, lr_tddfpt_section, evects, evals, &
-                                                          gs_mos, pseudopotential_commutator, rcc, fwhm)
-         CALL timestop(handle)
-         RETURN
+         CPABORT("ECD| Periodic LR_TDDFT ECD has no post-TDDFPT path; use IPA for KERNEL NONE")
       END IF
       CALL ecd_require_molecular_boundary(qs_env)
 
