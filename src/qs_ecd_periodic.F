@@ -147,6 +147,14 @@ MODULE qs_ecd_periodic
          DIMENSION(:)                                         :: spin
    END TYPE ecd_periodic_gamma_data_type
 
+   TYPE, PRIVATE :: ecd_periodic_transition_selection_type
+      INTEGER                                      :: candidate_count = 0, requested_count = 0, selected_count = 0
+      INTEGER, DIMENSION(2)                         :: band_range = (/ -1, -1 /)
+      REAL(KIND=dp)                                :: cutoff_gap = 0.0_dp
+      INTEGER, ALLOCATABLE, DIMENSION(:)           :: iocc, ispin, ivirt
+      REAL(KIND=dp), ALLOCATABLE, DIMENSION(:)     :: gap, occupation_difference
+   END TYPE ecd_periodic_transition_selection_type
+
    PUBLIC :: ecd_periodic_ipa_response
 
 CONTAINS
@@ -187,6 +195,7 @@ CONTAINS
       TYPE(cell_type), POINTER                           :: cell
       TYPE(ecd_gamma_context_type)                       :: gamma_context
       TYPE(ecd_gamma_zero_order_operators_type)          :: gamma_operators
+      TYPE(ecd_periodic_transition_selection_type)       :: transition_selection
       TYPE(section_vals_type), POINTER                   :: print_section, spectrum_section
 
       NULLIFY (cell, direction_ptr, energy_range, print_section, spectrum_section)
@@ -297,20 +306,222 @@ CONTAINS
          CALL ecd_periodic_implicit_gamma_ks_phase_g7(gamma_context)
          CALL ecd_periodic_implicit_gamma_state_g8(gamma_context)
       END IF
+      CALL ecd_periodic_transition_selection_build(transition_selection, gamma_context, ntransitions, &
+                                                   transition_band_range, eps_degeneracy)
       CALL ecd_periodic_implicit_gamma_velocity_response_g10(qs_env, ecd_section, gamma_context, gamma_operators, &
-                                                              transition_band_range, energy_range, npoints, fwhm, &
+                                                              transition_selection, energy_range, npoints, fwhm, &
                                                               electric_gauge == ecd_gauge_velocity, velocity_response_zero, &
                                                               velocity_response_first, diamagnetic_kernel)
       CALL ecd_periodic_implicit_gamma_length_response_g13(ecd_section, gamma_context, gamma_operators, &
-                                                            transition_band_range, energy_range, npoints, fwhm, &
+                                                            transition_selection, energy_range, npoints, fwhm, &
                                                             gauge_label, electric_gauge == ecd_gauge_length, &
                                                             velocity_response_zero, velocity_response_first, &
                                                             diamagnetic_kernel)
       DEALLOCATE (velocity_response_first, velocity_response_zero)
+      CALL ecd_periodic_transition_selection_release(transition_selection)
       CALL ecd_gamma_zero_order_operators_release(gamma_operators)
       CALL ecd_gamma_context_release(gamma_context)
 
    END SUBROUTINE ecd_periodic_ipa_response
+
+! **************************************************************************************************
+!> \brief Build the immutable energy-ordered periodic IPA transition selection.
+! **************************************************************************************************
+   SUBROUTINE ecd_periodic_transition_selection_build(selection, context, nrequested, transition_band_range, &
+                                                       eps_degeneracy)
+      TYPE(ecd_periodic_transition_selection_type), INTENT(INOUT) :: selection
+      TYPE(ecd_gamma_context_type), INTENT(IN)           :: context
+      INTEGER, INTENT(IN)                                :: nrequested
+      INTEGER, DIMENSION(2), INTENT(IN)                  :: transition_band_range
+      REAL(KIND=dp), INTENT(IN)                          :: eps_degeneracy
+
+      INTEGER                                            :: first_band, icandidate, ispin, ivirt, iocc, last_band, &
+                                                            nbase, ncandidates, nmo
+      REAL(KIND=dp), PARAMETER                           :: occupation_threshold = 1.0E-8_dp
+      INTEGER, ALLOCATABLE, DIMENSION(:)                 :: candidate_iocc, candidate_ispin, candidate_ivirt, order
+      REAL(KIND=dp), ALLOCATABLE, DIMENSION(:)           :: candidate_gap, candidate_occupation_difference
+
+      CALL ecd_periodic_transition_selection_release(selection)
+      IF (nrequested < 1 .OR. eps_degeneracy <= 0.0_dp) THEN
+         CPABORT('ECD| Periodic IPA transition selection received invalid controls')
+      END IF
+
+      ncandidates = 0
+      DO ispin = 1, context%nspin
+         nmo = context%spin(ispin)%nmo
+         IF (.NOT. ASSOCIATED(context%spin(ispin)%eigenvalue_reference) .OR. &
+             .NOT. ASSOCIATED(context%spin(ispin)%occupations) .OR. &
+             .NOT. ASSOCIATED(context%spin(ispin)%manifolds)) THEN
+            CPABORT('ECD| Periodic IPA transition selection requires retained Gamma state data')
+         END IF
+         CALL ecd_periodic_transition_window(context%spin(ispin), transition_band_range, first_band, last_band)
+         DO iocc = first_band, last_band
+            IF (context%spin(ispin)%occupations(iocc) <= occupation_threshold) CYCLE
+            DO ivirt = first_band, last_band
+               IF (context%spin(ispin)%occupations(ivirt) > occupation_threshold) CYCLE
+               IF (context%spin(ispin)%eigenvalue_reference(ivirt) - &
+                   context%spin(ispin)%eigenvalue_reference(iocc) <= SQRT(TINY(1.0_dp))) CYCLE
+               IF (context%spin(ispin)%occupations(iocc) - &
+                   context%spin(ispin)%occupations(ivirt) <= occupation_threshold) CYCLE
+               ncandidates = ncandidates + 1
+            END DO
+         END DO
+      END DO
+      IF (ncandidates < 1) THEN
+         CPABORT('ECD| Periodic IPA transition selection found no occupied-empty candidates')
+      END IF
+
+      ALLOCATE (candidate_gap(ncandidates), candidate_iocc(ncandidates), candidate_ispin(ncandidates), &
+                candidate_ivirt(ncandidates), candidate_occupation_difference(ncandidates), order(ncandidates))
+      icandidate = 0
+      DO ispin = 1, context%nspin
+         CALL ecd_periodic_transition_window(context%spin(ispin), transition_band_range, first_band, last_band)
+         DO iocc = first_band, last_band
+            IF (context%spin(ispin)%occupations(iocc) <= occupation_threshold) CYCLE
+            DO ivirt = first_band, last_band
+               IF (context%spin(ispin)%occupations(ivirt) > occupation_threshold) CYCLE
+               IF (context%spin(ispin)%eigenvalue_reference(ivirt) - &
+                   context%spin(ispin)%eigenvalue_reference(iocc) <= SQRT(TINY(1.0_dp))) CYCLE
+               IF (context%spin(ispin)%occupations(iocc) - &
+                   context%spin(ispin)%occupations(ivirt) <= occupation_threshold) CYCLE
+               icandidate = icandidate + 1
+               candidate_gap(icandidate) = context%spin(ispin)%eigenvalue_reference(ivirt) - &
+                                            context%spin(ispin)%eigenvalue_reference(iocc)
+               candidate_iocc(icandidate) = iocc
+               candidate_ispin(icandidate) = ispin
+               candidate_ivirt(icandidate) = ivirt
+               candidate_occupation_difference(icandidate) = context%spin(ispin)%occupations(iocc) - &
+                                                               context%spin(ispin)%occupations(ivirt)
+            END DO
+         END DO
+      END DO
+      CPASSERT(icandidate == ncandidates)
+
+      CALL ecd_periodic_transition_order_sort(candidate_gap, candidate_ispin, candidate_iocc, candidate_ivirt, order)
+      nbase = MIN(nrequested, ncandidates)
+      selection%cutoff_gap = candidate_gap(order(nbase))
+      selection%selected_count = nbase
+      DO WHILE (selection%selected_count < ncandidates)
+         icandidate = order(selection%selected_count + 1)
+         IF (ABS(candidate_gap(icandidate) - selection%cutoff_gap) > eps_degeneracy) EXIT
+         selection%selected_count = selection%selected_count + 1
+      END DO
+      IF (nrequested > ncandidates) THEN
+         CPWARN('ECD| Requested more periodic IPA transitions than available')
+      END IF
+      selection%candidate_count = ncandidates
+      selection%requested_count = nrequested
+      selection%band_range = transition_band_range
+      ALLOCATE (selection%gap(selection%selected_count), selection%iocc(selection%selected_count), &
+                selection%ispin(selection%selected_count), selection%ivirt(selection%selected_count), &
+                selection%occupation_difference(selection%selected_count))
+      DO icandidate = 1, selection%selected_count
+         nbase = order(icandidate)
+         selection%gap(icandidate) = candidate_gap(nbase)
+         selection%iocc(icandidate) = candidate_iocc(nbase)
+         selection%ispin(icandidate) = candidate_ispin(nbase)
+         selection%ivirt(icandidate) = candidate_ivirt(nbase)
+         selection%occupation_difference(icandidate) = candidate_occupation_difference(nbase)
+      END DO
+      DEALLOCATE (candidate_gap, candidate_iocc, candidate_ispin, candidate_ivirt, &
+                  candidate_occupation_difference, order)
+
+   END SUBROUTINE ecd_periodic_transition_selection_build
+
+! **************************************************************************************************
+!> \brief Resolve a complete-manifold periodic IPA transition window for one spin channel.
+! **************************************************************************************************
+   SUBROUTINE ecd_periodic_transition_window(spin, transition_band_range, first_band, last_band)
+      TYPE(ecd_gamma_spin_type), INTENT(IN)              :: spin
+      INTEGER, DIMENSION(2), INTENT(IN)                  :: transition_band_range
+      INTEGER, INTENT(OUT)                               :: first_band, last_band
+
+      IF (ALL(transition_band_range == -1)) THEN
+         first_band = 1
+         last_band = spin%nmo
+      ELSE
+         first_band = transition_band_range(1)
+         last_band = transition_band_range(2)
+         CALL ecd_band_manifolds_validate_window(spin%manifolds, transition_band_range)
+      END IF
+      IF (first_band < 1 .OR. last_band > spin%nmo .OR. first_band > last_band) THEN
+         CPABORT('ECD| Periodic IPA transition band range is inconsistent with the Gamma MO space')
+      END IF
+
+   END SUBROUTINE ecd_periodic_transition_window
+
+! **************************************************************************************************
+!> \brief Deterministically order periodic IPA candidates by gap, spin, occupied band, and virtual band.
+! **************************************************************************************************
+   SUBROUTINE ecd_periodic_transition_order_sort(gap, ispin, iocc, ivirt, order)
+      REAL(KIND=dp), DIMENSION(:), INTENT(IN)            :: gap
+      INTEGER, DIMENSION(:), INTENT(IN)                  :: iocc, ispin, ivirt
+      INTEGER, DIMENSION(:), INTENT(OUT)                 :: order
+
+      INTEGER                                            :: icandidate, insert_at, key
+
+      IF (SIZE(gap) /= SIZE(ispin) .OR. SIZE(gap) /= SIZE(iocc) .OR. SIZE(gap) /= SIZE(ivirt) .OR. &
+          SIZE(gap) /= SIZE(order)) THEN
+         CPABORT('ECD| Periodic IPA transition-order arrays are inconsistent')
+      END IF
+      DO icandidate = 1, SIZE(order)
+         order(icandidate) = icandidate
+      END DO
+      DO icandidate = 2, SIZE(order)
+         key = order(icandidate)
+         insert_at = icandidate - 1
+         DO WHILE (insert_at >= 1)
+            IF (.NOT. ecd_periodic_transition_precedes(key, order(insert_at), gap, ispin, iocc, ivirt)) EXIT
+            order(insert_at + 1) = order(insert_at)
+            insert_at = insert_at - 1
+         END DO
+         order(insert_at + 1) = key
+      END DO
+
+   END SUBROUTINE ecd_periodic_transition_order_sort
+
+! **************************************************************************************************
+!> \brief Compare two periodic IPA candidate indices using deterministic lexical keys.
+! **************************************************************************************************
+   LOGICAL FUNCTION ecd_periodic_transition_precedes(left, right, gap, ispin, iocc, ivirt)
+      INTEGER, INTENT(IN)                                :: left, right
+      REAL(KIND=dp), DIMENSION(:), INTENT(IN)            :: gap
+      INTEGER, DIMENSION(:), INTENT(IN)                  :: iocc, ispin, ivirt
+
+      ecd_periodic_transition_precedes = .FALSE.
+      IF (gap(left) < gap(right)) THEN
+         ecd_periodic_transition_precedes = .TRUE.
+      ELSE IF (gap(left) == gap(right)) THEN
+         IF (ispin(left) < ispin(right)) THEN
+            ecd_periodic_transition_precedes = .TRUE.
+         ELSE IF (ispin(left) == ispin(right) .AND. iocc(left) < iocc(right)) THEN
+            ecd_periodic_transition_precedes = .TRUE.
+         ELSE IF (ispin(left) == ispin(right) .AND. iocc(left) == iocc(right) .AND. &
+                  ivirt(left) < ivirt(right)) THEN
+            ecd_periodic_transition_precedes = .TRUE.
+         END IF
+      END IF
+
+   END FUNCTION ecd_periodic_transition_precedes
+
+! **************************************************************************************************
+!> \brief Release periodic IPA transition-selection storage.
+! **************************************************************************************************
+   SUBROUTINE ecd_periodic_transition_selection_release(selection)
+      TYPE(ecd_periodic_transition_selection_type), INTENT(INOUT) :: selection
+
+      IF (ALLOCATED(selection%gap)) DEALLOCATE (selection%gap)
+      IF (ALLOCATED(selection%iocc)) DEALLOCATE (selection%iocc)
+      IF (ALLOCATED(selection%ispin)) DEALLOCATE (selection%ispin)
+      IF (ALLOCATED(selection%ivirt)) DEALLOCATE (selection%ivirt)
+      IF (ALLOCATED(selection%occupation_difference)) DEALLOCATE (selection%occupation_difference)
+      selection%candidate_count = 0
+      selection%requested_count = 0
+      selection%selected_count = 0
+      selection%band_range = (/ -1, -1 /)
+      selection%cutoff_gap = 0.0_dp
+
+   END SUBROUTINE ecd_periodic_transition_selection_release
 
 ! **************************************************************************************************
 !> \brief Validate the ECD-owned implicit-Gamma overlap image snapshot through first order.
@@ -1148,22 +1359,20 @@ CONTAINS
 !> \brief Assemble the first-order velocity-gauge causal response from retained Gamma providers.
 ! **************************************************************************************************
    SUBROUTINE ecd_periodic_implicit_gamma_velocity_response_g10(qs_env, ecd_section, context, operators, &
-                                                                 transition_band_range, energy_range, npoints, fwhm, &
+                                                                 transition_selection, energy_range, npoints, fwhm, &
                                                                  write_response, response_zero_output, response_first_output, &
                                                                  diamagnetic_kernel_output)
       TYPE(qs_environment_type), POINTER                 :: qs_env
       TYPE(section_vals_type), POINTER                   :: ecd_section
       TYPE(ecd_gamma_context_type), INTENT(IN), TARGET   :: context
       TYPE(ecd_gamma_zero_order_operators_type), INTENT(IN), TARGET :: operators
-      INTEGER, DIMENSION(2), INTENT(IN)                  :: transition_band_range
+      TYPE(ecd_periodic_transition_selection_type), INTENT(IN) :: transition_selection
       LOGICAL, INTENT(IN)                                :: write_response
       REAL(KIND=dp), DIMENSION(2), INTENT(IN)            :: energy_range
       INTEGER, INTENT(IN)                                :: npoints
       REAL(KIND=dp), INTENT(IN)                          :: fwhm
       COMPLEX(KIND=dp), ALLOCATABLE, DIMENSION(:, :, :), INTENT(OUT) :: response_first_output, response_zero_output
       REAL(KIND=dp), DIMENSION(ncart, ncart), INTENT(OUT) :: diamagnetic_kernel_output
-
-      REAL(KIND=dp), PARAMETER                           :: occupation_threshold = 1.0E-8_dp
 
       COMPLEX(KIND=dp), ALLOCATABLE, DIMENSION(:, :)     :: current_first_mo, current_first_rotated, &
                                                             current_zero_mo, current_zero_rotated, &
@@ -1174,8 +1383,8 @@ CONTAINS
                                                             response_zero
       COMPLEX(KIND=dp), ALLOCATABLE, DIMENSION(:, :)     :: transition_taylor
       COMPLEX(KIND=dp), DIMENSION(ncart, ncart, 0:1)     :: counter_taylor, resonant_taylor
-      INTEGER                                            :: first_band, iband, idir, ipoint, ispin, ivirt, last_band, &
-                                                            nmo, ntransitions, ntransitions_total
+      INTEGER                                            :: iband, idir, ipoint, ispin, itransition, ivirt, nmo, &
+                                                            ntransitions, ntransitions_total
       LOGICAL                                            :: gth_available
       REAL(KIND=dp)                                      :: antisymmetric_first_norm, cell_volume, gap, gap_derivative, &
                                                             occupation_difference, photon_energy, prefactor, response_counter_norm, &
@@ -1232,18 +1441,6 @@ CONTAINS
              SIZE(context%spin(ispin)%coefficient_first, 2) /= nmo) THEN
             CPABORT("ECD| Stage G10 retained state-response dimensions are inconsistent")
          END IF
-         IF (ALL(transition_band_range == -1)) THEN
-            first_band = 1
-            last_band = nmo
-         ELSE
-            first_band = transition_band_range(1)
-            last_band = transition_band_range(2)
-            CALL ecd_band_manifolds_validate_window(context%spin(ispin)%manifolds, transition_band_range)
-         END IF
-         IF (first_band < 1 .OR. last_band > nmo .OR. first_band > last_band) THEN
-            CPABORT("ECD| Stage G10 transition band range is inconsistent with the Gamma MO space")
-         END IF
-
          ALLOCATE (current_first_components(nmo, nmo, ncart), current_zero_components(nmo, nmo, ncart))
          DO idir = 1, ncart
             CALL ecd_project_complex_operator_to_mo(context%current_taylor_real(idir, 1), &
@@ -1272,39 +1469,32 @@ CONTAINS
 
          ALLOCATE (gap_taylor(0:1), transition_taylor(ncart, 0:1))
          ntransitions = 0
-         DO iband = first_band, last_band
-            IF (context%spin(ispin)%occupations(iband) <= occupation_threshold) CYCLE
-            DO ivirt = first_band, last_band
-               IF (context%spin(ispin)%occupations(ivirt) > occupation_threshold) CYCLE
-               gap = context%spin(ispin)%eigenvalue_reference(ivirt) - &
-                     context%spin(ispin)%eigenvalue_reference(iband)
-               IF (gap <= SQRT(TINY(1.0_dp))) THEN
-                  CPABORT("ECD| Stage G10 requires positive occupied-to-empty transition gaps")
-               END IF
-               occupation_difference = context%spin(ispin)%occupations(iband) - &
-                                       context%spin(ispin)%occupations(ivirt)
-               IF (occupation_difference <= occupation_threshold) CYCLE
-               gap_derivative = 0.5_dp*(context%spin(ispin)%eigenvalue_first(ivirt) + &
-                                        context%spin(ispin)%eigenvalue_first(iband))
-               gap_taylor(0) = gap
-               gap_taylor(1) = gap_derivative
-               DO idir = 1, ncart
-                  transition_taylor(idir, 0) = current_zero_components(ivirt, iband, idir)
-                  transition_taylor(idir, 1) = current_first_components(ivirt, iband, idir)
-               END DO
-               ntransitions = ntransitions + 1
-               CALL ecd_periodic_response_add_transition(transition_taylor, gap_taylor, occupation_difference, &
-                                                         cell_volume, energy_range, fwhm, response_resonant, &
-                                                         response_counter, response_first, response_first_counter, &
-                                                         resonant_taylor, counter_taylor)
+         DO itransition = 1, transition_selection%selected_count
+            IF (transition_selection%ispin(itransition) /= ispin) CYCLE
+            iband = transition_selection%iocc(itransition)
+            ivirt = transition_selection%ivirt(itransition)
+            gap = transition_selection%gap(itransition)
+            occupation_difference = transition_selection%occupation_difference(itransition)
+            gap_derivative = 0.5_dp*(context%spin(ispin)%eigenvalue_first(ivirt) + &
+                                     context%spin(ispin)%eigenvalue_first(iband))
+            gap_taylor(0) = gap
+            gap_taylor(1) = gap_derivative
+            DO idir = 1, ncart
+               transition_taylor(idir, 0) = current_zero_components(ivirt, iband, idir)
+               transition_taylor(idir, 1) = current_first_components(ivirt, iband, idir)
             END DO
+            ntransitions = ntransitions + 1
+            CALL ecd_periodic_response_add_transition(transition_taylor, gap_taylor, occupation_difference, &
+                                                      cell_volume, energy_range, fwhm, response_resonant, &
+                                                      response_counter, response_first, response_first_counter, &
+                                                      resonant_taylor, counter_taylor)
          END DO
-         IF (ntransitions < 1) THEN
-            CPABORT("ECD| Stage G10 found no occupied-to-empty transitions")
-         END IF
          ntransitions_total = ntransitions_total + ntransitions
          DEALLOCATE (current_first_components, current_zero_components, gap_taylor, transition_taylor)
       END DO
+      IF (ntransitions_total /= transition_selection%selected_count) THEN
+         CPABORT('ECD| Stage G10 transition selection is inconsistent with the Gamma spin space')
+      END IF
 
       CALL ecd_periodic_implicit_gamma_diamagnetic_kernel(qs_env, context, gth_available, diamagnetic_kernel_output)
       response_zero = response_resonant + response_counter
@@ -1354,11 +1544,16 @@ CONTAINS
       response_first_output = response_first
       IF (write_response) THEN
          CALL ecd_periodic_print_response_tensor(ecd_section, energy_range, response_zero, response_first, &
-                                                  context, 'VELOCITY', gth_available, fwhm, transition_band_range, &
-                                                  ntransitions_total)
+                                                  context, 'VELOCITY', gth_available, fwhm, transition_selection%band_range, &
+                                                  ntransitions_total, candidate_count=transition_selection%candidate_count, &
+                                                  requested_count=transition_selection%requested_count, &
+                                                  cutoff_gap=transition_selection%cutoff_gap)
          CALL ecd_periodic_print_maxwell_spectrum(ecd_section, energy_range, context%direction, response_zero, &
                                                   response_first, context, 'VELOCITY', gth_available, fwhm, &
-                                                  transition_band_range, ntransitions_total)
+                                                  transition_selection%band_range, ntransitions_total, &
+                                                  candidate_count=transition_selection%candidate_count, &
+                                                  requested_count=transition_selection%requested_count, &
+                                                  cutoff_gap=transition_selection%cutoff_gap)
       END IF
 
       DEALLOCATE (response_counter, response_first, response_first_counter, response_resonant, response_zero)
@@ -1369,13 +1564,13 @@ CONTAINS
 !> \brief Assemble the first-order length-gauge causal response and compare it with the velocity tensor.
 ! **************************************************************************************************
    SUBROUTINE ecd_periodic_implicit_gamma_length_response_g13(ecd_section, context, operators, &
-                                                               transition_band_range, energy_range, npoints, fwhm, &
+                                                               transition_selection, energy_range, npoints, fwhm, &
                                                                gauge_label, write_response, velocity_response_zero, &
                                                                velocity_response_first, diamagnetic_kernel)
       TYPE(section_vals_type), POINTER                   :: ecd_section
       TYPE(ecd_gamma_context_type), INTENT(IN), TARGET   :: context
       TYPE(ecd_gamma_zero_order_operators_type), INTENT(IN), TARGET :: operators
-      INTEGER, DIMENSION(2), INTENT(IN)                  :: transition_band_range
+      TYPE(ecd_periodic_transition_selection_type), INTENT(IN) :: transition_selection
       CHARACTER(LEN=*), INTENT(IN)                       :: gauge_label
       LOGICAL, INTENT(IN)                                :: write_response
       REAL(KIND=dp), DIMENSION(2), INTENT(IN)            :: energy_range
@@ -1393,8 +1588,8 @@ CONTAINS
                                                             length_first_state_components, length_zero_components
       COMPLEX(KIND=dp), ALLOCATABLE, DIMENSION(:, :)     :: transition_taylor
       COMPLEX(KIND=dp), DIMENSION(ncart, ncart, 0:1)     :: counter_taylor, resonant_taylor
-      INTEGER                                            :: first_band, iband, idir, ipoint, ispin, ivirt, last_band, &
-                                                            nmo, ntransitions, ntransitions_total
+      INTEGER                                            :: iband, idir, ipoint, ispin, itransition, ivirt, nmo, &
+                                                            ntransitions, ntransitions_total
       LOGICAL                                            :: gth_available
       REAL(KIND=dp)                                      :: antisymmetric_first_norm, cell_volume, gap, gap_derivative, &
                                                             gauge_first_residual_max, gauge_first_residual_norm, &
@@ -1439,60 +1634,41 @@ CONTAINS
       ntransitions_total = 0
       DO ispin = 1, context%nspin
          nmo = context%spin(ispin)%nmo
-         IF (ALL(transition_band_range == -1)) THEN
-            first_band = 1
-            last_band = nmo
-         ELSE
-            first_band = transition_band_range(1)
-            last_band = transition_band_range(2)
-            CALL ecd_band_manifolds_validate_window(context%spin(ispin)%manifolds, transition_band_range)
-         END IF
-         IF (first_band < 1 .OR. last_band > nmo .OR. first_band > last_band) THEN
-            CPABORT("ECD| Stage G13 transition band range is inconsistent with the Gamma MO space")
-         END IF
-
          CALL ecd_periodic_gamma_length_components_build(context, ispin, length_zero_components, &
                                                          length_first_operator_components, &
                                                          length_first_state_components)
 
          ALLOCATE (transition_taylor(ncart, 0:1))
          ntransitions = 0
-         DO iband = first_band, last_band
-            IF (context%spin(ispin)%occupations(iband) <= occupation_threshold) CYCLE
-            DO ivirt = first_band, last_band
-               IF (context%spin(ispin)%occupations(ivirt) > occupation_threshold) CYCLE
-               gap = context%spin(ispin)%eigenvalue_reference(ivirt) - &
-                     context%spin(ispin)%eigenvalue_reference(iband)
-               IF (gap <= SQRT(TINY(1.0_dp))) THEN
-                  CPABORT("ECD| Stage G13 requires positive occupied-to-empty transition gaps")
-               END IF
-               occupation_difference = context%spin(ispin)%occupations(iband) - &
-                                       context%spin(ispin)%occupations(ivirt)
-               IF (occupation_difference <= occupation_threshold) CYCLE
-               gap_derivative = 0.5_dp*(context%spin(ispin)%eigenvalue_first(ivirt) + &
-                                        context%spin(ispin)%eigenvalue_first(iband))
-               gap_taylor(0) = gap
-               gap_taylor(1) = gap_derivative
-               DO idir = 1, ncart
-                  transition_taylor(idir, 0) = -gap*length_zero_components(ivirt, iband, idir)
-                  transition_taylor(idir, 1) = -gap_derivative*length_zero_components(ivirt, iband, idir) - &
-                                                gap*(length_first_operator_components(ivirt, iband, idir) + &
-                                                     length_first_state_components(ivirt, iband, idir))
-               END DO
-               ntransitions = ntransitions + 1
-               CALL ecd_periodic_response_add_transition(transition_taylor, gap_taylor, occupation_difference, &
-                                                         cell_volume, energy_range, fwhm, response_resonant, &
-                                                         response_counter, response_first_resonant, &
-                                                         response_first_counter, resonant_taylor, counter_taylor)
+         DO itransition = 1, transition_selection%selected_count
+            IF (transition_selection%ispin(itransition) /= ispin) CYCLE
+            iband = transition_selection%iocc(itransition)
+            ivirt = transition_selection%ivirt(itransition)
+            gap = transition_selection%gap(itransition)
+            occupation_difference = transition_selection%occupation_difference(itransition)
+            gap_derivative = 0.5_dp*(context%spin(ispin)%eigenvalue_first(ivirt) + &
+                                     context%spin(ispin)%eigenvalue_first(iband))
+            gap_taylor(0) = gap
+            gap_taylor(1) = gap_derivative
+            DO idir = 1, ncart
+               transition_taylor(idir, 0) = -gap*length_zero_components(ivirt, iband, idir)
+               transition_taylor(idir, 1) = -gap_derivative*length_zero_components(ivirt, iband, idir) - &
+                                             gap*(length_first_operator_components(ivirt, iband, idir) + &
+                                                  length_first_state_components(ivirt, iband, idir))
             END DO
+            ntransitions = ntransitions + 1
+            CALL ecd_periodic_response_add_transition(transition_taylor, gap_taylor, occupation_difference, &
+                                                      cell_volume, energy_range, fwhm, response_resonant, &
+                                                      response_counter, response_first_resonant, &
+                                                      response_first_counter, resonant_taylor, counter_taylor)
          END DO
-         IF (ntransitions < 1) THEN
-            CPABORT("ECD| Stage G13 found no occupied-to-empty transitions")
-         END IF
          ntransitions_total = ntransitions_total + ntransitions
          DEALLOCATE (length_first_operator_components, length_first_state_components, length_zero_components, &
                      transition_taylor)
       END DO
+      IF (ntransitions_total /= transition_selection%selected_count) THEN
+         CPABORT('ECD| Stage G13 transition selection is inconsistent with the Gamma spin space')
+      END IF
 
       response_zero = response_resonant + response_counter
       response_first = response_first_resonant + response_first_counter
@@ -1584,18 +1760,27 @@ CONTAINS
             'ECD| Stage G13 maximum first-order gauge relative residual', gauge_first_relative_max
       END IF
       CALL ecd_periodic_print_gauge_diagnostics(ecd_section, context, gauge_label, gth_available, fwhm, &
-                                                transition_band_range, ntransitions_total, energy_range, &
+                                                transition_selection%band_range, ntransitions_total, &
+                                                transition_selection%candidate_count, transition_selection%requested_count, &
+                                                transition_selection%cutoff_gap, energy_range, &
                                                 velocity_response_zero, velocity_response_first, response_zero, &
                                                 response_first)
       IF (write_response) THEN
          CALL ecd_periodic_print_response_tensor(ecd_section, energy_range, response_zero, response_first, &
-                                                  context, gauge_label, gth_available, fwhm, transition_band_range, &
-                                                  ntransitions_total)
+                                                  context, gauge_label, gth_available, fwhm, transition_selection%band_range, &
+                                                  ntransitions_total, candidate_count=transition_selection%candidate_count, &
+                                                  requested_count=transition_selection%requested_count, &
+                                                  cutoff_gap=transition_selection%cutoff_gap)
          CALL ecd_periodic_print_maxwell_spectrum(ecd_section, energy_range, context%direction, response_zero, &
                                                   response_first, context, gauge_label, gth_available, fwhm, &
-                                                  transition_band_range, ntransitions_total)
+                                                  transition_selection%band_range, ntransitions_total, &
+                                                  candidate_count=transition_selection%candidate_count, &
+                                                  requested_count=transition_selection%requested_count, &
+                                                  cutoff_gap=transition_selection%cutoff_gap)
       END IF
       CALL ecd_periodic_print_output_summary(context, gauge_label, gth_available, ntransitions_total, &
+                                             transition_selection%candidate_count, transition_selection%requested_count, &
+                                             transition_selection%cutoff_gap, &
                                              gauge_zero_relative_norm, gauge_first_relative_norm, &
                                              gauge_zero_relative_max, gauge_first_relative_max)
 
@@ -3197,15 +3382,16 @@ CONTAINS
 !> \brief Write common reproducibility metadata for implicit-Gamma periodic ECD files.
 ! **************************************************************************************************
    SUBROUTINE ecd_periodic_write_output_metadata(output_unit, context, gauge_label, gth_available, fwhm, &
-                                                 transition_band_range, ntransitions, energy_range, npoints, transition_source)
+                                                 transition_band_range, ntransitions, candidate_count, requested_count, &
+                                                 cutoff_gap, energy_range, npoints, transition_source)
       INTEGER, INTENT(IN)                                :: output_unit
       TYPE(ecd_gamma_context_type), INTENT(IN)           :: context
       CHARACTER(LEN=*), INTENT(IN)                       :: gauge_label
       LOGICAL, INTENT(IN)                                :: gth_available
       INTEGER, DIMENSION(2), INTENT(IN)                  :: transition_band_range
-      INTEGER, INTENT(IN)                                :: ntransitions
+      INTEGER, INTENT(IN)                                :: candidate_count, ntransitions, requested_count
       INTEGER, INTENT(IN)                                :: npoints
-      REAL(KIND=dp), INTENT(IN)                          :: fwhm
+      REAL(KIND=dp), INTENT(IN)                          :: cutoff_gap, fwhm
       REAL(KIND=dp), DIMENSION(2), INTENT(IN)            :: energy_range
       CHARACTER(LEN=*), INTENT(IN), OPTIONAL             :: transition_source
 
@@ -3230,7 +3416,10 @@ CONTAINS
       WRITE (output_unit, '(A,2(1X,I0))') '# Transition_band_range', transition_band_range
       SELECT CASE (TRIM(source_label))
       CASE ('IPA')
+         WRITE (output_unit, '(A,1X,I0)') '# Requested_occupied_empty_pairs', requested_count
+         WRITE (output_unit, '(A,1X,I0)') '# Candidate_occupied_empty_pairs', candidate_count
          WRITE (output_unit, '(A,1X,I0)') '# Selected_occupied_empty_pairs', ntransitions
+         WRITE (output_unit, '(A,1X,ES18.10E3)') '# Transition_cutoff_gap_hartree', cutoff_gap
       CASE ('TDDFPT_TDA')
          WRITE (output_unit, '(A,1X,I0)') '# Selected_TDA_states', ntransitions
       CASE DEFAULT
@@ -3245,15 +3434,16 @@ CONTAINS
 !> \brief Write energy-resolved finite-AO length--velocity residual diagnostics.
 ! **************************************************************************************************
    SUBROUTINE ecd_periodic_print_gauge_diagnostics(ecd_section, context, gauge_label, gth_available, fwhm, &
-                                                    transition_band_range, ntransitions, energy_range, &
+                                                    transition_band_range, ntransitions, candidate_count, requested_count, &
+                                                    cutoff_gap, energy_range, &
                                                     velocity_zero, velocity_first, length_zero, length_first)
       TYPE(section_vals_type), POINTER                   :: ecd_section
       TYPE(ecd_gamma_context_type), INTENT(IN)           :: context
       CHARACTER(LEN=*), INTENT(IN)                       :: gauge_label
       LOGICAL, INTENT(IN)                                :: gth_available
       INTEGER, DIMENSION(2), INTENT(IN)                  :: transition_band_range
-      INTEGER, INTENT(IN)                                :: ntransitions
-      REAL(KIND=dp), INTENT(IN)                          :: fwhm
+      INTEGER, INTENT(IN)                                :: candidate_count, ntransitions, requested_count
+      REAL(KIND=dp), INTENT(IN)                          :: cutoff_gap, fwhm
       REAL(KIND=dp), DIMENSION(2), INTENT(IN)            :: energy_range
       COMPLEX(KIND=dp), DIMENSION(:, :, :), INTENT(IN)   :: length_first, length_zero, velocity_first, velocity_zero
 
@@ -3289,9 +3479,10 @@ CONTAINS
          WRITE (iounit, '(T2,A,1X,A)') 'ECD| Periodic gauge diagnostics file', TRIM(diagnostics_filename)
       END IF
       WRITE (diagnostics_unit, '(A)') '# CP2K periodic ECD gauge diagnostics'
-      WRITE (diagnostics_unit, '(A)') '# Format_version 1'
+      WRITE (diagnostics_unit, '(A)') '# Format_version 2'
       CALL ecd_periodic_write_output_metadata(diagnostics_unit, context, gauge_label, gth_available, fwhm, &
-                                              transition_band_range, ntransitions, energy_range, SIZE(velocity_zero, 3))
+                                              transition_band_range, ntransitions, candidate_count, requested_count, &
+                                              cutoff_gap, energy_range, SIZE(velocity_zero, 3))
       WRITE (diagnostics_unit, '(A)') '# Relative residual: 2*norm(velocity-length)/(norm(velocity)+norm(length))'
       WRITE (diagnostics_unit, '(A)') '# Columns: Energy_hartree Energy_eV velocity0_norm length0_norm '// &
                                      'absolute0_residual relative0_residual velocity1_norm length1_norm '// &
@@ -3317,14 +3508,15 @@ CONTAINS
 ! **************************************************************************************************
 !> \brief Print the compact final implicit-Gamma ECD validation summary.
 ! **************************************************************************************************
-   SUBROUTINE ecd_periodic_print_output_summary(context, gauge_label, gth_available, ntransitions, &
+   SUBROUTINE ecd_periodic_print_output_summary(context, gauge_label, gth_available, ntransitions, candidate_count, &
+                                                requested_count, cutoff_gap, &
                                                 midpoint_zero_relative, midpoint_first_relative, &
                                                 maximum_zero_relative, maximum_first_relative)
       TYPE(ecd_gamma_context_type), INTENT(IN)           :: context
       CHARACTER(LEN=*), INTENT(IN)                       :: gauge_label
       LOGICAL, INTENT(IN)                                :: gth_available
-      INTEGER, INTENT(IN)                                :: ntransitions
-      REAL(KIND=dp), INTENT(IN)                          :: maximum_first_relative, maximum_zero_relative, &
+      INTEGER, INTENT(IN)                                :: candidate_count, ntransitions, requested_count
+      REAL(KIND=dp), INTENT(IN)                          :: cutoff_gap, maximum_first_relative, maximum_zero_relative, &
                                                             midpoint_first_relative, midpoint_zero_relative
 
       TYPE(cp_logger_type), POINTER                      :: logger
@@ -3338,7 +3530,13 @@ CONTAINS
       WRITE (cp_logger_get_default_io_unit(logger), '(T2,A,T55,L1)') &
          'ECD| GTH current available', gth_available
       WRITE (cp_logger_get_default_io_unit(logger), '(T2,A,T55,I10)') &
+         'ECD| Requested occupied-empty pairs', requested_count
+      WRITE (cp_logger_get_default_io_unit(logger), '(T2,A,T55,I10)') &
+         'ECD| Candidate occupied-empty pairs', candidate_count
+      WRITE (cp_logger_get_default_io_unit(logger), '(T2,A,T55,I10)') &
          'ECD| Selected occupied-empty pairs', ntransitions
+      WRITE (cp_logger_get_default_io_unit(logger), '(T2,A,T55,ES14.6)') &
+         'ECD| Transition cutoff gap [hartree]', cutoff_gap
       WRITE (cp_logger_get_default_io_unit(logger), '(T2,A,T55,ES14.6)') &
          'ECD| Midpoint zero-order gauge relative residual', midpoint_zero_relative
       WRITE (cp_logger_get_default_io_unit(logger), '(T2,A,T55,ES14.6)') &
@@ -3363,7 +3561,7 @@ CONTAINS
 ! **************************************************************************************************
    SUBROUTINE ecd_periodic_print_response_tensor(ecd_section, energy_range, response_zero, response_first, &
                                                  context, gauge_label, gth_available, fwhm, transition_band_range, &
-                                                 ntransitions, transition_source)
+                                                 ntransitions, transition_source, candidate_count, requested_count, cutoff_gap)
       TYPE(section_vals_type), POINTER                   :: ecd_section
       REAL(KIND=dp), DIMENSION(2), INTENT(IN)            :: energy_range
       COMPLEX(KIND=dp), DIMENSION(:, :, :), INTENT(IN)   :: response_first, response_zero
@@ -3371,8 +3569,8 @@ CONTAINS
       CHARACTER(LEN=*), INTENT(IN), OPTIONAL             :: gauge_label
       LOGICAL, INTENT(IN), OPTIONAL                      :: gth_available
       INTEGER, DIMENSION(2), INTENT(IN), OPTIONAL        :: transition_band_range
-      INTEGER, INTENT(IN), OPTIONAL                      :: ntransitions
-      REAL(KIND=dp), INTENT(IN), OPTIONAL                :: fwhm
+      INTEGER, INTENT(IN), OPTIONAL                      :: candidate_count, ntransitions, requested_count
+      REAL(KIND=dp), INTENT(IN), OPTIONAL                :: cutoff_gap, fwhm
       CHARACTER(LEN=*), INTENT(IN), OPTIONAL             :: transition_source
 
       CHARACTER(LEN=default_path_length)                 :: response_filename
@@ -3409,12 +3607,14 @@ CONTAINS
       WRITE (response_unit, '(A)') '# CP2K periodic ECD dielectric response'
       IF (PRESENT(context)) THEN
          IF (.NOT. PRESENT(gauge_label) .OR. .NOT. PRESENT(gth_available) .OR. .NOT. PRESENT(fwhm) .OR. &
-             .NOT. PRESENT(transition_band_range) .OR. .NOT. PRESENT(ntransitions)) THEN
+             .NOT. PRESENT(transition_band_range) .OR. .NOT. PRESENT(ntransitions) .OR. &
+             .NOT. PRESENT(candidate_count) .OR. .NOT. PRESENT(requested_count) .OR. .NOT. PRESENT(cutoff_gap)) THEN
             CPABORT('ECD| Periodic response metadata are incomplete')
          END IF
-         WRITE (response_unit, '(A)') '# Format_version 2'
+         WRITE (response_unit, '(A)') '# Format_version 3'
          CALL ecd_periodic_write_output_metadata(response_unit, context, gauge_label, gth_available, fwhm, &
-                                                 transition_band_range, ntransitions, energy_range, SIZE(response_zero, 3), &
+                                                 transition_band_range, ntransitions, candidate_count, requested_count, &
+                                                 cutoff_gap, energy_range, SIZE(response_zero, 3), &
                                                  source_label)
       END IF
       WRITE (response_unit, '(A)') '# epsilon0 includes the vacuum identity and diamagnetic baseline'
@@ -3469,7 +3669,8 @@ CONTAINS
 ! **************************************************************************************************
    SUBROUTINE ecd_periodic_print_maxwell_spectrum(ecd_section, energy_range, direction, response_zero, &
                                                    response_first, context, gauge_label, gth_available, fwhm, &
-                                                   transition_band_range, ntransitions, transition_source)
+                                                   transition_band_range, ntransitions, transition_source, candidate_count, &
+                                                   requested_count, cutoff_gap)
       TYPE(section_vals_type), POINTER                   :: ecd_section
       REAL(KIND=dp), DIMENSION(2), INTENT(IN)            :: energy_range
       REAL(KIND=dp), DIMENSION(ncart), INTENT(IN)        :: direction
@@ -3478,8 +3679,8 @@ CONTAINS
       CHARACTER(LEN=*), INTENT(IN), OPTIONAL             :: gauge_label
       LOGICAL, INTENT(IN), OPTIONAL                      :: gth_available
       INTEGER, DIMENSION(2), INTENT(IN), OPTIONAL        :: transition_band_range
-      INTEGER, INTENT(IN), OPTIONAL                      :: ntransitions
-      REAL(KIND=dp), INTENT(IN), OPTIONAL                :: fwhm
+      INTEGER, INTENT(IN), OPTIONAL                      :: candidate_count, ntransitions, requested_count
+      REAL(KIND=dp), INTENT(IN), OPTIONAL                :: cutoff_gap, fwhm
       CHARACTER(LEN=*), INTENT(IN), OPTIONAL             :: transition_source
 
       CHARACTER(LEN=default_path_length)                 :: spectrum_filename
@@ -3522,12 +3723,14 @@ CONTAINS
       WRITE (spectrum_unit, '(A)') '# CP2K periodic ECD Maxwell spectrum'
       IF (PRESENT(context)) THEN
          IF (.NOT. PRESENT(gauge_label) .OR. .NOT. PRESENT(gth_available) .OR. .NOT. PRESENT(fwhm) .OR. &
-             .NOT. PRESENT(transition_band_range) .OR. .NOT. PRESENT(ntransitions)) THEN
+             .NOT. PRESENT(transition_band_range) .OR. .NOT. PRESENT(ntransitions) .OR. &
+             .NOT. PRESENT(candidate_count) .OR. .NOT. PRESENT(requested_count) .OR. .NOT. PRESENT(cutoff_gap)) THEN
             CPABORT('ECD| Maxwell-spectrum metadata are incomplete')
          END IF
-         WRITE (spectrum_unit, '(A)') '# Format_version 2'
+         WRITE (spectrum_unit, '(A)') '# Format_version 3'
          CALL ecd_periodic_write_output_metadata(spectrum_unit, context, gauge_label, gth_available, fwhm, &
-                                                 transition_band_range, ntransitions, energy_range, SIZE(response_zero, 3), &
+                                                 transition_band_range, ntransitions, candidate_count, requested_count, &
+                                                 cutoff_gap, energy_range, SIZE(response_zero, 3), &
                                                  source_label)
       END IF
       WRITE (spectrum_unit, '(A,3(1X,ES18.10E3))') '# Propagation_direction', direction

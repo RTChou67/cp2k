@@ -2296,7 +2296,8 @@ CONTAINS
       CALL section_add_keyword(subsection, keyword)
       CALL keyword_release(keyword)
       CALL keyword_create(keyword, __LOCATION__, name="NTRANSITIONS", &
-                          description="Number of lowest-energy independent-particle transitions to print.", &
+                          description="Requested number of lowest-energy independent-particle transitions included in the "// &
+                                      "response; cutoff-degenerate transitions are retained.", &
                           usage="NTRANSITIONS 50", n_var=1, type_of_var=integer_t, default_i_val=50)
       CALL section_add_keyword(subsection, keyword)
       CALL keyword_release(keyword)
