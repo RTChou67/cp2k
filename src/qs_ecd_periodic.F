@@ -152,12 +152,13 @@ CONTAINS
                                                             velocity_first_cartesian, velocity_transition_cartesian
       INTEGER                                            :: idir, itransition, npoints, spatial_order
       INTEGER, ALLOCATABLE, DIMENSION(:)                 :: selected_iocc, selected_ispin, selected_ivirt
-      LOGICAL                                            :: do_kpoints, energy_range_explicit, gth_available
+      LOGICAL                                            :: do_kpoints, energy_range_explicit, gth_available, &
+                                                            gth_available_reference
       REAL(KIND=dp)                                      :: eps_degeneracy
       REAL(KIND=dp), ALLOCATABLE, DIMENSION(:, :)        :: gap_first_cartesian
       REAL(KIND=dp), DIMENSION(:), POINTER               :: energy_range
       REAL(KIND=dp), DIMENSION(ncart)                    :: direction
-      REAL(KIND=dp), DIMENSION(ncart, ncart)             :: diamagnetic_kernel
+      REAL(KIND=dp), DIMENSION(ncart, ncart)             :: diamagnetic_kernel, diamagnetic_kernel_direction
       TYPE(cell_type), POINTER                           :: cell
       TYPE(ecd_gamma_context_type)                       :: gamma_context
       TYPE(ecd_gamma_zero_order_operators_type)          :: gamma_operators
@@ -273,10 +274,24 @@ CONTAINS
                gamma_context%spin(transition_selection%ispin(itransition))% &
                   eigenvalue_first(transition_selection%iocc(itransition)))
          END DO
-         CALL ecd_periodic_implicit_gamma_velocity_response_g10(qs_env, gamma_context, gamma_operators, &
-                                                                 transition_selection, energy_range, npoints, fwhm, &
-                                                                 velocity_response_zero_direction, velocity_first_direction, &
-                                                                 diamagnetic_kernel, velocity_transition_direction, gth_available)
+         IF (idir == 1) THEN
+            CALL ecd_periodic_implicit_gamma_velocity_response_g10(qs_env, gamma_context, gamma_operators, &
+                                                                    transition_selection, energy_range, npoints, fwhm, &
+                                                                    velocity_response_zero_direction, velocity_first_direction, &
+                                                                    diamagnetic_kernel_direction, velocity_transition_direction, &
+                                                                    gth_available)
+            diamagnetic_kernel = diamagnetic_kernel_direction
+            gth_available_reference = gth_available
+         ELSE
+            CALL ecd_periodic_implicit_gamma_velocity_response_g10(qs_env, gamma_context, gamma_operators, &
+                                                                    transition_selection, energy_range, npoints, fwhm, &
+                                                                    velocity_response_zero_direction, velocity_first_direction, &
+                                                                    diamagnetic_kernel_direction, velocity_transition_direction, &
+                                                                    gth_available, diamagnetic_kernel)
+            IF (gth_available .NEQV. gth_available_reference) THEN
+               CPABORT('ECD| Cartesian Gamma directions reported inconsistent GTH-current availability')
+            END IF
+         END IF
          CALL ecd_periodic_implicit_gamma_length_response_g13(gamma_context, transition_selection, energy_range, &
                                                                npoints, fwhm, velocity_response_zero_direction, &
                                                                velocity_first_direction, diamagnetic_kernel, &
@@ -285,11 +300,13 @@ CONTAINS
          IF (idir == 1) THEN
             CALL MOVE_ALLOC(velocity_response_zero_direction, velocity_response_zero)
          ELSE
+            CALL ecd_periodic_response_zero_check(velocity_response_zero, velocity_response_zero_direction, 'velocity')
             DEALLOCATE (velocity_response_zero_direction)
          END IF
          IF (idir == 1) THEN
             CALL MOVE_ALLOC(length_response_zero_direction, length_response_zero)
          ELSE
+            CALL ecd_periodic_response_zero_check(length_response_zero, length_response_zero_direction, 'length')
             DEALLOCATE (length_response_zero_direction)
          END IF
          velocity_first_cartesian(:, :, idir, :) = velocity_first_direction
@@ -1367,7 +1384,8 @@ CONTAINS
    SUBROUTINE ecd_periodic_implicit_gamma_velocity_response_g10(qs_env, context, operators, transition_selection, &
                                                                  energy_range, npoints, fwhm, response_zero_output, &
                                                                  response_first_output, diamagnetic_kernel_output, &
-                                                                 transition_output, gth_available_output)
+                                                                 transition_output, gth_available_output, &
+                                                                 diamagnetic_kernel_reference)
       TYPE(qs_environment_type), POINTER                 :: qs_env
       TYPE(ecd_gamma_context_type), INTENT(IN), TARGET   :: context
       TYPE(ecd_gamma_zero_order_operators_type), INTENT(IN), TARGET :: operators
@@ -1379,6 +1397,7 @@ CONTAINS
       REAL(KIND=dp), DIMENSION(ncart, ncart), INTENT(OUT) :: diamagnetic_kernel_output
       COMPLEX(KIND=dp), ALLOCATABLE, DIMENSION(:, :, :), INTENT(OUT) :: transition_output
       LOGICAL, INTENT(OUT)                               :: gth_available_output
+      REAL(KIND=dp), DIMENSION(ncart, ncart), INTENT(IN), OPTIONAL :: diamagnetic_kernel_reference
 
       COMPLEX(KIND=dp), ALLOCATABLE, DIMENSION(:, :)     :: current_first_mo, current_first_rotated, &
                                                             current_zero_mo, current_zero_rotated, &
@@ -1506,7 +1525,11 @@ CONTAINS
          CPABORT('ECD| Stage G10 transition selection is inconsistent with the Gamma spin space')
       END IF
 
-      CALL ecd_periodic_implicit_gamma_diamagnetic_kernel(qs_env, context, gth_available, diamagnetic_kernel_output)
+      IF (PRESENT(diamagnetic_kernel_reference)) THEN
+         diamagnetic_kernel_output = diamagnetic_kernel_reference
+      ELSE
+         CALL ecd_periodic_implicit_gamma_diamagnetic_kernel(qs_env, context, gth_available, diamagnetic_kernel_output)
+      END IF
       response_zero = response_resonant + response_counter
       DO ipoint = 1, npoints
          photon_energy = energy_range(1) + REAL(ipoint - 1, KIND=dp)* &
@@ -1817,6 +1840,32 @@ CONTAINS
       END DO
 
    END SUBROUTINE ecd_periodic_response_add_transition
+
+! **************************************************************************************************
+!> \brief Validate that the q=0 response is independent of the Cartesian q-derivative direction.
+! **************************************************************************************************
+   SUBROUTINE ecd_periodic_response_zero_check(reference_response, candidate_response, representation_label)
+      COMPLEX(KIND=dp), DIMENSION(:, :, :), INTENT(IN)   :: candidate_response, reference_response
+      CHARACTER(LEN=*), INTENT(IN)                       :: representation_label
+
+      REAL(KIND=dp), PARAMETER                           :: relative_tolerance = 1.0E-8_dp
+
+      REAL(KIND=dp)                                      :: candidate_norm, reference_norm, relative_residual, residual_norm
+
+      IF (SIZE(reference_response, 1) /= ncart .OR. SIZE(reference_response, 2) /= ncart .OR. &
+          SIZE(candidate_response, 1) /= ncart .OR. SIZE(candidate_response, 2) /= ncart .OR. &
+          SIZE(reference_response, 3) < 2 .OR. SIZE(candidate_response, 3) /= SIZE(reference_response, 3)) THEN
+         CPABORT('ECD| Cartesian zero-order response check received incompatible tensor dimensions')
+      END IF
+      reference_norm = SQRT(SUM(ABS(reference_response)**2))
+      candidate_norm = SQRT(SUM(ABS(candidate_response)**2))
+      residual_norm = SQRT(SUM(ABS(candidate_response - reference_response)**2))
+      relative_residual = 2.0_dp*residual_norm/MAX(SQRT(TINY(1.0_dp)), reference_norm + candidate_norm)
+      IF (relative_residual > relative_tolerance) THEN
+         CPABORT('ECD| Cartesian q directions produced inconsistent '//TRIM(representation_label)//' zero-order responses')
+      END IF
+
+   END SUBROUTINE ecd_periodic_response_zero_check
 
 ! **************************************************************************************************
 !> \brief Assemble the folded local plus GTH diamagnetic kernel at implicit Gamma.
