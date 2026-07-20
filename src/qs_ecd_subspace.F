@@ -34,6 +34,7 @@ MODULE qs_ecd_subspace
              ecd_band_manifolds_validate_window, &
              ecd_band_first_order_response, &
              ecd_band_taylor_non_degenerate_response, &
+             ecd_taylor_retarded_response_pair, &
              ecd_taylor_retarded_response
 
 CONTAINS
@@ -450,17 +451,36 @@ CONTAINS
       REAL(KIND=dp), DIMENSION(0:), INTENT(IN)           :: gap_coeff
       REAL(KIND=dp), INTENT(IN)                          :: photon_energy, half_width
 
-      COMPLEX(KIND=dp), ALLOCATABLE, DIMENSION(:, :)     :: kernel
+      CALL ecd_taylor_retarded_response_pair(transition_coeff, transition_coeff, gap_coeff, photon_energy, &
+                                              half_width, resonant_coeff, counter_coeff)
+
+   END SUBROUTINE ecd_taylor_retarded_response
+
+! **************************************************************************************************
+!> \brief Build a retarded response Taylor series from distinct left and right transition vertices.
+! **************************************************************************************************
+   SUBROUTINE ecd_taylor_retarded_response_pair(left_transition_coeff, right_transition_coeff, gap_coeff, &
+                                                 photon_energy, half_width, resonant_coeff, counter_coeff)
+      COMPLEX(KIND=dp), DIMENSION(:, 0:), INTENT(IN)     :: left_transition_coeff, right_transition_coeff
+      COMPLEX(KIND=dp), DIMENSION(:, :, 0:), INTENT(OUT) :: resonant_coeff, counter_coeff
+      REAL(KIND=dp), DIMENSION(0:), INTENT(IN)           :: gap_coeff
+      REAL(KIND=dp), INTENT(IN)                          :: photon_energy, half_width
+
+      COMPLEX(KIND=dp), ALLOCATABLE, DIMENSION(:, :)     :: counter_kernel, kernel
       COMPLEX(KIND=dp), ALLOCATABLE, DIMENSION(:)        :: counter_inverse, counter_denominator, &
                                                             resonant_inverse, resonant_denominator
       INTEGER                                            :: ia, ib, iorder, jorder, max_order, ncart
 
-      ncart = SIZE(transition_coeff, 1)
-      max_order = UBOUND(transition_coeff, 2)
+      ncart = SIZE(left_transition_coeff, 1)
+      max_order = UBOUND(left_transition_coeff, 2)
       IF (ncart < 1) THEN
          CPABORT("ECD| Taylor response requires at least one Cartesian component")
       END IF
-      IF (LBOUND(transition_coeff, 2) /= 0 .OR. LBOUND(gap_coeff, 1) /= 0) THEN
+      IF (SIZE(right_transition_coeff, 1) /= ncart .OR. &
+          LBOUND(right_transition_coeff, 2) /= 0 .OR. UBOUND(right_transition_coeff, 2) /= max_order) THEN
+         CPABORT("ECD| Taylor response received incompatible left and right transition orders")
+      END IF
+      IF (LBOUND(left_transition_coeff, 2) /= 0 .OR. LBOUND(gap_coeff, 1) /= 0) THEN
          CPABORT("ECD| Taylor response coefficients must start at order zero")
       END IF
       IF (UBOUND(gap_coeff, 1) /= max_order) THEN
@@ -478,15 +498,20 @@ CONTAINS
          CPABORT("ECD| Taylor response requires positive photon energy and half width")
       END IF
 
-      ALLOCATE (kernel(ncart*ncart, 0:max_order), counter_denominator(0:max_order), &
+      ALLOCATE (counter_kernel(ncart*ncart, 0:max_order), kernel(ncart*ncart, 0:max_order), &
+                counter_denominator(0:max_order), &
                 counter_inverse(0:max_order), resonant_denominator(0:max_order), resonant_inverse(0:max_order))
       kernel(:, :) = CMPLX(0.0_dp, 0.0_dp, KIND=dp)
+      counter_kernel(:, :) = CMPLX(0.0_dp, 0.0_dp, KIND=dp)
       DO iorder = 0, max_order
          DO jorder = 0, iorder
             DO ia = 1, ncart
                DO ib = 1, ncart
                   kernel((ia - 1)*ncart + ib, iorder) = kernel((ia - 1)*ncart + ib, iorder) + &
-                     CONJG(transition_coeff(ia, jorder))*transition_coeff(ib, iorder - jorder)
+                     CONJG(left_transition_coeff(ia, jorder))*right_transition_coeff(ib, iorder - jorder)
+                  counter_kernel((ia - 1)*ncart + ib, iorder) = &
+                     counter_kernel((ia - 1)*ncart + ib, iorder) + &
+                     CONJG(right_transition_coeff(ia, jorder))*left_transition_coeff(ib, iorder - jorder)
                END DO
             END DO
          END DO
@@ -510,15 +535,15 @@ CONTAINS
                   resonant_coeff(ia, ib, iorder) = resonant_coeff(ia, ib, iorder) + &
                      kernel((ia - 1)*ncart + ib, jorder)*resonant_inverse(iorder - jorder)
                   counter_coeff(ia, ib, iorder) = counter_coeff(ia, ib, iorder) - &
-                     (-1)**jorder*kernel((ib - 1)*ncart + ia, jorder)*counter_inverse(iorder - jorder)
+                     (-1)**jorder*counter_kernel((ib - 1)*ncart + ia, jorder)*counter_inverse(iorder - jorder)
                END DO
             END DO
          END DO
       END DO
 
-      DEALLOCATE (counter_denominator, counter_inverse, kernel, resonant_denominator, resonant_inverse)
+      DEALLOCATE (counter_denominator, counter_inverse, counter_kernel, kernel, resonant_denominator, resonant_inverse)
 
-   END SUBROUTINE ecd_taylor_retarded_response
+   END SUBROUTINE ecd_taylor_retarded_response_pair
 
 ! **************************************************************************************************
 !> \brief Invert a normalized scalar Taylor series.

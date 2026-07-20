@@ -53,11 +53,10 @@ CONTAINS
 ! **************************************************************************************************
 !> \brief Build folded length and complete-current matrices at implicit Gamma.
 ! **************************************************************************************************
-   SUBROUTINE ecd_gamma_zero_order_operators_build(operators, qs_env, context, pseudopotential_commutator)
+   SUBROUTINE ecd_gamma_zero_order_operators_build(operators, qs_env, context)
       TYPE(ecd_gamma_zero_order_operators_type), INTENT(INOUT) :: operators
       TYPE(qs_environment_type), POINTER                 :: qs_env
       TYPE(ecd_gamma_context_type), INTENT(IN)           :: context
-      LOGICAL, INTENT(IN)                                :: pseudopotential_commutator
 
       INTEGER                                            :: idir
       TYPE(dbcsr_p_type), DIMENSION(:), POINTER          :: gth_current_symmetric
@@ -88,7 +87,7 @@ CONTAINS
                         0.0_dp, 1.0_dp)
       END DO
 
-      IF (pseudopotential_commutator .AND. ASSOCIATED(context%sap_ppnl)) THEN
+      IF (ASSOCIATED(context%sap_ppnl)) THEN
          CALL ecd_gamma_ao_vector_create(gth_current_symmetric, context%matrix_s(1)%matrix, context%sab_orb, &
                                          'ECD implicit Gamma GTH current symmetric', dbcsr_type_antisymmetric)
          CALL build_com_mom_nl(context%qs_kind_set, context%sab_orb, context%sap_ppnl, &

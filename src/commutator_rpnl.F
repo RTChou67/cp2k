@@ -1679,7 +1679,10 @@ CONTAINS
       projector_coordinate = DOT_PRODUCT(direction, projector_position - ref_point)
 
       DO m = 0, order
-         path_factor = projector_coordinate**(order - m)/REAL(order + 1, KIND=dp)
+         ! Normalized coefficient of the Pickard--Mauri segment integral:
+         ! int_0^1 d lambda [u_R + lambda u_r]^order / order!
+         path_factor = projector_coordinate**(order - m)/ &
+                       (ecd_integer_factorial(order - m)*ecd_integer_factorial(m)*REAL(m + 1, KIND=dp))
          DO ix = 0, m
             DO iy = 0, m - ix
                iz = m - ix - iy

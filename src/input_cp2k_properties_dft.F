@@ -2214,8 +2214,8 @@ CONTAINS
       CALL keyword_release(keyword)
 
       CALL keyword_create(keyword, __LOCATION__, name="PSEUDOPOTENTIAL_COMMUTATOR", &
-                          description="Controls the GTH non-local contribution to the molecular magnetic operator "// &
-                          "and the periodic finite-wave-vector current.", &
+                          description="Controls the molecular GTH magnetic contribution and selects the periodic "// &
+                          "complete-current (T) or local-current ablation (F) primary response.", &
                           usage="PSEUDOPOTENTIAL_COMMUTATOR {logical}", &
                           type_of_var=logical_t, default_l_val=.TRUE., lone_keyword_l_val=.TRUE.)
       CALL section_add_keyword(section, keyword)

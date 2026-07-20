@@ -55,6 +55,7 @@ MODULE qs_ecd_periodic
    USE orbital_pointers,                 ONLY: coset, ncoset
    USE qs_ecd_subspace,                 ONLY: ecd_band_first_order_response,&
                                               ecd_band_manifolds_validate_window,&
+                                              ecd_taylor_retarded_response_pair,&
                                               ecd_taylor_retarded_response
    USE qs_ecd_operators,                ONLY: ecd_periodic_gth_operators_build,&
                                               ecd_periodic_gth_operators_get,&
@@ -127,7 +128,7 @@ CONTAINS
 !> \param ipa_section ECD/IPA input section
 !> \param ntransitions Number of transition-resolved records requested
 !> \param transition_band_range Band range included in the response
-!> \param pseudopotential_commutator Include the GTH non-local current
+!> \param pseudopotential_commutator Select complete-current or local-current primary output
 !> \param ref_point Spatial-expansion reference point
 !> \param broadening Spectrum broadening selector
 !> \param fwhm Spectrum full width at half maximum
@@ -150,6 +151,16 @@ CONTAINS
                                                             velocity_response_zero_direction, velocity_transition_direction
       COMPLEX(KIND=dp), ALLOCATABLE, DIMENSION(:, :, :, :) :: length_first_cartesian, length_transition_cartesian, &
                                                             velocity_first_cartesian, velocity_transition_cartesian
+      COMPLEX(KIND=dp), ALLOCATABLE, DIMENSION(:, :, :)  :: velocity_complete_first_direction, &
+                                                            velocity_complete_zero, velocity_complete_zero_direction, &
+                                                            velocity_cross_first_direction, velocity_cross_zero, &
+                                                            velocity_cross_zero_direction, velocity_gth_transition_direction, &
+                                                            velocity_local_first_direction, velocity_local_zero, &
+                                                            velocity_local_zero_direction, velocity_nonlocal_first_direction, &
+                                                            velocity_nonlocal_zero, velocity_nonlocal_zero_direction
+      COMPLEX(KIND=dp), ALLOCATABLE, DIMENSION(:, :, :, :) :: velocity_complete_first_cartesian, &
+                                                            velocity_cross_first_cartesian, velocity_gth_transition_cartesian, &
+                                                            velocity_local_first_cartesian, velocity_nonlocal_first_cartesian
       INTEGER                                            :: idir, itransition, npoints, spatial_order
       INTEGER, ALLOCATABLE, DIMENSION(:)                 :: selected_iocc, selected_ispin, selected_ivirt
       LOGICAL                                            :: do_kpoints, energy_range_explicit, gth_available, &
@@ -234,11 +245,9 @@ CONTAINS
          direction(idir) = 1.0_dp
          CALL ecd_gamma_context_create_implicit(gamma_context, qs_env, direction, ref_point, spatial_order, &
                                                 eps_degeneracy)
-         CALL ecd_gamma_zero_order_operators_build(gamma_operators, qs_env, gamma_context, &
-                                                    pseudopotential_commutator)
+         CALL ecd_gamma_zero_order_operators_build(gamma_operators, qs_env, gamma_context)
          CALL ecd_periodic_implicit_gamma_overlap_g3(gamma_context)
-         CALL ecd_periodic_implicit_gamma_current_g4(qs_env, gamma_context, gamma_operators, &
-                                                      pseudopotential_commutator)
+         CALL ecd_periodic_implicit_gamma_current_g4(qs_env, gamma_context, gamma_operators)
          CALL ecd_periodic_implicit_gamma_length_g11(qs_env, gamma_context, gamma_operators)
          CALL ecd_periodic_implicit_gamma_ks_g6(qs_env, gamma_context)
          CALL ecd_periodic_implicit_gamma_ks_phase_g7(gamma_context)
@@ -252,7 +261,12 @@ CONTAINS
                       selected_iocc(transition_selection%selected_count), &
                       selected_ispin(transition_selection%selected_count), &
                       selected_ivirt(transition_selection%selected_count), &
+                      velocity_complete_first_cartesian(ncart, ncart, ncart, npoints), &
+                      velocity_cross_first_cartesian(ncart, ncart, ncart, npoints), &
                       velocity_first_cartesian(ncart, ncart, ncart, npoints), &
+                      velocity_gth_transition_cartesian(ncart, 0:1, transition_selection%selected_count, ncart), &
+                      velocity_local_first_cartesian(ncart, ncart, ncart, npoints), &
+                      velocity_nonlocal_first_cartesian(ncart, ncart, ncart, npoints), &
                       velocity_transition_cartesian(ncart, 0:1, transition_selection%selected_count, ncart))
             selected_iocc = transition_selection%iocc
             selected_ispin = transition_selection%ispin
@@ -276,26 +290,40 @@ CONTAINS
          END DO
          IF (idir == 1) THEN
             CALL ecd_periodic_implicit_gamma_velocity_response_g10(qs_env, gamma_context, gamma_operators, &
-                                                                    transition_selection, energy_range, npoints, fwhm, &
+                                                                    transition_selection, pseudopotential_commutator, &
+                                                                    energy_range, npoints, fwhm, &
                                                                     velocity_response_zero_direction, velocity_first_direction, &
+                                                                    velocity_complete_zero_direction, &
+                                                                    velocity_complete_first_direction, &
+                                                                    velocity_local_zero_direction, velocity_local_first_direction, &
+                                                                    velocity_cross_zero_direction, velocity_cross_first_direction, &
+                                                                    velocity_nonlocal_zero_direction, &
+                                                                    velocity_nonlocal_first_direction, &
                                                                     diamagnetic_kernel_direction, velocity_transition_direction, &
-                                                                    gth_available)
+                                                                    velocity_gth_transition_direction, gth_available)
             diamagnetic_kernel = diamagnetic_kernel_direction
             gth_available_reference = gth_available
          ELSE
             CALL ecd_periodic_implicit_gamma_velocity_response_g10(qs_env, gamma_context, gamma_operators, &
-                                                                    transition_selection, energy_range, npoints, fwhm, &
+                                                                    transition_selection, pseudopotential_commutator, &
+                                                                    energy_range, npoints, fwhm, &
                                                                     velocity_response_zero_direction, velocity_first_direction, &
+                                                                    velocity_complete_zero_direction, &
+                                                                    velocity_complete_first_direction, &
+                                                                    velocity_local_zero_direction, velocity_local_first_direction, &
+                                                                    velocity_cross_zero_direction, velocity_cross_first_direction, &
+                                                                    velocity_nonlocal_zero_direction, &
+                                                                    velocity_nonlocal_first_direction, &
                                                                     diamagnetic_kernel_direction, velocity_transition_direction, &
-                                                                    gth_available, diamagnetic_kernel)
+                                                                    velocity_gth_transition_direction, gth_available, diamagnetic_kernel)
             IF (gth_available .NEQV. gth_available_reference) THEN
                CPABORT('ECD| Cartesian Gamma directions reported inconsistent GTH-current availability')
             END IF
          END IF
          CALL ecd_periodic_implicit_gamma_length_response_g13(gamma_context, transition_selection, energy_range, &
-                                                               npoints, fwhm, velocity_response_zero_direction, &
-                                                               velocity_first_direction, diamagnetic_kernel, &
-                                                               length_response_zero_direction, length_first_direction, &
+                                                               npoints, fwhm, velocity_complete_zero_direction, &
+                                                               velocity_complete_first_direction, length_response_zero_direction, &
+                                                               length_first_direction, &
                                                                length_transition_direction)
          IF (idir == 1) THEN
             CALL MOVE_ALLOC(velocity_response_zero_direction, velocity_response_zero)
@@ -304,17 +332,41 @@ CONTAINS
             DEALLOCATE (velocity_response_zero_direction)
          END IF
          IF (idir == 1) THEN
+            CALL MOVE_ALLOC(velocity_complete_zero_direction, velocity_complete_zero)
+            CALL MOVE_ALLOC(velocity_local_zero_direction, velocity_local_zero)
+            CALL MOVE_ALLOC(velocity_cross_zero_direction, velocity_cross_zero)
+            CALL MOVE_ALLOC(velocity_nonlocal_zero_direction, velocity_nonlocal_zero)
+         ELSE
+            CALL ecd_periodic_response_zero_check(velocity_complete_zero, velocity_complete_zero_direction, &
+                                                  'complete velocity')
+            CALL ecd_periodic_response_zero_check(velocity_local_zero, velocity_local_zero_direction, &
+                                                  'local velocity')
+            CALL ecd_periodic_response_zero_check(velocity_cross_zero, velocity_cross_zero_direction, &
+                                                  'cross velocity')
+            CALL ecd_periodic_response_zero_check(velocity_nonlocal_zero, velocity_nonlocal_zero_direction, &
+                                                  'nonlocal velocity')
+            DEALLOCATE (velocity_complete_zero_direction, velocity_local_zero_direction, &
+                        velocity_cross_zero_direction, velocity_nonlocal_zero_direction)
+         END IF
+         IF (idir == 1) THEN
             CALL MOVE_ALLOC(length_response_zero_direction, length_response_zero)
          ELSE
             CALL ecd_periodic_response_zero_check(length_response_zero, length_response_zero_direction, 'length')
             DEALLOCATE (length_response_zero_direction)
          END IF
          velocity_first_cartesian(:, :, idir, :) = velocity_first_direction
+         velocity_complete_first_cartesian(:, :, idir, :) = velocity_complete_first_direction
+         velocity_local_first_cartesian(:, :, idir, :) = velocity_local_first_direction
+         velocity_cross_first_cartesian(:, :, idir, :) = velocity_cross_first_direction
+         velocity_nonlocal_first_cartesian(:, :, idir, :) = velocity_nonlocal_first_direction
          length_first_cartesian(:, :, idir, :) = length_first_direction
          velocity_transition_cartesian(:, :, :, idir) = velocity_transition_direction
+         velocity_gth_transition_cartesian(:, :, :, idir) = velocity_gth_transition_direction
          length_transition_cartesian(:, :, :, idir) = length_transition_direction
          DEALLOCATE (length_first_direction, length_transition_direction, velocity_first_direction, &
-                     velocity_transition_direction)
+                     velocity_complete_first_direction, velocity_cross_first_direction, &
+                     velocity_gth_transition_direction, velocity_local_first_direction, &
+                     velocity_nonlocal_first_direction, velocity_transition_direction)
          IF (idir < ncart) THEN
             CALL ecd_periodic_transition_selection_release(transition_selection)
             CALL ecd_gamma_zero_order_operators_release(gamma_operators)
@@ -323,20 +375,31 @@ CONTAINS
       END DO
       CALL ecd_periodic_print_cartesian_response(ecd_section, energy_range, velocity_response_zero, &
                                                  velocity_first_cartesian, length_response_zero, &
-                                                 length_first_cartesian, gamma_context, gth_available, fwhm, &
+                                                 length_first_cartesian, gamma_context, gth_available, &
+                                                 pseudopotential_commutator, fwhm, &
                                                  transition_selection)
       CALL ecd_periodic_print_cartesian_transition_matrix_elements(ecd_section, gamma_context, transition_selection, &
                                                                     pseudopotential_commutator, &
                                                                     gap_first_cartesian, &
                                                                     velocity_transition_cartesian, &
+                                                                    velocity_gth_transition_cartesian, &
                                                                     length_transition_cartesian)
       CALL ecd_periodic_print_cartesian_gauge_diagnostics(ecd_section, gamma_context, gth_available, fwhm, &
-                                                           transition_selection, energy_range, velocity_response_zero, &
-                                                           velocity_first_cartesian, length_response_zero, &
+                                                           transition_selection, energy_range, velocity_complete_zero, &
+                                                           velocity_complete_first_cartesian, length_response_zero, &
                                                            length_first_cartesian)
+      CALL ecd_periodic_print_cartesian_velocity_decomposition(ecd_section, energy_range, velocity_local_zero, &
+                                                                velocity_local_first_cartesian, velocity_cross_zero, &
+                                                                velocity_cross_first_cartesian, velocity_nonlocal_zero, &
+                                                                velocity_nonlocal_first_cartesian, velocity_complete_zero, &
+                                                                velocity_complete_first_cartesian, gamma_context, &
+                                                                gth_available, fwhm, transition_selection)
       DEALLOCATE (gap_first_cartesian, length_first_cartesian, length_response_zero, length_transition_cartesian, &
                   selected_iocc, selected_ispin, selected_ivirt, velocity_first_cartesian, &
-                  velocity_response_zero, velocity_transition_cartesian)
+                  velocity_response_zero, velocity_transition_cartesian, velocity_complete_first_cartesian, &
+                  velocity_complete_zero, velocity_cross_first_cartesian, velocity_cross_zero, &
+                  velocity_gth_transition_cartesian, velocity_local_first_cartesian, velocity_local_zero, &
+                  velocity_nonlocal_first_cartesian, velocity_nonlocal_zero)
       CALL ecd_periodic_transition_selection_release(transition_selection)
       CALL ecd_gamma_zero_order_operators_release(gamma_operators)
       CALL ecd_gamma_context_release(gamma_context)
@@ -1231,12 +1294,10 @@ CONTAINS
 !> checked against the folded complete current before the first coefficient is
 !> made available to the finite-q transition provider.
 ! **************************************************************************************************
-   SUBROUTINE ecd_periodic_implicit_gamma_current_g4(qs_env, context, gamma_operators, &
-                                                       pseudopotential_commutator)
+   SUBROUTINE ecd_periodic_implicit_gamma_current_g4(qs_env, context, gamma_operators)
       TYPE(qs_environment_type), POINTER                 :: qs_env
       TYPE(ecd_gamma_context_type), INTENT(INOUT), TARGET :: context
       TYPE(ecd_gamma_zero_order_operators_type), INTENT(IN), TARGET :: gamma_operators
-      LOGICAL, INTENT(IN)                                :: pseudopotential_commutator
 
       INTEGER                                            :: idir
       LOGICAL                                            :: gth_available, gth_enabled
@@ -1260,7 +1321,8 @@ CONTAINS
                local_moments_rs, local_momentum_rs, logger, translation_cell_to_index, overlap_images, position)
       xkp_zero = 0.0_dp
       CALL ecd_gamma_context_overlap_images_get(context, overlap_images, translation_cell_to_index)
-      IF (ASSOCIATED(context%current_taylor_real) .OR. ASSOCIATED(context%current_taylor_imag)) THEN
+      IF (ASSOCIATED(context%current_taylor_real) .OR. ASSOCIATED(context%current_taylor_imag) .OR. &
+          ASSOCIATED(context%gth_current_taylor_real) .OR. ASSOCIATED(context%gth_current_taylor_imag)) THEN
          CPABORT("ECD| Stage G4 current Taylor coefficients are already allocated")
       END IF
       CALL ecd_gamma_zero_order_operators_get(gamma_operators, position, local_current, gth_current, complete_current, &
@@ -1269,7 +1331,7 @@ CONTAINS
       CALL ecd_periodic_local_operators_build(local_operators, qs_env, context%ref_point, 1)
       CALL ecd_periodic_local_operators_get(local_operators, local_cell_to_index, local_momentum_rs, &
                                             local_moments_der_rs, local_moments_rs)
-      gth_enabled = pseudopotential_commutator .AND. gth_available
+      gth_enabled = gth_available
       IF (gth_enabled) THEN
          CALL ecd_periodic_gth_operators_build(gth_operators, qs_env, context%direction, context%ref_point, 1)
          CALL ecd_periodic_gth_operators_get(gth_operators, gth_cell_to_index, gth_current_path_rs)
@@ -1309,9 +1371,9 @@ CONTAINS
       CALL dbcsr_deallocate_matrix_set(current_residual)
       context%current_taylor_imag => current_taylor_imag
       context%current_taylor_real => current_taylor_real
-      NULLIFY (current_taylor_imag, current_taylor_real)
-      CALL dbcsr_deallocate_matrix_set(gth_current_taylor_imag)
-      CALL dbcsr_deallocate_matrix_set(gth_current_taylor_real)
+      context%gth_current_taylor_imag => gth_current_taylor_imag
+      context%gth_current_taylor_real => gth_current_taylor_real
+      NULLIFY (current_taylor_imag, current_taylor_real, gth_current_taylor_imag, gth_current_taylor_real)
       CALL ecd_periodic_gth_operators_release(gth_operators)
       CALL ecd_periodic_local_operators_release(local_operators)
 
@@ -1382,31 +1444,47 @@ CONTAINS
 !> \brief Assemble the first-order velocity-gauge causal response from retained Gamma providers.
 ! **************************************************************************************************
    SUBROUTINE ecd_periodic_implicit_gamma_velocity_response_g10(qs_env, context, operators, transition_selection, &
-                                                                 energy_range, npoints, fwhm, response_zero_output, &
-                                                                 response_first_output, diamagnetic_kernel_output, &
-                                                                 transition_output, gth_available_output, &
+                                                                 pseudopotential_commutator, energy_range, npoints, fwhm, &
+                                                                 response_zero_output, response_first_output, &
+                                                                 complete_zero_output, complete_first_output, &
+                                                                 local_zero_output, local_first_output, &
+                                                                 cross_zero_output, cross_first_output, &
+                                                                 nonlocal_zero_output, nonlocal_first_output, &
+                                                                 diamagnetic_kernel_output, transition_output, &
+                                                                 gth_transition_output, gth_available_output, &
                                                                  diamagnetic_kernel_reference)
       TYPE(qs_environment_type), POINTER                 :: qs_env
       TYPE(ecd_gamma_context_type), INTENT(IN), TARGET   :: context
       TYPE(ecd_gamma_zero_order_operators_type), INTENT(IN), TARGET :: operators
       TYPE(ecd_periodic_transition_selection_type), INTENT(IN) :: transition_selection
+      LOGICAL, INTENT(IN)                                :: pseudopotential_commutator
       REAL(KIND=dp), DIMENSION(2), INTENT(IN)            :: energy_range
       INTEGER, INTENT(IN)                                :: npoints
       REAL(KIND=dp), INTENT(IN)                          :: fwhm
       COMPLEX(KIND=dp), ALLOCATABLE, DIMENSION(:, :, :), INTENT(OUT) :: response_first_output, response_zero_output
+      COMPLEX(KIND=dp), ALLOCATABLE, DIMENSION(:, :, :), INTENT(OUT) :: complete_first_output, complete_zero_output, &
+                                                                          cross_first_output, cross_zero_output, &
+                                                                          local_first_output, local_zero_output, &
+                                                                          nonlocal_first_output, nonlocal_zero_output
       REAL(KIND=dp), DIMENSION(ncart, ncart), INTENT(OUT) :: diamagnetic_kernel_output
       COMPLEX(KIND=dp), ALLOCATABLE, DIMENSION(:, :, :), INTENT(OUT) :: transition_output
+      COMPLEX(KIND=dp), ALLOCATABLE, DIMENSION(:, :, :), INTENT(OUT) :: gth_transition_output
       LOGICAL, INTENT(OUT)                               :: gth_available_output
       REAL(KIND=dp), DIMENSION(ncart, ncart), INTENT(IN), OPTIONAL :: diamagnetic_kernel_reference
 
       COMPLEX(KIND=dp), ALLOCATABLE, DIMENSION(:, :)     :: current_first_mo, current_first_rotated, &
                                                             current_zero_mo, current_zero_rotated, &
-                                                            state_first, transition_first
+                                                            gth_first_mo, gth_first_rotated, gth_zero_mo, &
+                                                            gth_zero_rotated, state_first, transition_first
       COMPLEX(KIND=dp), ALLOCATABLE, DIMENSION(:, :, :)  :: current_first_components, current_zero_components, &
-                                                            response_counter, &
-                                                            response_first, response_first_counter, response_resonant, &
-                                                            response_zero
-      COMPLEX(KIND=dp), ALLOCATABLE, DIMENSION(:, :)     :: transition_taylor
+                                                            cross_counter, cross_first_counter, cross_first_resonant, &
+                                                            cross_resonant, local_counter, local_first_counter, &
+                                                            local_first_resonant, local_resonant, nonlocal_counter, &
+                                                            nonlocal_first_counter, nonlocal_first_resonant, &
+                                                            nonlocal_resonant, gth_first_components, &
+                                                            gth_zero_components
+      COMPLEX(KIND=dp), ALLOCATABLE, DIMENSION(:, :)     :: gth_transition_taylor, local_transition_taylor, &
+                                                            transition_taylor
       COMPLEX(KIND=dp), DIMENSION(ncart, ncart, 0:1)     :: counter_taylor, resonant_taylor
       INTEGER                                            :: iband, idir, ipoint, ispin, itransition, ivirt, nmo, &
                                                             ntransitions, ntransitions_total
@@ -1417,15 +1495,21 @@ CONTAINS
                                                             response_first_resonant_norm, response_norm, &
                                                             response_resonant_norm
       REAL(KIND=dp), ALLOCATABLE, DIMENSION(:)           :: gap_taylor
+      REAL(KIND=dp), DIMENSION(ncart, ncart)             :: gth_diamagnetic_kernel, local_diamagnetic_kernel
       TYPE(cp_logger_type), POINTER                      :: logger
       TYPE(dbcsr_p_type), DIMENSION(:), POINTER          :: complete_current, gth_current, local_current, position
 
       NULLIFY (complete_current, gth_current, local_current, logger, position)
-      IF (.NOT. ASSOCIATED(context%current_taylor_real) .OR. .NOT. ASSOCIATED(context%current_taylor_imag)) THEN
+      IF (.NOT. ASSOCIATED(context%current_taylor_real) .OR. .NOT. ASSOCIATED(context%current_taylor_imag) .OR. &
+          .NOT. ASSOCIATED(context%gth_current_taylor_real) .OR. &
+          .NOT. ASSOCIATED(context%gth_current_taylor_imag)) THEN
          CPABORT("ECD| Stage G10 requires retained current Taylor coefficients")
       END IF
       IF (SIZE(context%current_taylor_real, 1) /= ncart .OR. SIZE(context%current_taylor_imag, 1) /= ncart .OR. &
-          SIZE(context%current_taylor_real, 2) < 2 .OR. SIZE(context%current_taylor_imag, 2) < 2) THEN
+          SIZE(context%gth_current_taylor_real, 1) /= ncart .OR. &
+          SIZE(context%gth_current_taylor_imag, 1) /= ncart .OR. &
+          SIZE(context%current_taylor_real, 2) < 2 .OR. SIZE(context%current_taylor_imag, 2) < 2 .OR. &
+          SIZE(context%gth_current_taylor_real, 2) < 2 .OR. SIZE(context%gth_current_taylor_imag, 2) < 2) THEN
          CPABORT("ECD| Stage G10 current Taylor coefficient dimensions are inconsistent")
       END IF
       IF (fwhm <= 0.0_dp) THEN
@@ -1439,15 +1523,28 @@ CONTAINS
                                                gth_available)
       gth_available_output = gth_available
 
-      ALLOCATE (response_counter(ncart, ncart, npoints), &
-                response_first(ncart, ncart, npoints), response_first_counter(ncart, ncart, npoints), &
-                response_resonant(ncart, ncart, npoints), response_zero(ncart, ncart, npoints))
-      response_counter = CMPLX(0.0_dp, 0.0_dp, KIND=dp)
-      response_first = CMPLX(0.0_dp, 0.0_dp, KIND=dp)
-      response_first_counter = CMPLX(0.0_dp, 0.0_dp, KIND=dp)
-      response_resonant = CMPLX(0.0_dp, 0.0_dp, KIND=dp)
+      ALLOCATE (cross_counter(ncart, ncart, npoints), cross_first_counter(ncart, ncart, npoints), &
+                cross_first_resonant(ncart, ncart, npoints), cross_resonant(ncart, ncart, npoints), &
+                local_counter(ncart, ncart, npoints), local_first_counter(ncart, ncart, npoints), &
+                local_first_resonant(ncart, ncart, npoints), local_resonant(ncart, ncart, npoints), &
+                nonlocal_counter(ncart, ncart, npoints), nonlocal_first_counter(ncart, ncart, npoints), &
+                nonlocal_first_resonant(ncart, ncart, npoints), nonlocal_resonant(ncart, ncart, npoints))
+      cross_counter = CMPLX(0.0_dp, 0.0_dp, KIND=dp)
+      cross_first_counter = CMPLX(0.0_dp, 0.0_dp, KIND=dp)
+      cross_first_resonant = CMPLX(0.0_dp, 0.0_dp, KIND=dp)
+      cross_resonant = CMPLX(0.0_dp, 0.0_dp, KIND=dp)
+      local_counter = CMPLX(0.0_dp, 0.0_dp, KIND=dp)
+      local_first_counter = CMPLX(0.0_dp, 0.0_dp, KIND=dp)
+      local_first_resonant = CMPLX(0.0_dp, 0.0_dp, KIND=dp)
+      local_resonant = CMPLX(0.0_dp, 0.0_dp, KIND=dp)
+      nonlocal_counter = CMPLX(0.0_dp, 0.0_dp, KIND=dp)
+      nonlocal_first_counter = CMPLX(0.0_dp, 0.0_dp, KIND=dp)
+      nonlocal_first_resonant = CMPLX(0.0_dp, 0.0_dp, KIND=dp)
+      nonlocal_resonant = CMPLX(0.0_dp, 0.0_dp, KIND=dp)
       ALLOCATE (transition_output(ncart, 0:1, transition_selection%selected_count))
       transition_output = CMPLX(0.0_dp, 0.0_dp, KIND=dp)
+      ALLOCATE (gth_transition_output(ncart, 0:1, transition_selection%selected_count))
+      gth_transition_output = CMPLX(0.0_dp, 0.0_dp, KIND=dp)
 
       logger => cp_get_default_logger()
       ntransitions_total = 0
@@ -1469,7 +1566,8 @@ CONTAINS
              SIZE(context%spin(ispin)%coefficient_first, 2) /= nmo) THEN
             CPABORT("ECD| Stage G10 retained state-response dimensions are inconsistent")
          END IF
-         ALLOCATE (current_first_components(nmo, nmo, ncart), current_zero_components(nmo, nmo, ncart))
+         ALLOCATE (current_first_components(nmo, nmo, ncart), current_zero_components(nmo, nmo, ncart), &
+                   gth_first_components(nmo, nmo, ncart), gth_zero_components(nmo, nmo, ncart))
          DO idir = 1, ncart
             CALL ecd_project_complex_operator_to_mo(context%current_taylor_real(idir, 1), &
                                                     context%current_taylor_imag(idir, 1), &
@@ -1479,23 +1577,43 @@ CONTAINS
                                                     context%current_taylor_imag(idir, 2), &
                                                     context%spin(ispin)%mo_coeff, context%spin(ispin)%nao, nmo, &
                                                     current_first_mo)
+            CALL ecd_project_complex_operator_to_mo(context%gth_current_taylor_real(idir, 1), &
+                                                    context%gth_current_taylor_imag(idir, 1), &
+                                                    context%spin(ispin)%mo_coeff, context%spin(ispin)%nao, nmo, &
+                                                    gth_zero_mo)
+            CALL ecd_project_complex_operator_to_mo(context%gth_current_taylor_real(idir, 2), &
+                                                    context%gth_current_taylor_imag(idir, 2), &
+                                                    context%spin(ispin)%mo_coeff, context%spin(ispin)%nao, nmo, &
+                                                    gth_first_mo)
             ALLOCATE (current_first_rotated(nmo, nmo), current_zero_rotated(nmo, nmo), &
+                      gth_first_rotated(nmo, nmo), gth_zero_rotated(nmo, nmo), &
                       state_first(nmo, nmo), transition_first(nmo, nmo))
             current_zero_rotated = MATMUL(CONJG(TRANSPOSE(context%spin(ispin)%band_rotation)), &
                                            MATMUL(current_zero_mo, context%spin(ispin)%band_rotation))
             current_first_rotated = MATMUL(CONJG(TRANSPOSE(context%spin(ispin)%band_rotation)), &
                                             MATMUL(current_first_mo, context%spin(ispin)%band_rotation))
+            gth_zero_rotated = MATMUL(CONJG(TRANSPOSE(context%spin(ispin)%band_rotation)), &
+                                      MATMUL(gth_zero_mo, context%spin(ispin)%band_rotation))
+            gth_first_rotated = MATMUL(CONJG(TRANSPOSE(context%spin(ispin)%band_rotation)), &
+                                       MATMUL(gth_first_mo, context%spin(ispin)%band_rotation))
             state_first = 0.5_dp*(MATMUL(CONJG(TRANSPOSE(context%spin(ispin)%coefficient_first)), &
                                           current_zero_rotated) - &
                                     MATMUL(current_zero_rotated, context%spin(ispin)%coefficient_first))
             transition_first = current_first_rotated + state_first
             current_zero_components(:, :, idir) = current_zero_rotated
             current_first_components(:, :, idir) = transition_first
+            state_first = 0.5_dp*(MATMUL(CONJG(TRANSPOSE(context%spin(ispin)%coefficient_first)), &
+                                         gth_zero_rotated) - &
+                                   MATMUL(gth_zero_rotated, context%spin(ispin)%coefficient_first))
+            gth_first_components(:, :, idir) = gth_first_rotated + state_first
+            gth_zero_components(:, :, idir) = gth_zero_rotated
             DEALLOCATE (current_first_mo, current_first_rotated, current_zero_mo, current_zero_rotated, &
-                        state_first, transition_first)
+                        gth_first_mo, gth_first_rotated, gth_zero_mo, gth_zero_rotated, state_first, &
+                        transition_first)
          END DO
 
-         ALLOCATE (gap_taylor(0:1), transition_taylor(ncart, 0:1))
+         ALLOCATE (gap_taylor(0:1), gth_transition_taylor(ncart, 0:1), &
+                   local_transition_taylor(ncart, 0:1), transition_taylor(ncart, 0:1))
          ntransitions = 0
          DO itransition = 1, transition_selection%selected_count
             IF (transition_selection%ispin(itransition) /= ispin) CYCLE
@@ -1510,16 +1628,38 @@ CONTAINS
             DO idir = 1, ncart
                transition_taylor(idir, 0) = current_zero_components(ivirt, iband, idir)
                transition_taylor(idir, 1) = current_first_components(ivirt, iband, idir)
+               gth_transition_taylor(idir, 0) = gth_zero_components(ivirt, iband, idir)
+               gth_transition_taylor(idir, 1) = gth_first_components(ivirt, iband, idir)
             END DO
+            local_transition_taylor = transition_taylor - gth_transition_taylor
             transition_output(:, :, itransition) = transition_taylor
+            gth_transition_output(:, :, itransition) = gth_transition_taylor
             ntransitions = ntransitions + 1
-            CALL ecd_periodic_response_add_transition(transition_taylor, gap_taylor, occupation_difference, &
-                                                      cell_volume, energy_range, fwhm, response_resonant, &
-                                                      response_counter, response_first, response_first_counter, &
-                                                      resonant_taylor, counter_taylor)
+            CALL ecd_periodic_response_add_transition_pair(local_transition_taylor, local_transition_taylor, &
+                                                            gap_taylor, occupation_difference, cell_volume, &
+                                                            energy_range, fwhm, local_resonant, local_counter, &
+                                                            local_first_resonant, local_first_counter, &
+                                                            resonant_taylor, counter_taylor)
+            CALL ecd_periodic_response_add_transition_pair(local_transition_taylor, gth_transition_taylor, &
+                                                            gap_taylor, occupation_difference, cell_volume, &
+                                                            energy_range, fwhm, cross_resonant, cross_counter, &
+                                                            cross_first_resonant, cross_first_counter, &
+                                                            resonant_taylor, counter_taylor)
+            CALL ecd_periodic_response_add_transition_pair(gth_transition_taylor, local_transition_taylor, &
+                                                            gap_taylor, occupation_difference, cell_volume, &
+                                                            energy_range, fwhm, cross_resonant, cross_counter, &
+                                                            cross_first_resonant, cross_first_counter, &
+                                                            resonant_taylor, counter_taylor)
+            CALL ecd_periodic_response_add_transition_pair(gth_transition_taylor, gth_transition_taylor, &
+                                                            gap_taylor, occupation_difference, cell_volume, &
+                                                            energy_range, fwhm, nonlocal_resonant, nonlocal_counter, &
+                                                            nonlocal_first_resonant, nonlocal_first_counter, &
+                                                            resonant_taylor, counter_taylor)
          END DO
          ntransitions_total = ntransitions_total + ntransitions
-         DEALLOCATE (current_first_components, current_zero_components, gap_taylor, transition_taylor)
+         DEALLOCATE (current_first_components, current_zero_components, gth_first_components, &
+                     gth_zero_components, gap_taylor, gth_transition_taylor, local_transition_taylor, &
+                     transition_taylor)
       END DO
       IF (ntransitions_total /= transition_selection%selected_count) THEN
          CPABORT('ECD| Stage G10 transition selection is inconsistent with the Gamma spin space')
@@ -1527,31 +1667,61 @@ CONTAINS
 
       IF (PRESENT(diamagnetic_kernel_reference)) THEN
          diamagnetic_kernel_output = diamagnetic_kernel_reference
+         CALL ecd_periodic_implicit_gamma_diamagnetic_kernel(qs_env, context, gth_available, &
+                                                              local_diamagnetic_kernel, gth_diamagnetic_kernel, &
+                                                              diamagnetic_kernel_output)
       ELSE
-         CALL ecd_periodic_implicit_gamma_diamagnetic_kernel(qs_env, context, gth_available, diamagnetic_kernel_output)
+         CALL ecd_periodic_implicit_gamma_diamagnetic_kernel(qs_env, context, gth_available, &
+                                                              local_diamagnetic_kernel, gth_diamagnetic_kernel, &
+                                                              diamagnetic_kernel_output)
       END IF
-      response_zero = response_resonant + response_counter
+      ALLOCATE (complete_zero_output(ncart, ncart, npoints), complete_first_output(ncart, ncart, npoints), &
+                local_zero_output(ncart, ncart, npoints), local_first_output(ncart, ncart, npoints), &
+                cross_zero_output(ncart, ncart, npoints), cross_first_output(ncart, ncart, npoints), &
+                nonlocal_zero_output(ncart, ncart, npoints), nonlocal_first_output(ncart, ncart, npoints))
+      local_zero_output = local_resonant + local_counter
+      local_first_output = local_first_resonant + local_first_counter
+      cross_zero_output = cross_resonant + cross_counter
+      cross_first_output = cross_first_resonant + cross_first_counter
+      nonlocal_zero_output = nonlocal_resonant + nonlocal_counter
+      nonlocal_first_output = nonlocal_first_resonant + nonlocal_first_counter
       DO ipoint = 1, npoints
          photon_energy = energy_range(1) + REAL(ipoint - 1, KIND=dp)* &
                          (energy_range(2) - energy_range(1))/REAL(npoints - 1, KIND=dp)
          prefactor = 2.0_dp*twopi/(cell_volume*photon_energy**2)
-         response_zero(:, :, ipoint) = response_zero(:, :, ipoint) + &
-                                        CMPLX(prefactor*diamagnetic_kernel_output, 0.0_dp, KIND=dp)
+         local_zero_output(:, :, ipoint) = local_zero_output(:, :, ipoint) + &
+                                           CMPLX(prefactor*local_diamagnetic_kernel, 0.0_dp, KIND=dp)
+         nonlocal_zero_output(:, :, ipoint) = nonlocal_zero_output(:, :, ipoint) + &
+                                              CMPLX(prefactor*gth_diamagnetic_kernel, 0.0_dp, KIND=dp)
       END DO
-      response_first = response_first + response_first_counter
+      complete_zero_output = local_zero_output + cross_zero_output + nonlocal_zero_output
+      complete_first_output = local_first_output + cross_first_output + nonlocal_first_output
+
+      ALLOCATE (response_zero_output(ncart, ncart, npoints), response_first_output(ncart, ncart, npoints))
+      response_zero_output = complete_zero_output
+      response_first_output = complete_first_output
+      IF (.NOT. pseudopotential_commutator) THEN
+         response_zero_output = local_zero_output
+         response_first_output = local_first_output
+      END IF
 
       ipoint = (npoints + 1)/2
       photon_energy = energy_range(1) + REAL(ipoint - 1, KIND=dp)* &
                      (energy_range(2) - energy_range(1))/REAL(npoints - 1, KIND=dp)
-      response_resonant_norm = SQRT(SUM(ABS(response_resonant(:, :, ipoint))**2))
-      response_counter_norm = SQRT(SUM(ABS(response_counter(:, :, ipoint))**2))
-      response_first_resonant_norm = SQRT(SUM(ABS(response_first(:, :, ipoint) - &
-                                                       response_first_counter(:, :, ipoint))**2))
-      response_first_counter_norm = SQRT(SUM(ABS(response_first_counter(:, :, ipoint))**2))
-      response_norm = SQRT(SUM(ABS(response_zero(:, :, ipoint))**2))
-      response_first_norm = SQRT(SUM(ABS(response_first(:, :, ipoint))**2))
-      antisymmetric_first_norm = 0.5_dp*SQRT(SUM(ABS(response_first(:, :, ipoint) - &
-                                                       TRANSPOSE(response_first(:, :, ipoint)))**2))
+      response_resonant_norm = SQRT(SUM(ABS(local_resonant(:, :, ipoint) + cross_resonant(:, :, ipoint) + &
+                                             nonlocal_resonant(:, :, ipoint))**2))
+      response_counter_norm = SQRT(SUM(ABS(local_counter(:, :, ipoint) + cross_counter(:, :, ipoint) + &
+                                            nonlocal_counter(:, :, ipoint))**2))
+      response_first_resonant_norm = SQRT(SUM(ABS(local_first_resonant(:, :, ipoint) + &
+                                                   cross_first_resonant(:, :, ipoint) + &
+                                                   nonlocal_first_resonant(:, :, ipoint))**2))
+      response_first_counter_norm = SQRT(SUM(ABS(local_first_counter(:, :, ipoint) + &
+                                                  cross_first_counter(:, :, ipoint) + &
+                                                  nonlocal_first_counter(:, :, ipoint))**2))
+      response_norm = SQRT(SUM(ABS(complete_zero_output(:, :, ipoint))**2))
+      response_first_norm = SQRT(SUM(ABS(complete_first_output(:, :, ipoint))**2))
+      antisymmetric_first_norm = 0.5_dp*SQRT(SUM(ABS(complete_first_output(:, :, ipoint) - &
+                                                       TRANSPOSE(complete_first_output(:, :, ipoint)))**2))
       IF (cp_logger_get_default_io_unit(logger) > 0) THEN
          WRITE (cp_logger_get_default_io_unit(logger), '(T2,A,T55,I10)') &
             'ECD| Stage G10 velocity response grid points', npoints
@@ -1572,27 +1742,24 @@ CONTAINS
          WRITE (cp_logger_get_default_io_unit(logger), '(T2,A,T55,ES14.6)') &
             'ECD| Stage G10 midpoint antisymmetric first-order norm', antisymmetric_first_norm
       END IF
-      ALLOCATE (response_zero_output(ncart, ncart, npoints), response_first_output(ncart, ncart, npoints))
-      response_zero_output = response_zero
-      response_first_output = response_first
-      DEALLOCATE (response_counter, response_first, response_first_counter, response_resonant, response_zero)
+      DEALLOCATE (cross_counter, cross_first_counter, cross_first_resonant, cross_resonant, local_counter, &
+                  local_first_counter, local_first_resonant, local_resonant, nonlocal_counter, &
+                  nonlocal_first_counter, nonlocal_first_resonant, nonlocal_resonant)
 
    END SUBROUTINE ecd_periodic_implicit_gamma_velocity_response_g10
 
 ! **************************************************************************************************
-!> \brief Assemble the first-order length-gauge causal response and compare it with the velocity tensor.
+!> \brief Assemble the first-order direct length-polarization response and compare it with the velocity tensor.
 ! **************************************************************************************************
    SUBROUTINE ecd_periodic_implicit_gamma_length_response_g13(context, transition_selection, energy_range, npoints, &
                                                                fwhm, velocity_response_zero, velocity_response_first, &
-                                                               diamagnetic_kernel, response_zero_output, response_first_output, &
-                                                               transition_output)
+                                                               response_zero_output, response_first_output, transition_output)
       TYPE(ecd_gamma_context_type), INTENT(IN), TARGET   :: context
       TYPE(ecd_periodic_transition_selection_type), INTENT(IN) :: transition_selection
       REAL(KIND=dp), DIMENSION(2), INTENT(IN)            :: energy_range
       INTEGER, INTENT(IN)                                :: npoints
       REAL(KIND=dp), INTENT(IN)                          :: fwhm
       COMPLEX(KIND=dp), DIMENSION(:, :, :), INTENT(IN)   :: velocity_response_first, velocity_response_zero
-      REAL(KIND=dp), DIMENSION(ncart, ncart), INTENT(IN) :: diamagnetic_kernel
       COMPLEX(KIND=dp), ALLOCATABLE, DIMENSION(:, :, :), INTENT(OUT) :: response_first_output, response_zero_output
       COMPLEX(KIND=dp), ALLOCATABLE, DIMENSION(:, :, :), INTENT(OUT) :: transition_output
 
@@ -1610,7 +1777,7 @@ CONTAINS
                                                             gauge_first_relative_max, gauge_first_relative_norm, &
                                                             gauge_zero_residual_max, gauge_zero_residual_norm, &
                                                             gauge_zero_relative_max, gauge_zero_relative_norm, &
-                                                            occupation_difference, photon_energy, prefactor, &
+                                                            occupation_difference, photon_energy, &
                                                             response_counter_norm, response_first_counter_norm, &
                                                             response_first_norm, response_first_resonant_norm, &
                                                             response_norm, response_resonant_norm
@@ -1662,17 +1829,16 @@ CONTAINS
             gap_taylor(0) = gap
             gap_taylor(1) = gap_derivative
             DO idir = 1, ncart
-               transition_taylor(idir, 0) = -gap*length_zero_components(ivirt, iband, idir)
-               transition_taylor(idir, 1) = -gap_derivative*length_zero_components(ivirt, iband, idir) - &
-                                             gap*(length_first_operator_components(ivirt, iband, idir) + &
-                                                  length_first_state_components(ivirt, iband, idir))
+               transition_taylor(idir, 0) = length_zero_components(ivirt, iband, idir)
+               transition_taylor(idir, 1) = length_first_operator_components(ivirt, iband, idir) + &
+                                             length_first_state_components(ivirt, iband, idir)
             END DO
             transition_output(:, :, itransition) = transition_taylor
             ntransitions = ntransitions + 1
-            CALL ecd_periodic_response_add_transition(transition_taylor, gap_taylor, occupation_difference, &
-                                                      cell_volume, energy_range, fwhm, response_resonant, &
-                                                      response_counter, response_first_resonant, &
-                                                      response_first_counter, resonant_taylor, counter_taylor)
+            CALL ecd_periodic_length_response_add_transition(transition_taylor, gap_taylor, occupation_difference, &
+                                                              cell_volume, energy_range, fwhm, response_resonant, &
+                                                              response_counter, response_first_resonant, &
+                                                              response_first_counter, resonant_taylor, counter_taylor)
          END DO
          ntransitions_total = ntransitions_total + ntransitions
          DEALLOCATE (length_first_operator_components, length_first_state_components, length_zero_components, &
@@ -1684,13 +1850,6 @@ CONTAINS
 
       response_zero = response_resonant + response_counter
       response_first = response_first_resonant + response_first_counter
-      DO ipoint = 1, npoints
-         photon_energy = energy_range(1) + REAL(ipoint - 1, KIND=dp)* &
-                         (energy_range(2) - energy_range(1))/REAL(npoints - 1, KIND=dp)
-         prefactor = 2.0_dp*twopi/(cell_volume*photon_energy**2)
-         response_zero(:, :, ipoint) = response_zero(:, :, ipoint) + &
-                                        CMPLX(prefactor*diamagnetic_kernel, 0.0_dp, KIND=dp)
-      END DO
 
       gauge_zero_residual_max = 0.0_dp
       gauge_first_residual_max = 0.0_dp
@@ -1842,6 +2001,129 @@ CONTAINS
    END SUBROUTINE ecd_periodic_response_add_transition
 
 ! **************************************************************************************************
+!> \brief Add one bilinear current-transition Taylor series to a retarded dielectric grid.
+! **************************************************************************************************
+   SUBROUTINE ecd_periodic_response_add_transition_pair(left_transition_taylor, right_transition_taylor, &
+                                                         gap_taylor, occupation_difference, cell_volume, &
+                                                         energy_range, fwhm, response_resonant, response_counter, &
+                                                         response_first_resonant, response_first_counter, &
+                                                         resonant_taylor, counter_taylor)
+      COMPLEX(KIND=dp), DIMENSION(:, 0:), INTENT(IN)     :: left_transition_taylor, right_transition_taylor
+      COMPLEX(KIND=dp), DIMENSION(:, :, :), INTENT(INOUT) :: response_counter, response_first_counter, &
+                                                             response_first_resonant, response_resonant
+      COMPLEX(KIND=dp), DIMENSION(:, :, 0:), INTENT(OUT) :: counter_taylor, resonant_taylor
+      INTEGER                                            :: ipoint, npoints
+      REAL(KIND=dp), DIMENSION(0:), INTENT(IN)           :: gap_taylor
+      REAL(KIND=dp), INTENT(IN)                          :: cell_volume, fwhm, occupation_difference
+      REAL(KIND=dp), DIMENSION(2), INTENT(IN)            :: energy_range
+      REAL(KIND=dp)                                      :: photon_energy, prefactor
+
+      npoints = SIZE(response_resonant, 3)
+      IF (SIZE(left_transition_taylor, 1) /= ncart .OR. SIZE(right_transition_taylor, 1) /= ncart .OR. &
+          LBOUND(left_transition_taylor, 2) /= 0 .OR. LBOUND(right_transition_taylor, 2) /= 0 .OR. &
+          UBOUND(left_transition_taylor, 2) /= 1 .OR. UBOUND(right_transition_taylor, 2) /= 1 .OR. &
+          LBOUND(gap_taylor, 1) /= 0 .OR. UBOUND(gap_taylor, 1) /= 1) THEN
+         CPABORT('ECD| Bilinear retarded response requires first-order transition and gap Taylor coefficients')
+      END IF
+      IF (npoints < 2 .OR. cell_volume <= 0.0_dp .OR. fwhm <= 0.0_dp .OR. &
+          energy_range(1) <= 0.0_dp .OR. energy_range(1) >= energy_range(2)) THEN
+         CPABORT('ECD| Bilinear retarded response received an invalid response grid')
+      END IF
+      IF (SIZE(response_resonant, 1) /= ncart .OR. SIZE(response_resonant, 2) /= ncart .OR. &
+          SIZE(response_counter, 1) /= ncart .OR. SIZE(response_counter, 2) /= ncart .OR. &
+          SIZE(response_first_resonant, 1) /= ncart .OR. SIZE(response_first_resonant, 2) /= ncart .OR. &
+          SIZE(response_first_counter, 1) /= ncart .OR. SIZE(response_first_counter, 2) /= ncart .OR. &
+          SIZE(response_counter, 3) /= npoints .OR. SIZE(response_first_resonant, 3) /= npoints .OR. &
+          SIZE(response_first_counter, 3) /= npoints) THEN
+         CPABORT('ECD| Bilinear retarded response received incompatible response tensors')
+      END IF
+      IF (SIZE(resonant_taylor, 1) /= ncart .OR. SIZE(resonant_taylor, 2) /= ncart .OR. &
+          SIZE(counter_taylor, 1) /= ncart .OR. SIZE(counter_taylor, 2) /= ncart .OR. &
+          LBOUND(resonant_taylor, 3) /= 0 .OR. UBOUND(resonant_taylor, 3) /= 1 .OR. &
+          LBOUND(counter_taylor, 3) /= 0 .OR. UBOUND(counter_taylor, 3) /= 1) THEN
+         CPABORT('ECD| Bilinear retarded response received incompatible Taylor work tensors')
+      END IF
+
+      DO ipoint = 1, npoints
+         photon_energy = energy_range(1) + REAL(ipoint - 1, KIND=dp)* &
+                         (energy_range(2) - energy_range(1))/REAL(npoints - 1, KIND=dp)
+         prefactor = -2.0_dp*twopi/(cell_volume*photon_energy**2)
+         CALL ecd_taylor_retarded_response_pair(left_transition_taylor, right_transition_taylor, gap_taylor, &
+                                                 photon_energy, 0.5_dp*fwhm, resonant_taylor, counter_taylor)
+         response_resonant(:, :, ipoint) = response_resonant(:, :, ipoint) + &
+                                            prefactor*occupation_difference*resonant_taylor(:, :, 0)
+         response_counter(:, :, ipoint) = response_counter(:, :, ipoint) + &
+                                           prefactor*occupation_difference*counter_taylor(:, :, 0)
+         response_first_resonant(:, :, ipoint) = response_first_resonant(:, :, ipoint) + &
+                                                  prefactor*occupation_difference*resonant_taylor(:, :, 1)
+         response_first_counter(:, :, ipoint) = response_first_counter(:, :, ipoint) + &
+                                                 prefactor*occupation_difference*counter_taylor(:, :, 1)
+      END DO
+
+   END SUBROUTINE ecd_periodic_response_add_transition_pair
+
+! **************************************************************************************************
+!> \brief Add one direct length-polarization transition Taylor series to a retarded dielectric grid.
+! **************************************************************************************************
+   SUBROUTINE ecd_periodic_length_response_add_transition(transition_taylor, gap_taylor, occupation_difference, &
+                                                           cell_volume, energy_range, fwhm, response_resonant, &
+                                                           response_counter, response_first_resonant, &
+                                                           response_first_counter, resonant_taylor, counter_taylor)
+      COMPLEX(KIND=dp), DIMENSION(:, 0:), INTENT(IN)     :: transition_taylor
+      COMPLEX(KIND=dp), DIMENSION(:, :, :), INTENT(INOUT) :: response_counter, response_first_counter, &
+                                                             response_first_resonant, response_resonant
+      COMPLEX(KIND=dp), DIMENSION(:, :, 0:), INTENT(OUT) :: counter_taylor, resonant_taylor
+      INTEGER                                            :: ipoint, ncart_local, npoints
+      REAL(KIND=dp), DIMENSION(0:), INTENT(IN)           :: gap_taylor
+      REAL(KIND=dp), INTENT(IN)                          :: cell_volume, fwhm, occupation_difference
+      REAL(KIND=dp), DIMENSION(2), INTENT(IN)            :: energy_range
+      REAL(KIND=dp)                                      :: photon_energy, prefactor
+
+      ncart_local = SIZE(transition_taylor, 1)
+      npoints = SIZE(response_resonant, 3)
+      IF (ncart_local /= ncart .OR. LBOUND(transition_taylor, 2) /= 0 .OR. &
+          UBOUND(transition_taylor, 2) /= 1 .OR. LBOUND(gap_taylor, 1) /= 0 .OR. &
+          UBOUND(gap_taylor, 1) /= 1) THEN
+         CPABORT('ECD| Direct length response requires first-order transition and gap Taylor coefficients')
+      END IF
+      IF (npoints < 2 .OR. cell_volume <= 0.0_dp .OR. fwhm <= 0.0_dp .OR. &
+          energy_range(1) <= 0.0_dp .OR. energy_range(1) >= energy_range(2)) THEN
+         CPABORT('ECD| Direct length response received an invalid response grid')
+      END IF
+      IF (SIZE(response_resonant, 1) /= ncart .OR. SIZE(response_resonant, 2) /= ncart .OR. &
+          SIZE(response_counter, 1) /= ncart .OR. SIZE(response_counter, 2) /= ncart .OR. &
+          SIZE(response_first_resonant, 1) /= ncart .OR. SIZE(response_first_resonant, 2) /= ncart .OR. &
+          SIZE(response_first_counter, 1) /= ncart .OR. SIZE(response_first_counter, 2) /= ncart .OR. &
+          SIZE(response_counter, 3) /= npoints .OR. SIZE(response_first_resonant, 3) /= npoints .OR. &
+          SIZE(response_first_counter, 3) /= npoints) THEN
+         CPABORT('ECD| Direct length response received incompatible response tensors')
+      END IF
+      IF (SIZE(resonant_taylor, 1) /= ncart .OR. SIZE(resonant_taylor, 2) /= ncart .OR. &
+          SIZE(counter_taylor, 1) /= ncart .OR. SIZE(counter_taylor, 2) /= ncart .OR. &
+          LBOUND(resonant_taylor, 3) /= 0 .OR. UBOUND(resonant_taylor, 3) /= 1 .OR. &
+          LBOUND(counter_taylor, 3) /= 0 .OR. UBOUND(counter_taylor, 3) /= 1) THEN
+         CPABORT('ECD| Direct length response received incompatible Taylor work tensors')
+      END IF
+
+      prefactor = -2.0_dp*twopi/cell_volume
+      DO ipoint = 1, npoints
+         photon_energy = energy_range(1) + REAL(ipoint - 1, KIND=dp)* &
+                         (energy_range(2) - energy_range(1))/REAL(npoints - 1, KIND=dp)
+         CALL ecd_taylor_retarded_response(transition_taylor, gap_taylor, photon_energy, 0.5_dp*fwhm, &
+                                            resonant_taylor, counter_taylor)
+         response_resonant(:, :, ipoint) = response_resonant(:, :, ipoint) + &
+                                            prefactor*occupation_difference*resonant_taylor(:, :, 0)
+         response_counter(:, :, ipoint) = response_counter(:, :, ipoint) + &
+                                           prefactor*occupation_difference*counter_taylor(:, :, 0)
+         response_first_resonant(:, :, ipoint) = response_first_resonant(:, :, ipoint) + &
+                                                  prefactor*occupation_difference*resonant_taylor(:, :, 1)
+         response_first_counter(:, :, ipoint) = response_first_counter(:, :, ipoint) + &
+                                                 prefactor*occupation_difference*counter_taylor(:, :, 1)
+      END DO
+
+   END SUBROUTINE ecd_periodic_length_response_add_transition
+
+! **************************************************************************************************
 !> \brief Validate that the q=0 response is independent of the Cartesian q-derivative direction.
 ! **************************************************************************************************
    SUBROUTINE ecd_periodic_response_zero_check(reference_response, candidate_response, representation_label)
@@ -1871,10 +2153,12 @@ CONTAINS
 !> \brief Assemble the folded local plus GTH diamagnetic kernel at implicit Gamma.
 ! **************************************************************************************************
    SUBROUTINE ecd_periodic_implicit_gamma_diamagnetic_kernel(qs_env, context, gth_available, &
+                                                              local_kernel_output, gth_kernel_output, &
                                                               diamagnetic_kernel)
       TYPE(qs_environment_type), POINTER                 :: qs_env
       TYPE(ecd_gamma_context_type), INTENT(IN)           :: context
       LOGICAL, INTENT(IN)                                :: gth_available
+      REAL(KIND=dp), DIMENSION(ncart, ncart), INTENT(OUT) :: local_kernel_output, gth_kernel_output
       REAL(KIND=dp), DIMENSION(ncart, ncart), INTENT(OUT) :: diamagnetic_kernel
 
       REAL(KIND=dp), PARAMETER                           :: fd_step = 1.0E-4_dp
@@ -1946,6 +2230,8 @@ CONTAINS
       END IF
 
       diamagnetic_kernel = local_kernel + gth_kernel
+      local_kernel_output = local_kernel
+      gth_kernel_output = gth_kernel
       logger => cp_get_default_logger()
       IF (cp_logger_get_default_io_unit(logger) > 0) THEN
          DO ia = 1, ncart
@@ -1966,13 +2252,15 @@ CONTAINS
 !> \brief Write complete Cartesian first-order periodic IPA response tensors.
 ! **************************************************************************************************
    SUBROUTINE ecd_periodic_print_cartesian_response(ecd_section, energy_range, velocity_zero, velocity_first, &
-                                                    length_zero, length_first, context, gth_available, fwhm, selection)
+                                                    length_zero, length_first, context, gth_available, &
+                                                    pseudopotential_commutator, fwhm, selection)
       TYPE(section_vals_type), POINTER                   :: ecd_section
       REAL(KIND=dp), DIMENSION(2), INTENT(IN)            :: energy_range
       COMPLEX(KIND=dp), DIMENSION(:, :, :), INTENT(IN)   :: length_zero, velocity_zero
       COMPLEX(KIND=dp), DIMENSION(:, :, :, :), INTENT(IN) :: length_first, velocity_first
       TYPE(ecd_gamma_context_type), INTENT(IN)           :: context
       LOGICAL, INTENT(IN)                                :: gth_available
+      LOGICAL, INTENT(IN)                                :: pseudopotential_commutator
       REAL(KIND=dp), INTENT(IN)                          :: fwhm
       TYPE(ecd_periodic_transition_selection_type), INTENT(IN) :: selection
 
@@ -2007,7 +2295,7 @@ CONTAINS
       IF (response_unit <= 0) RETURN
 
       WRITE (response_unit, '(A)') '# CP2K periodic ECD Cartesian dielectric response'
-      WRITE (response_unit, '(A)') '# Format_version 4'
+      WRITE (response_unit, '(A)') '# Format_version 6'
       WRITE (response_unit, '(A)') '# Gamma_layout IMPLICIT'
       WRITE (response_unit, '(A)') '# Electric_representations VELOCITY LENGTH'
       WRITE (response_unit, '(A,1X,L1)') '# GTH_current_available', gth_available
@@ -2020,7 +2308,12 @@ CONTAINS
       WRITE (response_unit, '(A,1X,ES18.10E3)') '# Transition_cutoff_gap_hartree', selection%cutoff_gap
       WRITE (response_unit, '(A,2(1X,ES18.10E3))') '# Energy_range_hartree', energy_range
       WRITE (response_unit, '(A,1X,I0)') '# NPOINTS', SIZE(velocity_zero, 3)
-      WRITE (response_unit, '(A)') '# epsilon0 includes the vacuum identity for both electric representations.'
+      IF (pseudopotential_commutator) THEN
+         WRITE (response_unit, '(A)') '# Velocity epsilon uses the complete current plus diamagnetic kernel.'
+      ELSE
+         WRITE (response_unit, '(A)') '# Velocity epsilon uses the local-current ablation plus local diamagnetic kernel.'
+      END IF
+      WRITE (response_unit, '(A)') '# Length epsilon uses direct length-polarization transitions without a diamagnetic kernel.'
       WRITE (response_unit, '(A)') '# epsilon1_abq stores the q_x, q_y, q_z Cartesian derivative components.'
       WRITE (response_unit, '(A)', ADVANCE='NO') '# Columns: Energy_hartree Energy_eV'
       DO idir = 1, 2
@@ -2098,29 +2391,145 @@ CONTAINS
    END SUBROUTINE ecd_periodic_print_cartesian_response
 
 ! **************************************************************************************************
+!> \brief Write additive local, cross, nonlocal, and complete velocity susceptibilities.
+! **************************************************************************************************
+   SUBROUTINE ecd_periodic_print_cartesian_velocity_decomposition(ecd_section, energy_range, local_zero, local_first, &
+                                                                   cross_zero, cross_first, nonlocal_zero, nonlocal_first, &
+                                                                   complete_zero, complete_first, context, gth_available, &
+                                                                   fwhm, selection)
+      TYPE(section_vals_type), POINTER                   :: ecd_section
+      REAL(KIND=dp), DIMENSION(2), INTENT(IN)            :: energy_range
+      COMPLEX(KIND=dp), DIMENSION(:, :, :), INTENT(IN)   :: complete_zero, cross_zero, local_zero, nonlocal_zero
+      COMPLEX(KIND=dp), DIMENSION(:, :, :, :), INTENT(IN) :: complete_first, cross_first, local_first, nonlocal_first
+      TYPE(ecd_gamma_context_type), INTENT(IN)           :: context
+      LOGICAL, INTENT(IN)                                :: gth_available
+      REAL(KIND=dp), INTENT(IN)                          :: fwhm
+      TYPE(ecd_periodic_transition_selection_type), INTENT(IN) :: selection
+
+      CHARACTER(LEN=default_path_length)                 :: decomposition_filename
+      COMPLEX(KIND=dp)                                   :: response_value
+      INTEGER                                            :: ia, ib, icomponent, idir, ipoint, decomposition_unit
+      REAL(KIND=dp)                                      :: closure_first, closure_zero, photon_energy
+      TYPE(cp_logger_type), POINTER                      :: logger
+      TYPE(section_vals_type), POINTER                   :: tensor_print_key
+
+      IF (SIZE(complete_zero, 1) /= ncart .OR. SIZE(complete_zero, 2) /= ncart .OR. &
+          SIZE(complete_zero, 3) < 2 .OR. ANY(SHAPE(local_zero) /= SHAPE(complete_zero)) .OR. &
+          ANY(SHAPE(cross_zero) /= SHAPE(complete_zero)) .OR. ANY(SHAPE(nonlocal_zero) /= SHAPE(complete_zero)) .OR. &
+          SIZE(complete_first, 1) /= ncart .OR. SIZE(complete_first, 2) /= ncart .OR. &
+          SIZE(complete_first, 3) /= ncart .OR. SIZE(complete_first, 4) /= SIZE(complete_zero, 3) .OR. &
+          ANY(SHAPE(local_first) /= SHAPE(complete_first)) .OR. &
+          ANY(SHAPE(cross_first) /= SHAPE(complete_first)) .OR. &
+          ANY(SHAPE(nonlocal_first) /= SHAPE(complete_first))) THEN
+         CPABORT('ECD| Velocity decomposition output received incompatible response tensors')
+      END IF
+
+      NULLIFY (logger, tensor_print_key)
+      logger => cp_get_default_logger()
+      tensor_print_key => section_vals_get_subs_vals(ecd_section, 'PRINT%RESPONSE_TENSOR')
+      decomposition_filename = cp_print_key_generate_filename(logger, tensor_print_key, &
+                                                               extension='.ecd_velocity_decomposition', my_local=.FALSE.)
+      decomposition_unit = cp_print_key_unit_nr(logger, ecd_section, 'PRINT%RESPONSE_TENSOR', &
+                                                 extension='.ecd_velocity_decomposition', file_position='REWIND', &
+                                                 file_action='WRITE', file_form='FORMATTED')
+      IF (decomposition_unit <= 0) RETURN
+
+      WRITE (decomposition_unit, '(A)') '# CP2K periodic ECD velocity susceptibility decomposition'
+      WRITE (decomposition_unit, '(A)') '# Format_version 1'
+      WRITE (decomposition_unit, '(A)') '# Gamma_layout IMPLICIT'
+      WRITE (decomposition_unit, '(A,1X,L1)') '# GTH_current_available', gth_available
+      WRITE (decomposition_unit, '(A,1X,ES18.10E3)') '# FWHM_hartree', fwhm
+      WRITE (decomposition_unit, '(A,3(1X,ES18.10E3))') '# Reference_point_bohr', context%ref_point
+      WRITE (decomposition_unit, '(A,1X,I0)') '# Selected_occupied_empty_pairs', selection%selected_count
+      WRITE (decomposition_unit, '(A,2(1X,ES18.10E3))') '# Energy_range_hartree', energy_range
+      WRITE (decomposition_unit, '(A)') '# Components LOCAL CROSS NONLOCAL COMPLETE'
+      WRITE (decomposition_unit, '(A)') '# LOCAL includes the local diamagnetic kernel.'
+      WRITE (decomposition_unit, '(A)') '# NONLOCAL includes the GTH diamagnetic kernel.'
+      WRITE (decomposition_unit, '(A)') '# Per component: chi0_ab_re chi0_ab_im for a,b=X,Y,Z, then chi1_abq_re chi1_abq_im.'
+      WRITE (decomposition_unit, '(A)') '# Final columns: zero_order_closure_norm first_order_closure_norm.'
+
+      DO ipoint = 1, SIZE(complete_zero, 3)
+         photon_energy = energy_range(1) + REAL(ipoint - 1, KIND=dp)* &
+                         (energy_range(2) - energy_range(1))/REAL(SIZE(complete_zero, 3) - 1, KIND=dp)
+         closure_zero = SQRT(SUM(ABS(complete_zero(:, :, ipoint) - local_zero(:, :, ipoint) - &
+                                     cross_zero(:, :, ipoint) - nonlocal_zero(:, :, ipoint))**2))
+         closure_first = SQRT(SUM(ABS(complete_first(:, :, :, ipoint) - local_first(:, :, :, ipoint) - &
+                                      cross_first(:, :, :, ipoint) - nonlocal_first(:, :, :, ipoint))**2))
+         WRITE (decomposition_unit, '(2(1X,ES18.10E3))', ADVANCE='NO') photon_energy, photon_energy*evolt
+         DO icomponent = 1, 4
+            DO ia = 1, ncart
+               DO ib = 1, ncart
+                  SELECT CASE (icomponent)
+                  CASE (1)
+                     response_value = local_zero(ia, ib, ipoint)
+                  CASE (2)
+                     response_value = cross_zero(ia, ib, ipoint)
+                  CASE (3)
+                     response_value = nonlocal_zero(ia, ib, ipoint)
+                  CASE DEFAULT
+                     response_value = complete_zero(ia, ib, ipoint)
+                  END SELECT
+                  WRITE (decomposition_unit, '(2(1X,ES18.10E3))', ADVANCE='NO') &
+                     REAL(response_value, KIND=dp), AIMAG(response_value)
+               END DO
+            END DO
+            DO ia = 1, ncart
+               DO ib = 1, ncart
+                  DO idir = 1, ncart
+                     SELECT CASE (icomponent)
+                     CASE (1)
+                        response_value = local_first(ia, ib, idir, ipoint)
+                     CASE (2)
+                        response_value = cross_first(ia, ib, idir, ipoint)
+                     CASE (3)
+                        response_value = nonlocal_first(ia, ib, idir, ipoint)
+                     CASE DEFAULT
+                        response_value = complete_first(ia, ib, idir, ipoint)
+                     END SELECT
+                     WRITE (decomposition_unit, '(2(1X,ES18.10E3))', ADVANCE='NO') &
+                        REAL(response_value, KIND=dp), AIMAG(response_value)
+                  END DO
+               END DO
+            END DO
+         END DO
+         WRITE (decomposition_unit, '(2(1X,ES18.10E3))') closure_zero, closure_first
+      END DO
+      IF (cp_logger_get_default_io_unit(logger) > 0) THEN
+         WRITE (cp_logger_get_default_io_unit(logger), '(T2,A,1X,A)') &
+            'ECD| Periodic velocity decomposition file', TRIM(decomposition_filename)
+      END IF
+      CALL cp_print_key_finished_output(decomposition_unit, logger, ecd_section, 'PRINT%RESPONSE_TENSOR')
+
+   END SUBROUTINE ecd_periodic_print_cartesian_velocity_decomposition
+
+! **************************************************************************************************
 !> \brief Write complete periodic IPA transition coefficients for both electric representations.
 ! **************************************************************************************************
    SUBROUTINE ecd_periodic_print_cartesian_transition_matrix_elements(ecd_section, context, transition_selection, &
                                                                        gth_requested, gap_first, velocity_transition, &
-                                                                       length_transition)
+                                                                       gth_transition, length_transition)
       TYPE(section_vals_type), POINTER                   :: ecd_section
       TYPE(ecd_gamma_context_type), INTENT(IN)           :: context
       TYPE(ecd_periodic_transition_selection_type), INTENT(IN) :: transition_selection
       LOGICAL, INTENT(IN)                                :: gth_requested
       REAL(KIND=dp), DIMENSION(:, :), INTENT(IN)          :: gap_first
-      COMPLEX(KIND=dp), DIMENSION(:, 0:, :, :), INTENT(IN) :: length_transition, velocity_transition
+      COMPLEX(KIND=dp), DIMENSION(:, 0:, :, :), INTENT(IN) :: gth_transition, length_transition, velocity_transition
 
       CHARACTER(LEN=default_path_length)                 :: matrix_filename
       INTEGER                                            :: idir, iocc, ispin, iq, itransition, ivirt, matrix_unit
       TYPE(cp_logger_type), POINTER                      :: logger
       TYPE(section_vals_type), POINTER                   :: matrix_print_key
 
-      IF (SIZE(velocity_transition, 1) /= ncart .OR. SIZE(length_transition, 1) /= ncart .OR. &
-          LBOUND(velocity_transition, 2) /= 0 .OR. LBOUND(length_transition, 2) /= 0 .OR. &
-          UBOUND(velocity_transition, 2) < 1 .OR. UBOUND(length_transition, 2) < 1 .OR. &
+      IF (SIZE(velocity_transition, 1) /= ncart .OR. SIZE(gth_transition, 1) /= ncart .OR. &
+          SIZE(length_transition, 1) /= ncart .OR. LBOUND(velocity_transition, 2) /= 0 .OR. &
+          LBOUND(gth_transition, 2) /= 0 .OR. LBOUND(length_transition, 2) /= 0 .OR. &
+          UBOUND(velocity_transition, 2) < 1 .OR. UBOUND(gth_transition, 2) < 1 .OR. &
+          UBOUND(length_transition, 2) < 1 .OR. &
           SIZE(velocity_transition, 3) /= transition_selection%selected_count .OR. &
+          SIZE(gth_transition, 3) /= transition_selection%selected_count .OR. &
           SIZE(length_transition, 3) /= transition_selection%selected_count .OR. &
-          SIZE(velocity_transition, 4) /= ncart .OR. SIZE(length_transition, 4) /= ncart .OR. &
+          SIZE(velocity_transition, 4) /= ncart .OR. SIZE(gth_transition, 4) /= ncart .OR. &
+          SIZE(length_transition, 4) /= ncart .OR. &
           SIZE(gap_first, 1) /= transition_selection%selected_count .OR. SIZE(gap_first, 2) /= ncart) THEN
          CPABORT('ECD| Periodic transition-matrix output received inconsistent transition coefficients')
       END IF
@@ -2139,9 +2548,10 @@ CONTAINS
       IF (matrix_unit <= 0) RETURN
 
       WRITE (matrix_unit, '(A)') '# CP2K periodic ECD IPA transition matrix elements'
-      WRITE (matrix_unit, '(A)') '# Format_version 1'
+      WRITE (matrix_unit, '(A)') '# Format_version 3'
       WRITE (matrix_unit, '(A)') '# Gamma_layout IMPLICIT'
-      WRITE (matrix_unit, '(A,1X,L1)') '# GTH_nonlocal_current_requested', gth_requested
+      WRITE (matrix_unit, '(A,1X,L1)') '# Pseudopotential_commutator_selects_complete', gth_requested
+      WRITE (matrix_unit, '(A)') '# GTH current columns are retained for both selector values.'
       WRITE (matrix_unit, '(A,3(1X,ES18.10E3))') '# Reference_point_bohr', context%ref_point
       WRITE (matrix_unit, '(A)') '# Q_derivative_components X Y Z'
       WRITE (matrix_unit, '(A,2(1X,I0))') '# Transition_band_range', transition_selection%band_range
@@ -2149,10 +2559,12 @@ CONTAINS
       WRITE (matrix_unit, '(A,1X,I0)') '# Candidate_occupied_empty_pairs', transition_selection%candidate_count
       WRITE (matrix_unit, '(A,1X,I0)') '# Selected_occupied_empty_pairs', transition_selection%selected_count
       WRITE (matrix_unit, '(A,1X,ES18.10E3)') '# Transition_cutoff_gap_hartree', transition_selection%cutoff_gap
-      WRITE (matrix_unit, '(A)') '# Velocity and length coefficients use normalized q-Taylor orders 0 and 1.'
-      WRITE (matrix_unit, '(A)') '# Length coefficients are reconstructed as velocity-equivalent transitions.'
-      WRITE (matrix_unit, '(A)') '# Per Cartesian component: velocity0_re velocity0_im velocity1_re velocity1_im '// &
-                                  'length0_re length0_im length1_re length1_im'
+      WRITE (matrix_unit, '(A)') '# Current and length coefficients use normalized q-Taylor orders 0 and 1.'
+      WRITE (matrix_unit, '(A)') '# Per Cartesian component: complete_current0_re complete_current0_im '// &
+                                  'complete_current1_re complete_current1_im local_current0_re local_current0_im '// &
+                                  'local_current1_re local_current1_im gth_current0_re gth_current0_im '// &
+                                  'gth_current1_re gth_current1_im length_position0_re length_position0_im '// &
+                                  'length_position1_re length_position1_im'
       WRITE (matrix_unit, '(A)') '# Columns: Transition_index Q_derivative_component Spin Occupied_band '// &
                                   'Virtual_band Occupation_difference '// &
                                   'Gap0_hartree Gap1_hartree followed by X, Y, and Z component groups.'
@@ -2174,11 +2586,23 @@ CONTAINS
                transition_selection%occupation_difference(itransition), transition_selection%gap(itransition), &
                gap_first(itransition, iq)
             DO idir = 1, ncart
-               WRITE (matrix_unit, '(8(ES18.10E3,1X))', ADVANCE='NO') &
+               WRITE (matrix_unit, '(16(ES18.10E3,1X))', ADVANCE='NO') &
                   REAL(velocity_transition(idir, 0, itransition, iq), KIND=dp), &
                   AIMAG(velocity_transition(idir, 0, itransition, iq)), &
                   REAL(velocity_transition(idir, 1, itransition, iq), KIND=dp), &
                   AIMAG(velocity_transition(idir, 1, itransition, iq)), &
+                  REAL(velocity_transition(idir, 0, itransition, iq) - &
+                       gth_transition(idir, 0, itransition, iq), KIND=dp), &
+                  AIMAG(velocity_transition(idir, 0, itransition, iq) - &
+                        gth_transition(idir, 0, itransition, iq)), &
+                  REAL(velocity_transition(idir, 1, itransition, iq) - &
+                       gth_transition(idir, 1, itransition, iq), KIND=dp), &
+                  AIMAG(velocity_transition(idir, 1, itransition, iq) - &
+                        gth_transition(idir, 1, itransition, iq)), &
+                  REAL(gth_transition(idir, 0, itransition, iq), KIND=dp), &
+                  AIMAG(gth_transition(idir, 0, itransition, iq)), &
+                  REAL(gth_transition(idir, 1, itransition, iq), KIND=dp), &
+                  AIMAG(gth_transition(idir, 1, itransition, iq)), &
                   REAL(length_transition(idir, 0, itransition, iq), KIND=dp), &
                   AIMAG(length_transition(idir, 0, itransition, iq)), &
                   REAL(length_transition(idir, 1, itransition, iq), KIND=dp), &
@@ -2246,6 +2670,7 @@ CONTAINS
       WRITE (diagnostics_unit, '(A)') '# Format_version 4'
       WRITE (diagnostics_unit, '(A)') '# Gamma_layout IMPLICIT'
       WRITE (diagnostics_unit, '(A)') '# Electric_representations VELOCITY LENGTH'
+      WRITE (diagnostics_unit, '(A)') '# Velocity tensor uses the complete current for both selector values.'
       WRITE (diagnostics_unit, '(A,1X,L1)') '# GTH_current_available', gth_available
       WRITE (diagnostics_unit, '(A,1X,ES18.10E3)') '# FWHM_hartree', fwhm
       WRITE (diagnostics_unit, '(A,3(1X,ES18.10E3))') '# Reference_point_bohr', context%ref_point
@@ -2408,14 +2833,14 @@ CONTAINS
 ! **************************************************************************************************
    SUBROUTINE ecd_periodic_current_taylor_build(current_real, current_imag, gth_real, gth_imag, &
                                                 local_momentum_rs, local_moments_der_rs, local_moments_rs, &
-                                                gth_current_path_rs, pseudopotential_commutator, matrix_s, xkp, &
+                                                gth_current_path_rs, include_gth_path, matrix_s, xkp, &
                                                 field_cell_to_index, local_cell_to_index, gth_cell_to_index, sab_nl, &
                                                 hmat, direction, &
                                                 max_order)
       TYPE(dbcsr_p_type), DIMENSION(:, :), POINTER       :: current_real, current_imag, gth_real, gth_imag
       TYPE(dbcsr_p_type), DIMENSION(:, :), POINTER       :: local_momentum_rs, local_moments_rs, matrix_s
       TYPE(dbcsr_p_type), DIMENSION(:, :, :), POINTER    :: gth_current_path_rs, local_moments_der_rs
-      LOGICAL, INTENT(IN)                                 :: pseudopotential_commutator
+      LOGICAL, INTENT(IN)                                 :: include_gth_path
       REAL(KIND=dp), DIMENSION(3), INTENT(IN)             :: xkp, direction
       INTEGER, DIMENSION(:, :, :), POINTER                :: field_cell_to_index, local_cell_to_index, &
                                                              gth_cell_to_index, source_cell_to_index
@@ -2440,7 +2865,7 @@ CONTAINS
       IF (SIZE(local_moments_der_rs, 2) /= ncart .OR. SIZE(local_moments_rs, 2) /= SIZE(local_momentum_rs, 2)) THEN
          CPABORT("ECD| Current Taylor construction received incompatible local multipole storage")
       END IF
-      IF (pseudopotential_commutator) THEN
+      IF (include_gth_path) THEN
          IF (SIZE(gth_current_path_rs, 1) /= ncart .OR. SIZE(gth_current_path_rs, 2) < max_order + 1) THEN
             CPABORT("ECD| Current Taylor construction received incompatible GTH path storage")
          END IF
@@ -2550,7 +2975,7 @@ CONTAINS
                      END DO
                   END DO
                END IF
-               IF (pseudopotential_commutator) THEN
+               IF (include_gth_path) THEN
                   source_rs => gth_current_path_rs(idir:idir, operator_order + 1, :)
                   source_cell_to_index => gth_cell_to_index
                   CALL rskp_directional_taylor_transform(work_real(1)%matrix, work_imag(1)%matrix, source_rs, &
