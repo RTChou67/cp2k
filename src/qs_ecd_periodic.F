@@ -1701,30 +1701,24 @@ CONTAINS
       REAL(KIND=dp), PARAMETER                           :: occupation_threshold = 1.0E-8_dp
 
       COMPLEX(KIND=dp), ALLOCATABLE, DIMENSION(:, :)     :: current_first_mo, current_first_rotated, &
-                                                            current_zero_mo, current_zero_rotated, position_rotated, &
+                                                            current_zero_mo, current_zero_rotated, &
                                                             state_first, transition_first
-      COMPLEX(KIND=dp), ALLOCATABLE, DIMENSION(:, :, :)  :: alternate_counter, alternate_counter_taylor, &
-                                                            alternate_resonant, alternate_resonant_taylor, &
-                                                            alternate_response, &
-                                                            current_first_components, current_zero_components, &
-                                                            position_components, response_counter, &
+      COMPLEX(KIND=dp), ALLOCATABLE, DIMENSION(:, :, :)  :: current_first_components, current_zero_components, &
+                                                            response_counter, &
                                                             response_first, response_first_counter, response_resonant, &
                                                             response_zero
-      COMPLEX(KIND=dp), ALLOCATABLE, DIMENSION(:, :)     :: alternate_taylor, transition_taylor
+      COMPLEX(KIND=dp), ALLOCATABLE, DIMENSION(:, :)     :: transition_taylor
       COMPLEX(KIND=dp), DIMENSION(ncart, ncart, 0:1)     :: counter_taylor, resonant_taylor
       INTEGER                                            :: first_band, iband, idir, ipoint, ispin, ivirt, last_band, &
                                                             nmo, ntransitions, ntransitions_total
       LOGICAL                                            :: gth_available
       REAL(KIND=dp)                                      :: antisymmetric_first_norm, cell_volume, gap, gap_derivative, &
-                                                            gauge_residual_max, gauge_residual_norm, occupation_difference, &
-                                                            photon_energy, prefactor, response_counter_norm, &
+                                                            occupation_difference, photon_energy, prefactor, response_counter_norm, &
                                                             response_first_counter_norm, response_first_norm, &
                                                             response_first_resonant_norm, response_norm, &
                                                             response_resonant_norm
-      REAL(KIND=dp), ALLOCATABLE, DIMENSION(:)           :: alternate_gap_taylor, gap_taylor
-      REAL(KIND=dp), ALLOCATABLE, DIMENSION(:, :)        :: position_buffer
+      REAL(KIND=dp), ALLOCATABLE, DIMENSION(:)           :: gap_taylor
       REAL(KIND=dp), DIMENSION(ncart, ncart)             :: diamagnetic_kernel
-      TYPE(cp_fm_type)                                   :: position_mo
       TYPE(cp_logger_type), POINTER                      :: logger
       TYPE(dbcsr_p_type), DIMENSION(:), POINTER          :: complete_current, gth_current, local_current, position
 
@@ -1746,12 +1740,9 @@ CONTAINS
       CALL ecd_gamma_zero_order_operators_get(operators, position, local_current, gth_current, complete_current, &
                                                gth_available)
 
-      ALLOCATE (alternate_counter(ncart, ncart, npoints), alternate_resonant(ncart, ncart, npoints), &
-                alternate_response(ncart, ncart, npoints), response_counter(ncart, ncart, npoints), &
+      ALLOCATE (response_counter(ncart, ncart, npoints), &
                 response_first(ncart, ncart, npoints), response_first_counter(ncart, ncart, npoints), &
                 response_resonant(ncart, ncart, npoints), response_zero(ncart, ncart, npoints))
-      alternate_counter = CMPLX(0.0_dp, 0.0_dp, KIND=dp)
-      alternate_resonant = CMPLX(0.0_dp, 0.0_dp, KIND=dp)
       response_counter = CMPLX(0.0_dp, 0.0_dp, KIND=dp)
       response_first = CMPLX(0.0_dp, 0.0_dp, KIND=dp)
       response_first_counter = CMPLX(0.0_dp, 0.0_dp, KIND=dp)
@@ -1789,8 +1780,7 @@ CONTAINS
             CPABORT("ECD| Stage G10 transition band range is inconsistent with the Gamma MO space")
          END IF
 
-         ALLOCATE (current_first_components(nmo, nmo, ncart), current_zero_components(nmo, nmo, ncart), &
-                   position_components(nmo, nmo, ncart))
+         ALLOCATE (current_first_components(nmo, nmo, ncart), current_zero_components(nmo, nmo, ncart))
          DO idir = 1, ncart
             CALL ecd_project_complex_operator_to_mo(context%current_taylor_real(idir, 1), &
                                                     context%current_taylor_imag(idir, 1), &
@@ -1800,33 +1790,23 @@ CONTAINS
                                                     context%current_taylor_imag(idir, 2), &
                                                     context%spin(ispin)%mo_coeff, context%spin(ispin)%nao, nmo, &
                                                     current_first_mo)
-            CALL ecd_project_real_operator_to_mo(position(idir), context%spin(ispin)%mo_coeff, &
-                                                 context%spin(ispin)%nao, nmo, position_mo)
-            ALLOCATE (current_first_rotated(nmo, nmo), current_zero_rotated(nmo, nmo), position_buffer(nmo, nmo), &
-                      position_rotated(nmo, nmo), state_first(nmo, nmo), transition_first(nmo, nmo))
+            ALLOCATE (current_first_rotated(nmo, nmo), current_zero_rotated(nmo, nmo), &
+                      state_first(nmo, nmo), transition_first(nmo, nmo))
             current_zero_rotated = MATMUL(CONJG(TRANSPOSE(context%spin(ispin)%band_rotation)), &
                                            MATMUL(current_zero_mo, context%spin(ispin)%band_rotation))
             current_first_rotated = MATMUL(CONJG(TRANSPOSE(context%spin(ispin)%band_rotation)), &
                                             MATMUL(current_first_mo, context%spin(ispin)%band_rotation))
-            CALL cp_fm_get_submatrix(position_mo, position_buffer)
-            position_rotated = MATMUL(CONJG(TRANSPOSE(context%spin(ispin)%band_rotation)), &
-                                      MATMUL(CMPLX(position_buffer, 0.0_dp, KIND=dp), &
-                                             context%spin(ispin)%band_rotation))
             state_first = 0.5_dp*(MATMUL(CONJG(TRANSPOSE(context%spin(ispin)%coefficient_first)), &
                                           current_zero_rotated) - &
                                     MATMUL(current_zero_rotated, context%spin(ispin)%coefficient_first))
             transition_first = current_first_rotated + state_first
             current_zero_components(:, :, idir) = current_zero_rotated
             current_first_components(:, :, idir) = transition_first
-            position_components(:, :, idir) = position_rotated
             DEALLOCATE (current_first_mo, current_first_rotated, current_zero_mo, current_zero_rotated, &
-                        position_buffer, position_rotated, state_first, transition_first)
-            CALL cp_fm_release(position_mo)
+                        state_first, transition_first)
          END DO
 
-         ALLOCATE (alternate_counter_taylor(ncart, ncart, 0:0), alternate_gap_taylor(0:0), &
-                   alternate_resonant_taylor(ncart, ncart, 0:0), alternate_taylor(ncart, 0:0), &
-                   gap_taylor(0:1), transition_taylor(ncart, 0:1))
+         ALLOCATE (gap_taylor(0:1), transition_taylor(ncart, 0:1))
          ntransitions = 0
          DO iband = first_band, last_band
             IF (context%spin(ispin)%occupations(iband) <= occupation_threshold) CYCLE
@@ -1844,62 +1824,38 @@ CONTAINS
                                         context%spin(ispin)%eigenvalue_first(iband))
                gap_taylor(0) = gap
                gap_taylor(1) = gap_derivative
-               alternate_gap_taylor(0) = gap
                DO idir = 1, ncart
                   transition_taylor(idir, 0) = current_zero_components(ivirt, iband, idir)
                   transition_taylor(idir, 1) = current_first_components(ivirt, iband, idir)
-                  alternate_taylor(idir, 0) = -gap*position_components(ivirt, iband, idir)
                END DO
                ntransitions = ntransitions + 1
                CALL ecd_periodic_response_add_transition(transition_taylor, gap_taylor, occupation_difference, &
                                                          cell_volume, energy_range, fwhm, response_resonant, &
                                                          response_counter, response_first, response_first_counter, &
                                                          resonant_taylor, counter_taylor)
-               DO ipoint = 1, npoints
-                  photon_energy = energy_range(1) + REAL(ipoint - 1, KIND=dp)* &
-                                  (energy_range(2) - energy_range(1))/REAL(npoints - 1, KIND=dp)
-                  prefactor = -2.0_dp*twopi/(cell_volume*photon_energy**2)
-                  CALL ecd_taylor_retarded_response(alternate_taylor, alternate_gap_taylor, photon_energy, &
-                                                     0.5_dp*fwhm, alternate_resonant_taylor, alternate_counter_taylor)
-                  alternate_resonant(:, :, ipoint) = alternate_resonant(:, :, ipoint) + &
-                                                      prefactor*occupation_difference*alternate_resonant_taylor(:, :, 0)
-                  alternate_counter(:, :, ipoint) = alternate_counter(:, :, ipoint) + &
-                                                     prefactor*occupation_difference*alternate_counter_taylor(:, :, 0)
-               END DO
             END DO
          END DO
          IF (ntransitions < 1) THEN
             CPABORT("ECD| Stage G10 found no occupied-to-empty transitions")
          END IF
          ntransitions_total = ntransitions_total + ntransitions
-         DEALLOCATE (alternate_counter_taylor, alternate_gap_taylor, alternate_resonant_taylor, alternate_taylor, &
-                     current_first_components, current_zero_components, gap_taylor, position_components, &
-                     transition_taylor)
+         DEALLOCATE (current_first_components, current_zero_components, gap_taylor, transition_taylor)
       END DO
 
       CALL ecd_periodic_implicit_gamma_diamagnetic_kernel(qs_env, context, gth_available, diamagnetic_kernel)
       response_zero = response_resonant + response_counter
-      alternate_response = alternate_resonant + alternate_counter
       DO ipoint = 1, npoints
          photon_energy = energy_range(1) + REAL(ipoint - 1, KIND=dp)* &
                          (energy_range(2) - energy_range(1))/REAL(npoints - 1, KIND=dp)
          prefactor = 2.0_dp*twopi/(cell_volume*photon_energy**2)
          response_zero(:, :, ipoint) = response_zero(:, :, ipoint) + &
                                         CMPLX(prefactor*diamagnetic_kernel, 0.0_dp, KIND=dp)
-         alternate_response(:, :, ipoint) = alternate_response(:, :, ipoint) + &
-                                             CMPLX(prefactor*diamagnetic_kernel, 0.0_dp, KIND=dp)
       END DO
       response_first = response_first + response_first_counter
 
-      gauge_residual_max = 0.0_dp
-      DO ipoint = 1, npoints
-         gauge_residual_norm = SQRT(SUM(ABS(response_zero(:, :, ipoint) - alternate_response(:, :, ipoint))**2))
-         gauge_residual_max = MAX(gauge_residual_max, gauge_residual_norm)
-      END DO
       ipoint = (npoints + 1)/2
       photon_energy = energy_range(1) + REAL(ipoint - 1, KIND=dp)* &
-                      (energy_range(2) - energy_range(1))/REAL(npoints - 1, KIND=dp)
-      gauge_residual_norm = SQRT(SUM(ABS(response_zero(:, :, ipoint) - alternate_response(:, :, ipoint))**2))
+                     (energy_range(2) - energy_range(1))/REAL(npoints - 1, KIND=dp)
       response_resonant_norm = SQRT(SUM(ABS(response_resonant(:, :, ipoint))**2))
       response_counter_norm = SQRT(SUM(ABS(response_counter(:, :, ipoint))**2))
       response_first_resonant_norm = SQRT(SUM(ABS(response_first(:, :, ipoint) - &
@@ -1928,10 +1884,6 @@ CONTAINS
             'ECD| Stage G10 midpoint full first-order norm', response_first_norm
          WRITE (cp_logger_get_default_io_unit(logger), '(T2,A,T55,ES14.6)') &
             'ECD| Stage G10 midpoint antisymmetric first-order norm', antisymmetric_first_norm
-         WRITE (cp_logger_get_default_io_unit(logger), '(T2,A,T55,ES14.6)') &
-            'ECD| Stage G10 midpoint zero-order gauge residual norm', gauge_residual_norm
-         WRITE (cp_logger_get_default_io_unit(logger), '(T2,A,T55,ES14.6)') &
-            'ECD| Stage G10 maximum zero-order gauge residual norm', gauge_residual_max
       END IF
       ALLOCATE (response_zero_output(ncart, ncart, npoints), response_first_output(ncart, ncart, npoints))
       response_zero_output = response_zero
@@ -1945,8 +1897,7 @@ CONTAINS
                                                   transition_band_range, ntransitions_total)
       END IF
 
-      DEALLOCATE (alternate_counter, alternate_resonant, alternate_response, response_counter, response_first, &
-                  response_first_counter, response_resonant, response_zero)
+      DEALLOCATE (response_counter, response_first, response_first_counter, response_resonant, response_zero)
 
    END SUBROUTINE ecd_periodic_implicit_gamma_velocity_response_g10
 
