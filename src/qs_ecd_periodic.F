@@ -220,8 +220,8 @@ CONTAINS
       IF (fwhm <= 0.0_dp) THEN
          CPABORT("ECD| Periodic response requires positive FWHM")
       END IF
-      IF (ntransitions < 1) THEN
-         CPABORT("ECD| Periodic IPA requires positive NTRANSITIONS")
+      IF (ntransitions == 0 .OR. ntransitions < -1) THEN
+         CPABORT("ECD| Periodic IPA requires NTRANSITIONS -1 or a positive value")
       END IF
       IF (transition_band_range(1) == -1 .OR. transition_band_range(2) == -1) THEN
          IF (ANY(transition_band_range /= -1)) THEN
@@ -307,7 +307,7 @@ CONTAINS
       REAL(KIND=dp), ALLOCATABLE, DIMENSION(:)           :: candidate_gap, candidate_occupation_difference
 
       CALL ecd_periodic_transition_selection_release(selection)
-      IF (nrequested < 1 .OR. eps_degeneracy <= 0.0_dp) THEN
+      IF (nrequested == 0 .OR. nrequested < -1 .OR. eps_degeneracy <= 0.0_dp) THEN
          CPABORT('ECD| Periodic IPA transition selection received invalid controls')
       END IF
 
@@ -363,7 +363,11 @@ CONTAINS
       CPASSERT(icandidate == ncandidates)
 
       CALL ecd_periodic_transition_order_sort(candidate_gap, candidate_ispin, candidate_iocc, candidate_ivirt, order)
-      nbase = MIN(nrequested, ncandidates)
+      IF (nrequested == -1) THEN
+         nbase = ncandidates
+      ELSE
+         nbase = MIN(nrequested, ncandidates)
+      END IF
       selection%cutoff_gap = candidate_gap(order(nbase))
       selection%selected_count = nbase
       DO WHILE (selection%selected_count < ncandidates)
