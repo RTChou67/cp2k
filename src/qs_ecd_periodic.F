@@ -52,7 +52,6 @@ MODULE qs_ecd_periodic
    USE kpoint_methods,                  ONLY: rskp_directional_taylor_transform,&
                                               rskp_transform
    USE mathconstants,                   ONLY: twopi
-   USE mathlib,                         ONLY: diag_complex
    USE orbital_pointers,                 ONLY: coset, ncoset
    USE qs_ecd_subspace,                 ONLY: ecd_band_first_order_response,&
                                               ecd_band_manifolds_validate_window,&
@@ -87,8 +86,7 @@ MODULE qs_ecd_periodic
    USE qs_neighbor_list_types,          ONLY: neighbor_list_set_p_type
    USE qs_rho_types,                    ONLY: qs_rho_type
    USE qs_vxc,                          ONLY: qs_vxc_create
-   USE physcon,                         ONLY: c_light_au,&
-                                              evolt
+   USE physcon,                         ONLY: evolt
    USE pw_env_types,                    ONLY: pw_env_get,&
                                               pw_env_type
    USE pw_methods,                      ONLY: pw_axpy,&
@@ -108,8 +106,6 @@ MODULE qs_ecd_periodic
 
    CHARACTER(len=*), PARAMETER, PRIVATE :: moduleN = 'qs_ecd_periodic'
    INTEGER, PARAMETER, PRIVATE          :: ecd_broadening_lorentzian = 3, &
-                                           ecd_gauge_length = 1, &
-                                           ecd_gauge_velocity = 2, &
                                            ncart = 3
 
    TYPE, PRIVATE :: ecd_periodic_transition_selection_type
@@ -148,23 +144,27 @@ CONTAINS
       INTEGER, INTENT(IN)                                :: broadening
       REAL(KIND=dp), INTENT(IN)                          :: fwhm
 
-      CHARACTER(LEN=default_string_length)               :: gauge_label
-      COMPLEX(KIND=dp), ALLOCATABLE, DIMENSION(:, :, :)  :: velocity_response_first, velocity_response_zero
-      COMPLEX(KIND=dp), ALLOCATABLE, DIMENSION(:, :, :)  :: length_transition, velocity_transition
-      INTEGER                                            :: electric_gauge, npoints, spatial_order
-      LOGICAL                                            :: direction_explicit, do_kpoints, &
-                                                            energy_range_explicit
-      REAL(KIND=dp)                                      :: direction_norm, eps_degeneracy
-      REAL(KIND=dp), DIMENSION(:), POINTER               :: direction_ptr, energy_range
+      COMPLEX(KIND=dp), ALLOCATABLE, DIMENSION(:, :, :)  :: length_first_direction, length_response_zero, &
+                                                            length_response_zero_direction, length_transition_direction, &
+                                                            velocity_first_direction, velocity_response_zero, &
+                                                            velocity_response_zero_direction, velocity_transition_direction
+      COMPLEX(KIND=dp), ALLOCATABLE, DIMENSION(:, :, :, :) :: length_first_cartesian, length_transition_cartesian, &
+                                                            velocity_first_cartesian, velocity_transition_cartesian
+      INTEGER                                            :: idir, itransition, npoints, spatial_order
+      INTEGER, ALLOCATABLE, DIMENSION(:)                 :: selected_iocc, selected_ispin, selected_ivirt
+      LOGICAL                                            :: do_kpoints, energy_range_explicit, gth_available
+      REAL(KIND=dp)                                      :: eps_degeneracy
+      REAL(KIND=dp), ALLOCATABLE, DIMENSION(:, :)        :: gap_first_cartesian
+      REAL(KIND=dp), DIMENSION(:), POINTER               :: energy_range
       REAL(KIND=dp), DIMENSION(ncart)                    :: direction
       REAL(KIND=dp), DIMENSION(ncart, ncart)             :: diamagnetic_kernel
       TYPE(cell_type), POINTER                           :: cell
       TYPE(ecd_gamma_context_type)                       :: gamma_context
       TYPE(ecd_gamma_zero_order_operators_type)          :: gamma_operators
       TYPE(ecd_periodic_transition_selection_type)       :: transition_selection
-      TYPE(section_vals_type), POINTER                   :: print_section, spectrum_section
+      TYPE(section_vals_type), POINTER                   :: response_section
 
-      NULLIFY (cell, direction_ptr, energy_range, print_section, spectrum_section)
+      NULLIFY (cell, energy_range, response_section)
 
       CALL get_qs_env(qs_env, cell=cell, do_kpoints=do_kpoints)
       CPASSERT(ASSOCIATED(cell))
@@ -178,11 +178,6 @@ CONTAINS
 
       CALL section_vals_val_get(ecd_section, "EPS_DEGENERACY", r_val=eps_degeneracy)
       CALL section_vals_val_get(ecd_section, "SPATIAL_ORDER", i_val=spatial_order)
-      CALL section_vals_val_get(ecd_section, "PROPAGATION_DIRECTION", explicit=direction_explicit)
-      IF (direction_explicit) THEN
-         CALL section_vals_val_get(ecd_section, "PROPAGATION_DIRECTION", r_vals=direction_ptr)
-      END IF
-      CALL section_vals_val_get(ipa_section, "ELECTRIC_GAUGE", i_val=electric_gauge)
 
       IF (eps_degeneracy <= 0.0_dp) THEN
          CPABORT("ECD| EPS_DEGENERACY must be positive")
@@ -190,31 +185,6 @@ CONTAINS
       IF (spatial_order /= 1) THEN
          CPABORT("ECD| Periodic ECD response currently requires SPATIAL_ORDER 1")
       END IF
-      IF (.NOT. direction_explicit) THEN
-         CPABORT("ECD| Periodic ECD requires PROPAGATION_DIRECTION")
-      END IF
-      IF (.NOT. ASSOCIATED(direction_ptr)) THEN
-         CPABORT("ECD| PROPAGATION_DIRECTION data are unavailable")
-      END IF
-      IF (SIZE(direction_ptr) /= ncart) THEN
-         CPABORT("ECD| PROPAGATION_DIRECTION expects three Cartesian components")
-      END IF
-      direction = direction_ptr
-      direction_norm = SQRT(SUM(direction**2))
-      IF (direction_norm <= SQRT(TINY(1.0_dp))) THEN
-         CPABORT("ECD| PROPAGATION_DIRECTION must have non-zero length")
-      END IF
-      direction = direction/direction_norm
-
-      SELECT CASE (electric_gauge)
-      CASE (ecd_gauge_length)
-         gauge_label = "LENGTH"
-      CASE (ecd_gauge_velocity)
-         gauge_label = "VELOCITY"
-      CASE DEFAULT
-         CPABORT("ECD| Unknown periodic ELECTRIC_GAUGE")
-      END SELECT
-
       IF (broadening /= ecd_broadening_lorentzian) THEN
          CPABORT("ECD| Periodic response currently requires BROADENING LORENTZIAN")
       END IF
@@ -233,15 +203,14 @@ CONTAINS
          CPABORT("ECD| Invalid periodic TRANSITION_BAND_RANGE")
       END IF
 
-      print_section => section_vals_get_subs_vals(ecd_section, "PRINT")
-      spectrum_section => section_vals_get_subs_vals(print_section, "SPECTRUM")
-      CALL section_vals_val_get(spectrum_section, "ENERGY_RANGE", explicit=energy_range_explicit)
+      response_section => section_vals_get_subs_vals(ecd_section, "PRINT%RESPONSE_TENSOR")
+      CALL section_vals_val_get(response_section, "ENERGY_RANGE", explicit=energy_range_explicit)
       IF (energy_range_explicit) THEN
-         CALL section_vals_val_get(spectrum_section, "ENERGY_RANGE", r_vals=energy_range)
+         CALL section_vals_val_get(response_section, "ENERGY_RANGE", r_vals=energy_range)
       END IF
-      CALL section_vals_val_get(spectrum_section, "NPOINTS", i_val=npoints)
+      CALL section_vals_val_get(response_section, "NPOINTS", i_val=npoints)
       IF (.NOT. energy_range_explicit) THEN
-         CPABORT("ECD| Periodic response requires PRINT%SPECTRUM%ENERGY_RANGE")
+         CPABORT("ECD| Periodic response requires PRINT%RESPONSE_TENSOR%ENERGY_RANGE")
       END IF
       IF (.NOT. ASSOCIATED(energy_range)) THEN
          CPABORT("ECD| ENERGY_RANGE data are unavailable")
@@ -259,11 +228,13 @@ CONTAINS
          CPABORT("ECD| Periodic response requires NPOINTS of at least two")
       END IF
 
-      CALL ecd_gamma_context_create_implicit(gamma_context, qs_env, direction, ref_point, spatial_order, &
-                                             eps_degeneracy)
-      CALL ecd_gamma_zero_order_operators_build(gamma_operators, qs_env, gamma_context, &
-                                                 pseudopotential_commutator)
-      IF (spatial_order >= 1) THEN
+      DO idir = 1, ncart
+         direction = 0.0_dp
+         direction(idir) = 1.0_dp
+         CALL ecd_gamma_context_create_implicit(gamma_context, qs_env, direction, ref_point, spatial_order, &
+                                                eps_degeneracy)
+         CALL ecd_gamma_zero_order_operators_build(gamma_operators, qs_env, gamma_context, &
+                                                    pseudopotential_commutator)
          CALL ecd_periodic_implicit_gamma_overlap_g3(gamma_context)
          CALL ecd_periodic_implicit_gamma_current_g4(qs_env, gamma_context, gamma_operators, &
                                                       pseudopotential_commutator)
@@ -271,23 +242,84 @@ CONTAINS
          CALL ecd_periodic_implicit_gamma_ks_g6(qs_env, gamma_context)
          CALL ecd_periodic_implicit_gamma_ks_phase_g7(gamma_context)
          CALL ecd_periodic_implicit_gamma_state_g8(gamma_context)
-      END IF
-      CALL ecd_periodic_transition_selection_build(transition_selection, gamma_context, ntransitions, &
-                                                   transition_band_range, eps_degeneracy)
-      CALL ecd_periodic_implicit_gamma_velocity_response_g10(qs_env, ecd_section, gamma_context, gamma_operators, &
-                                                              transition_selection, energy_range, npoints, fwhm, &
-                                                              electric_gauge == ecd_gauge_velocity, velocity_response_zero, &
-                                                              velocity_response_first, diamagnetic_kernel, velocity_transition)
-      CALL ecd_periodic_implicit_gamma_length_response_g13(ecd_section, gamma_context, gamma_operators, &
-                                                            transition_selection, energy_range, npoints, fwhm, &
-                                                            gauge_label, electric_gauge == ecd_gauge_length, &
-                                                            velocity_response_zero, velocity_response_first, &
-                                                            diamagnetic_kernel, length_transition)
-      CALL ecd_periodic_print_transition_matrix_elements(ecd_section, gamma_context, transition_selection, &
-                                                          gauge_label, pseudopotential_commutator, &
-                                                          velocity_transition, length_transition)
-      DEALLOCATE (length_transition, velocity_transition)
-      DEALLOCATE (velocity_response_first, velocity_response_zero)
+         CALL ecd_periodic_transition_selection_build(transition_selection, gamma_context, ntransitions, &
+                                                      transition_band_range, eps_degeneracy)
+         IF (idir == 1) THEN
+            ALLOCATE (length_first_cartesian(ncart, ncart, ncart, npoints), &
+                      gap_first_cartesian(transition_selection%selected_count, ncart), &
+                      length_transition_cartesian(ncart, 0:1, transition_selection%selected_count, ncart), &
+                      selected_iocc(transition_selection%selected_count), &
+                      selected_ispin(transition_selection%selected_count), &
+                      selected_ivirt(transition_selection%selected_count), &
+                      velocity_first_cartesian(ncart, ncart, ncart, npoints), &
+                      velocity_transition_cartesian(ncart, 0:1, transition_selection%selected_count, ncart))
+            selected_iocc = transition_selection%iocc
+            selected_ispin = transition_selection%ispin
+            selected_ivirt = transition_selection%ivirt
+         ELSE
+            IF (transition_selection%selected_count /= SIZE(selected_iocc)) THEN
+               CPABORT('ECD| Cartesian Gamma directions selected incompatible occupied-empty transition counts')
+            END IF
+            IF (ANY(transition_selection%iocc /= selected_iocc) .OR. &
+                ANY(transition_selection%ispin /= selected_ispin) .OR. &
+                ANY(transition_selection%ivirt /= selected_ivirt)) THEN
+               CPABORT('ECD| Cartesian Gamma directions selected inconsistent occupied-empty transitions')
+            END IF
+         END IF
+         DO itransition = 1, transition_selection%selected_count
+            gap_first_cartesian(itransition, idir) = 0.5_dp*( &
+               gamma_context%spin(transition_selection%ispin(itransition))% &
+                  eigenvalue_first(transition_selection%ivirt(itransition)) + &
+               gamma_context%spin(transition_selection%ispin(itransition))% &
+                  eigenvalue_first(transition_selection%iocc(itransition)))
+         END DO
+         CALL ecd_periodic_implicit_gamma_velocity_response_g10(qs_env, gamma_context, gamma_operators, &
+                                                                 transition_selection, energy_range, npoints, fwhm, &
+                                                                 velocity_response_zero_direction, velocity_first_direction, &
+                                                                 diamagnetic_kernel, velocity_transition_direction, gth_available)
+         CALL ecd_periodic_implicit_gamma_length_response_g13(gamma_context, transition_selection, energy_range, &
+                                                               npoints, fwhm, velocity_response_zero_direction, &
+                                                               velocity_first_direction, diamagnetic_kernel, &
+                                                               length_response_zero_direction, length_first_direction, &
+                                                               length_transition_direction)
+         IF (idir == 1) THEN
+            CALL MOVE_ALLOC(velocity_response_zero_direction, velocity_response_zero)
+         ELSE
+            DEALLOCATE (velocity_response_zero_direction)
+         END IF
+         IF (idir == 1) THEN
+            CALL MOVE_ALLOC(length_response_zero_direction, length_response_zero)
+         ELSE
+            DEALLOCATE (length_response_zero_direction)
+         END IF
+         velocity_first_cartesian(:, :, idir, :) = velocity_first_direction
+         length_first_cartesian(:, :, idir, :) = length_first_direction
+         velocity_transition_cartesian(:, :, :, idir) = velocity_transition_direction
+         length_transition_cartesian(:, :, :, idir) = length_transition_direction
+         DEALLOCATE (length_first_direction, length_transition_direction, velocity_first_direction, &
+                     velocity_transition_direction)
+         IF (idir < ncart) THEN
+            CALL ecd_periodic_transition_selection_release(transition_selection)
+            CALL ecd_gamma_zero_order_operators_release(gamma_operators)
+            CALL ecd_gamma_context_release(gamma_context)
+         END IF
+      END DO
+      CALL ecd_periodic_print_cartesian_response(ecd_section, energy_range, velocity_response_zero, &
+                                                 velocity_first_cartesian, length_response_zero, &
+                                                 length_first_cartesian, gamma_context, gth_available, fwhm, &
+                                                 transition_selection)
+      CALL ecd_periodic_print_cartesian_transition_matrix_elements(ecd_section, gamma_context, transition_selection, &
+                                                                    pseudopotential_commutator, &
+                                                                    gap_first_cartesian, &
+                                                                    velocity_transition_cartesian, &
+                                                                    length_transition_cartesian)
+      CALL ecd_periodic_print_cartesian_gauge_diagnostics(ecd_section, gamma_context, gth_available, fwhm, &
+                                                           transition_selection, energy_range, velocity_response_zero, &
+                                                           velocity_first_cartesian, length_response_zero, &
+                                                           length_first_cartesian)
+      DEALLOCATE (gap_first_cartesian, length_first_cartesian, length_response_zero, length_transition_cartesian, &
+                  selected_iocc, selected_ispin, selected_ivirt, velocity_first_cartesian, &
+                  velocity_response_zero, velocity_transition_cartesian)
       CALL ecd_periodic_transition_selection_release(transition_selection)
       CALL ecd_gamma_zero_order_operators_release(gamma_operators)
       CALL ecd_gamma_context_release(gamma_context)
@@ -1332,22 +1364,21 @@ CONTAINS
 ! **************************************************************************************************
 !> \brief Assemble the first-order velocity-gauge causal response from retained Gamma providers.
 ! **************************************************************************************************
-   SUBROUTINE ecd_periodic_implicit_gamma_velocity_response_g10(qs_env, ecd_section, context, operators, &
-                                                                 transition_selection, energy_range, npoints, fwhm, &
-                                                                 write_response, response_zero_output, response_first_output, &
-                                                                 diamagnetic_kernel_output, transition_output)
+   SUBROUTINE ecd_periodic_implicit_gamma_velocity_response_g10(qs_env, context, operators, transition_selection, &
+                                                                 energy_range, npoints, fwhm, response_zero_output, &
+                                                                 response_first_output, diamagnetic_kernel_output, &
+                                                                 transition_output, gth_available_output)
       TYPE(qs_environment_type), POINTER                 :: qs_env
-      TYPE(section_vals_type), POINTER                   :: ecd_section
       TYPE(ecd_gamma_context_type), INTENT(IN), TARGET   :: context
       TYPE(ecd_gamma_zero_order_operators_type), INTENT(IN), TARGET :: operators
       TYPE(ecd_periodic_transition_selection_type), INTENT(IN) :: transition_selection
-      LOGICAL, INTENT(IN)                                :: write_response
       REAL(KIND=dp), DIMENSION(2), INTENT(IN)            :: energy_range
       INTEGER, INTENT(IN)                                :: npoints
       REAL(KIND=dp), INTENT(IN)                          :: fwhm
       COMPLEX(KIND=dp), ALLOCATABLE, DIMENSION(:, :, :), INTENT(OUT) :: response_first_output, response_zero_output
       REAL(KIND=dp), DIMENSION(ncart, ncart), INTENT(OUT) :: diamagnetic_kernel_output
       COMPLEX(KIND=dp), ALLOCATABLE, DIMENSION(:, :, :), INTENT(OUT) :: transition_output
+      LOGICAL, INTENT(OUT)                               :: gth_available_output
 
       COMPLEX(KIND=dp), ALLOCATABLE, DIMENSION(:, :)     :: current_first_mo, current_first_rotated, &
                                                             current_zero_mo, current_zero_rotated, &
@@ -1387,6 +1418,7 @@ CONTAINS
       END IF
       CALL ecd_gamma_zero_order_operators_get(operators, position, local_current, gth_current, complete_current, &
                                                gth_available)
+      gth_available_output = gth_available
 
       ALLOCATE (response_counter(ncart, ncart, npoints), &
                 response_first(ncart, ncart, npoints), response_first_counter(ncart, ncart, npoints), &
@@ -1520,20 +1552,6 @@ CONTAINS
       ALLOCATE (response_zero_output(ncart, ncart, npoints), response_first_output(ncart, ncart, npoints))
       response_zero_output = response_zero
       response_first_output = response_first
-      IF (write_response) THEN
-         CALL ecd_periodic_print_response_tensor(ecd_section, energy_range, response_zero, response_first, &
-                                                  context, 'VELOCITY', gth_available, fwhm, transition_selection%band_range, &
-                                                  ntransitions_total, candidate_count=transition_selection%candidate_count, &
-                                                  requested_count=transition_selection%requested_count, &
-                                                  cutoff_gap=transition_selection%cutoff_gap)
-         CALL ecd_periodic_print_maxwell_spectrum(ecd_section, energy_range, context%direction, response_zero, &
-                                                  response_first, context, 'VELOCITY', gth_available, fwhm, &
-                                                  transition_selection%band_range, ntransitions_total, &
-                                                  candidate_count=transition_selection%candidate_count, &
-                                                  requested_count=transition_selection%requested_count, &
-                                                  cutoff_gap=transition_selection%cutoff_gap)
-      END IF
-
       DEALLOCATE (response_counter, response_first, response_first_counter, response_resonant, response_zero)
 
    END SUBROUTINE ecd_periodic_implicit_gamma_velocity_response_g10
@@ -1541,24 +1559,19 @@ CONTAINS
 ! **************************************************************************************************
 !> \brief Assemble the first-order length-gauge causal response and compare it with the velocity tensor.
 ! **************************************************************************************************
-   SUBROUTINE ecd_periodic_implicit_gamma_length_response_g13(ecd_section, context, operators, &
-                                                               transition_selection, energy_range, npoints, fwhm, &
-                                                               gauge_label, write_response, velocity_response_zero, &
-                                                               velocity_response_first, diamagnetic_kernel, transition_output)
-      TYPE(section_vals_type), POINTER                   :: ecd_section
+   SUBROUTINE ecd_periodic_implicit_gamma_length_response_g13(context, transition_selection, energy_range, npoints, &
+                                                               fwhm, velocity_response_zero, velocity_response_first, &
+                                                               diamagnetic_kernel, response_zero_output, response_first_output, &
+                                                               transition_output)
       TYPE(ecd_gamma_context_type), INTENT(IN), TARGET   :: context
-      TYPE(ecd_gamma_zero_order_operators_type), INTENT(IN), TARGET :: operators
       TYPE(ecd_periodic_transition_selection_type), INTENT(IN) :: transition_selection
-      CHARACTER(LEN=*), INTENT(IN)                       :: gauge_label
-      LOGICAL, INTENT(IN)                                :: write_response
       REAL(KIND=dp), DIMENSION(2), INTENT(IN)            :: energy_range
       INTEGER, INTENT(IN)                                :: npoints
       REAL(KIND=dp), INTENT(IN)                          :: fwhm
       COMPLEX(KIND=dp), DIMENSION(:, :, :), INTENT(IN)   :: velocity_response_first, velocity_response_zero
       REAL(KIND=dp), DIMENSION(ncart, ncart), INTENT(IN) :: diamagnetic_kernel
+      COMPLEX(KIND=dp), ALLOCATABLE, DIMENSION(:, :, :), INTENT(OUT) :: response_first_output, response_zero_output
       COMPLEX(KIND=dp), ALLOCATABLE, DIMENSION(:, :, :), INTENT(OUT) :: transition_output
-
-      REAL(KIND=dp), PARAMETER                           :: occupation_threshold = 1.0E-8_dp
 
       COMPLEX(KIND=dp), ALLOCATABLE, DIMENSION(:, :, :)  :: response_counter, response_first, &
                                                             response_first_counter, response_first_resonant, &
@@ -1569,7 +1582,6 @@ CONTAINS
       COMPLEX(KIND=dp), DIMENSION(ncart, ncart, 0:1)     :: counter_taylor, resonant_taylor
       INTEGER                                            :: iband, idir, ipoint, ispin, itransition, ivirt, nmo, &
                                                             ntransitions, ntransitions_total
-      LOGICAL                                            :: gth_available
       REAL(KIND=dp)                                      :: antisymmetric_first_norm, cell_volume, gap, gap_derivative, &
                                                             gauge_first_residual_max, gauge_first_residual_norm, &
                                                             gauge_first_relative_max, gauge_first_relative_norm, &
@@ -1582,9 +1594,7 @@ CONTAINS
       REAL(KIND=dp)                                      :: velocity_first_norm, velocity_zero_norm
       REAL(KIND=dp), DIMENSION(0:1)                      :: gap_taylor
       TYPE(cp_logger_type), POINTER                      :: logger
-      TYPE(dbcsr_p_type), DIMENSION(:), POINTER          :: complete_current, gth_current, local_current, position
-
-      NULLIFY (complete_current, gth_current, local_current, logger, position)
+      NULLIFY (logger)
       IF (fwhm <= 0.0_dp) THEN
          CPABORT("ECD| Stage G13 requires a positive FWHM")
       END IF
@@ -1597,9 +1607,6 @@ CONTAINS
       IF (cell_volume <= 0.0_dp) THEN
          CPABORT("ECD| Stage G13 requires a positive cell volume")
       END IF
-      CALL ecd_gamma_zero_order_operators_get(operators, position, local_current, gth_current, complete_current, &
-                                               gth_available)
-
       ALLOCATE (response_counter(ncart, ncart, npoints), response_first(ncart, ncart, npoints), &
                 response_first_counter(ncart, ncart, npoints), response_first_resonant(ncart, ncart, npoints), &
                 response_resonant(ncart, ncart, npoints), response_zero(ncart, ncart, npoints))
@@ -1741,30 +1748,9 @@ CONTAINS
          WRITE (cp_logger_get_default_io_unit(logger), '(T2,A,T55,ES14.6)') &
             'ECD| Stage G13 maximum first-order gauge relative residual', gauge_first_relative_max
       END IF
-      CALL ecd_periodic_print_gauge_diagnostics(ecd_section, context, gauge_label, gth_available, fwhm, &
-                                                transition_selection%band_range, ntransitions_total, &
-                                                transition_selection%candidate_count, transition_selection%requested_count, &
-                                                transition_selection%cutoff_gap, energy_range, &
-                                                velocity_response_zero, velocity_response_first, response_zero, &
-                                                response_first)
-      IF (write_response) THEN
-         CALL ecd_periodic_print_response_tensor(ecd_section, energy_range, response_zero, response_first, &
-                                                  context, gauge_label, gth_available, fwhm, transition_selection%band_range, &
-                                                  ntransitions_total, candidate_count=transition_selection%candidate_count, &
-                                                  requested_count=transition_selection%requested_count, &
-                                                  cutoff_gap=transition_selection%cutoff_gap)
-         CALL ecd_periodic_print_maxwell_spectrum(ecd_section, energy_range, context%direction, response_zero, &
-                                                  response_first, context, gauge_label, gth_available, fwhm, &
-                                                  transition_selection%band_range, ntransitions_total, &
-                                                  candidate_count=transition_selection%candidate_count, &
-                                                  requested_count=transition_selection%requested_count, &
-                                                  cutoff_gap=transition_selection%cutoff_gap)
-      END IF
-      CALL ecd_periodic_print_output_summary(context, gauge_label, gth_available, ntransitions_total, &
-                                             transition_selection%candidate_count, transition_selection%requested_count, &
-                                             transition_selection%cutoff_gap, &
-                                             gauge_zero_relative_norm, gauge_first_relative_norm, &
-                                             gauge_zero_relative_max, gauge_first_relative_max)
+      ALLOCATE (response_zero_output(ncart, ncart, npoints), response_first_output(ncart, ncart, npoints))
+      response_zero_output = response_zero
+      response_first_output = response_first
 
       DEALLOCATE (response_counter, response_first, response_first_counter, response_first_resonant, &
                   response_resonant, response_zero)
@@ -1928,21 +1914,155 @@ CONTAINS
    END SUBROUTINE ecd_periodic_implicit_gamma_diamagnetic_kernel
 
 ! **************************************************************************************************
+!> \brief Write complete Cartesian first-order periodic IPA response tensors.
+! **************************************************************************************************
+   SUBROUTINE ecd_periodic_print_cartesian_response(ecd_section, energy_range, velocity_zero, velocity_first, &
+                                                    length_zero, length_first, context, gth_available, fwhm, selection)
+      TYPE(section_vals_type), POINTER                   :: ecd_section
+      REAL(KIND=dp), DIMENSION(2), INTENT(IN)            :: energy_range
+      COMPLEX(KIND=dp), DIMENSION(:, :, :), INTENT(IN)   :: length_zero, velocity_zero
+      COMPLEX(KIND=dp), DIMENSION(:, :, :, :), INTENT(IN) :: length_first, velocity_first
+      TYPE(ecd_gamma_context_type), INTENT(IN)           :: context
+      LOGICAL, INTENT(IN)                                :: gth_available
+      REAL(KIND=dp), INTENT(IN)                          :: fwhm
+      TYPE(ecd_periodic_transition_selection_type), INTENT(IN) :: selection
+
+      CHARACTER(LEN=default_path_length)                 :: response_filename
+      CHARACTER(LEN=64)                                  :: column_label
+      CHARACTER(LEN=8)                                   :: representation_label
+      CHARACTER(LEN=1)                                   :: q_label
+      COMPLEX(KIND=dp)                                   :: response_value
+      INTEGER                                            :: ia, ib, idir, ipoint, iq, response_unit
+      REAL(KIND=dp)                                      :: photon_energy
+      TYPE(cp_logger_type), POINTER                      :: logger
+      TYPE(section_vals_type), POINTER                   :: tensor_print_key
+
+      IF (SIZE(velocity_zero, 1) /= ncart .OR. SIZE(velocity_zero, 2) /= ncart .OR. &
+          SIZE(length_zero, 1) /= ncart .OR. SIZE(length_zero, 2) /= ncart .OR. &
+          SIZE(velocity_zero, 3) < 2 .OR. SIZE(length_zero, 3) /= SIZE(velocity_zero, 3) .OR. &
+          SIZE(velocity_first, 1) /= ncart .OR. SIZE(velocity_first, 2) /= ncart .OR. &
+          SIZE(velocity_first, 3) /= ncart .OR. SIZE(velocity_first, 4) /= SIZE(velocity_zero, 3) .OR. &
+          SIZE(length_first, 1) /= ncart .OR. SIZE(length_first, 2) /= ncart .OR. &
+          SIZE(length_first, 3) /= ncart .OR. SIZE(length_first, 4) /= SIZE(velocity_zero, 3)) THEN
+         CPABORT('ECD| Cartesian periodic response output received incompatible tensor dimensions')
+      END IF
+
+      NULLIFY (logger, tensor_print_key)
+      logger => cp_get_default_logger()
+      tensor_print_key => section_vals_get_subs_vals(ecd_section, 'PRINT%RESPONSE_TENSOR')
+      response_filename = cp_print_key_generate_filename(logger, tensor_print_key, &
+                                                         extension='.ecd_response', my_local=.FALSE.)
+      response_unit = cp_print_key_unit_nr(logger, ecd_section, 'PRINT%RESPONSE_TENSOR', &
+                                            extension='.ecd_response', file_position='REWIND', &
+                                            file_action='WRITE', file_form='FORMATTED')
+      IF (response_unit <= 0) RETURN
+
+      WRITE (response_unit, '(A)') '# CP2K periodic ECD Cartesian dielectric response'
+      WRITE (response_unit, '(A)') '# Format_version 4'
+      WRITE (response_unit, '(A)') '# Gamma_layout IMPLICIT'
+      WRITE (response_unit, '(A)') '# Electric_representations VELOCITY LENGTH'
+      WRITE (response_unit, '(A,1X,L1)') '# GTH_current_available', gth_available
+      WRITE (response_unit, '(A,1X,ES18.10E3)') '# FWHM_hartree', fwhm
+      WRITE (response_unit, '(A,3(1X,ES18.10E3))') '# Reference_point_bohr', context%ref_point
+      WRITE (response_unit, '(A,2(1X,I0))') '# Transition_band_range', selection%band_range
+      WRITE (response_unit, '(A,1X,I0)') '# Requested_occupied_empty_pairs', selection%requested_count
+      WRITE (response_unit, '(A,1X,I0)') '# Candidate_occupied_empty_pairs', selection%candidate_count
+      WRITE (response_unit, '(A,1X,I0)') '# Selected_occupied_empty_pairs', selection%selected_count
+      WRITE (response_unit, '(A,1X,ES18.10E3)') '# Transition_cutoff_gap_hartree', selection%cutoff_gap
+      WRITE (response_unit, '(A,2(1X,ES18.10E3))') '# Energy_range_hartree', energy_range
+      WRITE (response_unit, '(A,1X,I0)') '# NPOINTS', SIZE(velocity_zero, 3)
+      WRITE (response_unit, '(A)') '# epsilon0 includes the vacuum identity for both electric representations.'
+      WRITE (response_unit, '(A)') '# epsilon1_abq stores the q_x, q_y, q_z Cartesian derivative components.'
+      WRITE (response_unit, '(A)', ADVANCE='NO') '# Columns: Energy_hartree Energy_eV'
+      DO idir = 1, 2
+         representation_label = 'length'
+         IF (idir == 1) representation_label = 'velocity'
+         DO ia = 1, ncart
+            DO ib = 1, ncart
+               WRITE (column_label, '(A,A,I0,A,I0,A)') TRIM(representation_label), '_epsilon0_', ia, '_', ib, '_re'
+               WRITE (response_unit, '(1X,A)', ADVANCE='NO') TRIM(column_label)
+               WRITE (column_label, '(A,A,I0,A,I0,A)') TRIM(representation_label), '_epsilon0_', ia, '_', ib, '_im'
+               WRITE (response_unit, '(1X,A)', ADVANCE='NO') TRIM(column_label)
+            END DO
+         END DO
+      END DO
+      DO idir = 1, 2
+         representation_label = 'length'
+         IF (idir == 1) representation_label = 'velocity'
+         DO ia = 1, ncart
+            DO ib = 1, ncart
+               DO iq = 1, ncart
+                  q_label = ACHAR(IACHAR('w') + iq)
+                  WRITE (column_label, '(A,A,I0,A,I0,A,A,A)') TRIM(representation_label), '_epsilon1_', ia, '_', ib, &
+                     '_q', q_label, '_re'
+                  WRITE (response_unit, '(1X,A)', ADVANCE='NO') TRIM(column_label)
+                  WRITE (column_label, '(A,A,I0,A,I0,A,A,A)') TRIM(representation_label), '_epsilon1_', ia, '_', ib, &
+                     '_q', q_label, '_im'
+                  WRITE (response_unit, '(1X,A)', ADVANCE='NO') TRIM(column_label)
+               END DO
+            END DO
+         END DO
+      END DO
+      WRITE (response_unit, '()')
+
+      DO ipoint = 1, SIZE(velocity_zero, 3)
+         photon_energy = energy_range(1) + REAL(ipoint - 1, KIND=dp)* &
+                          (energy_range(2) - energy_range(1))/REAL(SIZE(velocity_zero, 3) - 1, KIND=dp)
+         WRITE (response_unit, '(2(1X,ES18.10E3))', ADVANCE='NO') photon_energy, photon_energy*evolt
+         DO idir = 1, 2
+            DO ia = 1, ncart
+               DO ib = 1, ncart
+                  IF (idir == 1) THEN
+                     response_value = velocity_zero(ia, ib, ipoint)
+                  ELSE
+                     response_value = length_zero(ia, ib, ipoint)
+                  END IF
+                  IF (ia == ib) response_value = response_value + CMPLX(1.0_dp, 0.0_dp, KIND=dp)
+                  WRITE (response_unit, '(2(1X,ES18.10E3))', ADVANCE='NO') &
+                     REAL(response_value, KIND=dp), AIMAG(response_value)
+               END DO
+            END DO
+         END DO
+         DO idir = 1, 2
+            DO ia = 1, ncart
+               DO ib = 1, ncart
+                  DO iq = 1, ncart
+                     IF (idir == 1) THEN
+                        response_value = velocity_first(ia, ib, iq, ipoint)
+                     ELSE
+                        response_value = length_first(ia, ib, iq, ipoint)
+                     END IF
+                     WRITE (response_unit, '(2(1X,ES18.10E3))', ADVANCE='NO') &
+                        REAL(response_value, KIND=dp), AIMAG(response_value)
+                  END DO
+               END DO
+            END DO
+         END DO
+         WRITE (response_unit, '()')
+      END DO
+      IF (cp_logger_get_default_io_unit(logger) > 0) THEN
+         WRITE (cp_logger_get_default_io_unit(logger), '(T2,A,1X,A)') &
+            'ECD| Periodic Cartesian response tensor file', TRIM(response_filename)
+      END IF
+      CALL cp_print_key_finished_output(response_unit, logger, ecd_section, 'PRINT%RESPONSE_TENSOR')
+
+   END SUBROUTINE ecd_periodic_print_cartesian_response
+
+! **************************************************************************************************
 !> \brief Write complete periodic IPA transition coefficients for both electric representations.
 ! **************************************************************************************************
-   SUBROUTINE ecd_periodic_print_transition_matrix_elements(ecd_section, context, transition_selection, &
-                                                             gauge_label, gth_requested, &
-                                                             velocity_transition, length_transition)
+   SUBROUTINE ecd_periodic_print_cartesian_transition_matrix_elements(ecd_section, context, transition_selection, &
+                                                                       gth_requested, gap_first, velocity_transition, &
+                                                                       length_transition)
       TYPE(section_vals_type), POINTER                   :: ecd_section
       TYPE(ecd_gamma_context_type), INTENT(IN)           :: context
       TYPE(ecd_periodic_transition_selection_type), INTENT(IN) :: transition_selection
-      CHARACTER(LEN=*), INTENT(IN)                       :: gauge_label
       LOGICAL, INTENT(IN)                                :: gth_requested
-      COMPLEX(KIND=dp), DIMENSION(:, 0:, :), INTENT(IN)  :: length_transition, velocity_transition
+      REAL(KIND=dp), DIMENSION(:, :), INTENT(IN)          :: gap_first
+      COMPLEX(KIND=dp), DIMENSION(:, 0:, :, :), INTENT(IN) :: length_transition, velocity_transition
 
       CHARACTER(LEN=default_path_length)                 :: matrix_filename
-      INTEGER                                            :: idir, iocc, ispin, itransition, ivirt, matrix_unit
-      REAL(KIND=dp)                                      :: gap_derivative
+      INTEGER                                            :: idir, iocc, ispin, iq, itransition, ivirt, matrix_unit
       TYPE(cp_logger_type), POINTER                      :: logger
       TYPE(section_vals_type), POINTER                   :: matrix_print_key
 
@@ -1950,7 +2070,9 @@ CONTAINS
           LBOUND(velocity_transition, 2) /= 0 .OR. LBOUND(length_transition, 2) /= 0 .OR. &
           UBOUND(velocity_transition, 2) < 1 .OR. UBOUND(length_transition, 2) < 1 .OR. &
           SIZE(velocity_transition, 3) /= transition_selection%selected_count .OR. &
-          SIZE(length_transition, 3) /= transition_selection%selected_count) THEN
+          SIZE(length_transition, 3) /= transition_selection%selected_count .OR. &
+          SIZE(velocity_transition, 4) /= ncart .OR. SIZE(length_transition, 4) /= ncart .OR. &
+          SIZE(gap_first, 1) /= transition_selection%selected_count .OR. SIZE(gap_first, 2) /= ncart) THEN
          CPABORT('ECD| Periodic transition-matrix output received inconsistent transition coefficients')
       END IF
       IF (.NOT. ALLOCATED(context%spin)) THEN
@@ -1970,10 +2092,9 @@ CONTAINS
       WRITE (matrix_unit, '(A)') '# CP2K periodic ECD IPA transition matrix elements'
       WRITE (matrix_unit, '(A)') '# Format_version 1'
       WRITE (matrix_unit, '(A)') '# Gamma_layout IMPLICIT'
-      WRITE (matrix_unit, '(A,1X,A)') '# Primary_electric_gauge', TRIM(gauge_label)
       WRITE (matrix_unit, '(A,1X,L1)') '# GTH_nonlocal_current_requested', gth_requested
       WRITE (matrix_unit, '(A,3(1X,ES18.10E3))') '# Reference_point_bohr', context%ref_point
-      WRITE (matrix_unit, '(A,3(1X,ES18.10E3))') '# Propagation_direction', context%direction
+      WRITE (matrix_unit, '(A)') '# Q_derivative_components X Y Z'
       WRITE (matrix_unit, '(A,2(1X,I0))') '# Transition_band_range', transition_selection%band_range
       WRITE (matrix_unit, '(A,1X,I0)') '# Requested_occupied_empty_pairs', transition_selection%requested_count
       WRITE (matrix_unit, '(A,1X,I0)') '# Candidate_occupied_empty_pairs', transition_selection%candidate_count
@@ -1983,7 +2104,8 @@ CONTAINS
       WRITE (matrix_unit, '(A)') '# Length coefficients are reconstructed as velocity-equivalent transitions.'
       WRITE (matrix_unit, '(A)') '# Per Cartesian component: velocity0_re velocity0_im velocity1_re velocity1_im '// &
                                   'length0_re length0_im length1_re length1_im'
-      WRITE (matrix_unit, '(A)') '# Columns: Transition_index Spin Occupied_band Virtual_band Occupation_difference '// &
+      WRITE (matrix_unit, '(A)') '# Columns: Transition_index Q_derivative_component Spin Occupied_band '// &
+                                  'Virtual_band Occupation_difference '// &
                                   'Gap0_hartree Gap1_hartree followed by X, Y, and Z component groups.'
 
       DO itransition = 1, transition_selection%selected_count
@@ -1998,23 +2120,23 @@ CONTAINS
              .NOT. ASSOCIATED(context%spin(ispin)%eigenvalue_first)) THEN
             CPABORT('ECD| Periodic transition-matrix output found incomplete first-order state data')
          END IF
-         gap_derivative = 0.5_dp*(context%spin(ispin)%eigenvalue_first(ivirt) + &
-                                  context%spin(ispin)%eigenvalue_first(iocc))
-         WRITE (matrix_unit, '(4(I0,1X),3(ES18.10E3,1X))', ADVANCE='NO') itransition, ispin, iocc, ivirt, &
-            transition_selection%occupation_difference(itransition), transition_selection%gap(itransition), &
-            gap_derivative
-         DO idir = 1, ncart
-            WRITE (matrix_unit, '(8(ES18.10E3,1X))', ADVANCE='NO') &
-               REAL(velocity_transition(idir, 0, itransition), KIND=dp), &
-               AIMAG(velocity_transition(idir, 0, itransition)), &
-               REAL(velocity_transition(idir, 1, itransition), KIND=dp), &
-               AIMAG(velocity_transition(idir, 1, itransition)), &
-               REAL(length_transition(idir, 0, itransition), KIND=dp), &
-               AIMAG(length_transition(idir, 0, itransition)), &
-               REAL(length_transition(idir, 1, itransition), KIND=dp), &
-               AIMAG(length_transition(idir, 1, itransition))
+         DO iq = 1, ncart
+            WRITE (matrix_unit, '(5(I0,1X),3(ES18.10E3,1X))', ADVANCE='NO') itransition, iq, ispin, iocc, ivirt, &
+               transition_selection%occupation_difference(itransition), transition_selection%gap(itransition), &
+               gap_first(itransition, iq)
+            DO idir = 1, ncart
+               WRITE (matrix_unit, '(8(ES18.10E3,1X))', ADVANCE='NO') &
+                  REAL(velocity_transition(idir, 0, itransition, iq), KIND=dp), &
+                  AIMAG(velocity_transition(idir, 0, itransition, iq)), &
+                  REAL(velocity_transition(idir, 1, itransition, iq), KIND=dp), &
+                  AIMAG(velocity_transition(idir, 1, itransition, iq)), &
+                  REAL(length_transition(idir, 0, itransition, iq), KIND=dp), &
+                  AIMAG(length_transition(idir, 0, itransition, iq)), &
+                  REAL(length_transition(idir, 1, itransition, iq), KIND=dp), &
+                  AIMAG(length_transition(idir, 1, itransition, iq))
+            END DO
+            WRITE (matrix_unit, '()')
          END DO
-         WRITE (matrix_unit, '()')
       END DO
 
       IF (cp_logger_get_default_io_unit(logger) > 0) THEN
@@ -2023,94 +2145,44 @@ CONTAINS
       END IF
       CALL cp_print_key_finished_output(matrix_unit, logger, ecd_section, 'PRINT%MATRIX_ELEMENTS')
 
-   END SUBROUTINE ecd_periodic_print_transition_matrix_elements
+   END SUBROUTINE ecd_periodic_print_cartesian_transition_matrix_elements
 
 ! **************************************************************************************************
-!> \brief Write common reproducibility metadata for implicit-Gamma periodic ECD files.
+!> \brief Write Cartesian length--velocity diagnostics for periodic IPA response tensors.
 ! **************************************************************************************************
-   SUBROUTINE ecd_periodic_write_output_metadata(output_unit, context, gauge_label, gth_available, fwhm, &
-                                                 transition_band_range, ntransitions, candidate_count, requested_count, &
-                                                 cutoff_gap, energy_range, npoints, transition_source)
-      INTEGER, INTENT(IN)                                :: output_unit
-      TYPE(ecd_gamma_context_type), INTENT(IN)           :: context
-      CHARACTER(LEN=*), INTENT(IN)                       :: gauge_label
-      LOGICAL, INTENT(IN)                                :: gth_available
-      INTEGER, DIMENSION(2), INTENT(IN)                  :: transition_band_range
-      INTEGER, INTENT(IN)                                :: candidate_count, ntransitions, requested_count
-      INTEGER, INTENT(IN)                                :: npoints
-      REAL(KIND=dp), INTENT(IN)                          :: cutoff_gap, fwhm
-      REAL(KIND=dp), DIMENSION(2), INTENT(IN)            :: energy_range
-      CHARACTER(LEN=*), INTENT(IN), OPTIONAL             :: transition_source
-
-      CHARACTER(LEN=12)                                  :: source_label
-
-      IF (output_unit <= 0 .OR. .NOT. ASSOCIATED(context%cell)) THEN
-         CPABORT('ECD| Periodic output metadata require an open unit and a cell')
-      END IF
-      source_label = 'IPA'
-      IF (PRESENT(transition_source)) source_label = transition_source
-      WRITE (output_unit, '(A,1X,A)') '# Gamma_layout', 'IMPLICIT'
-      WRITE (output_unit, '(A,1X,A)') '# Electric_gauge', TRIM(gauge_label)
-      WRITE (output_unit, '(A,1X,L1)') '# GTH_current_available', gth_available
-      WRITE (output_unit, '(A,1X,A)') '# Broadening', 'LORENTZIAN'
-      WRITE (output_unit, '(A,1X,ES18.10E3)') '# FWHM_hartree', fwhm
-      WRITE (output_unit, '(A,1X,ES18.10E3)') '# FWHM_eV', fwhm*evolt
-      WRITE (output_unit, '(A,1X,I0)') '# Spatial_order', context%spatial_order
-      WRITE (output_unit, '(A,3(1X,ES18.10E3))') '# Propagation_direction', context%direction
-      WRITE (output_unit, '(A,3(1X,ES18.10E3))') '# Reference_point_bohr', context%ref_point
-      WRITE (output_unit, '(A,1X,ES18.10E3)') '# Cell_volume_bohr3', ABS(context%cell%deth)
-      WRITE (output_unit, '(A,1X,I0)') '# Spin_channels', context%nspin
-      WRITE (output_unit, '(A,2(1X,I0))') '# Transition_band_range', transition_band_range
-      SELECT CASE (TRIM(source_label))
-      CASE ('IPA')
-         WRITE (output_unit, '(A,1X,I0)') '# Requested_occupied_empty_pairs', requested_count
-         WRITE (output_unit, '(A,1X,I0)') '# Candidate_occupied_empty_pairs', candidate_count
-         WRITE (output_unit, '(A,1X,I0)') '# Selected_occupied_empty_pairs', ntransitions
-         WRITE (output_unit, '(A,1X,ES18.10E3)') '# Transition_cutoff_gap_hartree', cutoff_gap
-      CASE ('TDDFPT_TDA')
-         WRITE (output_unit, '(A,1X,I0)') '# Selected_TDA_states', ntransitions
-      CASE DEFAULT
-         CPABORT('ECD| Unsupported periodic output transition source')
-      END SELECT
-      WRITE (output_unit, '(A,2(1X,ES18.10E3))') '# Energy_range_hartree', energy_range
-      WRITE (output_unit, '(A,1X,I0)') '# NPOINTS', npoints
-
-   END SUBROUTINE ecd_periodic_write_output_metadata
-
-! **************************************************************************************************
-!> \brief Write energy-resolved finite-AO length--velocity residual diagnostics.
-! **************************************************************************************************
-   SUBROUTINE ecd_periodic_print_gauge_diagnostics(ecd_section, context, gauge_label, gth_available, fwhm, &
-                                                    transition_band_range, ntransitions, candidate_count, requested_count, &
-                                                    cutoff_gap, energy_range, &
-                                                    velocity_zero, velocity_first, length_zero, length_first)
+   SUBROUTINE ecd_periodic_print_cartesian_gauge_diagnostics(ecd_section, context, gth_available, fwhm, selection, &
+                                                              energy_range, velocity_zero, velocity_first, &
+                                                              length_zero, length_first)
       TYPE(section_vals_type), POINTER                   :: ecd_section
       TYPE(ecd_gamma_context_type), INTENT(IN)           :: context
-      CHARACTER(LEN=*), INTENT(IN)                       :: gauge_label
       LOGICAL, INTENT(IN)                                :: gth_available
-      INTEGER, DIMENSION(2), INTENT(IN)                  :: transition_band_range
-      INTEGER, INTENT(IN)                                :: candidate_count, ntransitions, requested_count
-      REAL(KIND=dp), INTENT(IN)                          :: cutoff_gap, fwhm
+      REAL(KIND=dp), INTENT(IN)                          :: fwhm
+      TYPE(ecd_periodic_transition_selection_type), INTENT(IN) :: selection
       REAL(KIND=dp), DIMENSION(2), INTENT(IN)            :: energy_range
-      COMPLEX(KIND=dp), DIMENSION(:, :, :), INTENT(IN)   :: length_first, length_zero, velocity_first, velocity_zero
+      COMPLEX(KIND=dp), DIMENSION(:, :, :), INTENT(IN)   :: length_zero, velocity_zero
+      COMPLEX(KIND=dp), DIMENSION(:, :, :, :), INTENT(IN) :: length_first, velocity_first
 
       CHARACTER(LEN=default_path_length)                 :: diagnostics_filename
-      INTEGER                                            :: diagnostics_unit, ipoint, iounit
-      REAL(KIND=dp)                                      :: absolute_first, absolute_zero, energy, length_first_norm, &
-                                                            length_zero_norm, relative_first, relative_zero, &
-                                                            velocity_first_norm, velocity_zero_norm
+      INTEGER                                            :: diagnostics_unit, idir, ipoint, midpoint
+      REAL(KIND=dp)                                      :: absolute_zero, energy, length_zero_norm, relative_zero, &
+                                                            velocity_zero_norm
+      REAL(KIND=dp), DIMENSION(ncart)                    :: absolute_first, length_first_norm, relative_first, &
+                                                            velocity_first_norm
+      REAL(KIND=dp), DIMENSION(ncart)                    :: maximum_first_relative, midpoint_first_relative
+      REAL(KIND=dp)                                      :: maximum_zero_relative, midpoint_zero_relative
       TYPE(cp_logger_type), POINTER                      :: logger
       TYPE(section_vals_type), POINTER                   :: tensor_print_key
 
       IF (SIZE(velocity_zero, 1) /= ncart .OR. SIZE(velocity_zero, 2) /= ncart .OR. &
-          SIZE(velocity_first, 1) /= ncart .OR. SIZE(velocity_first, 2) /= ncart .OR. &
           SIZE(length_zero, 1) /= ncart .OR. SIZE(length_zero, 2) /= ncart .OR. &
+          SIZE(velocity_zero, 3) < 2 .OR. SIZE(length_zero, 3) /= SIZE(velocity_zero, 3) .OR. &
+          SIZE(velocity_first, 1) /= ncart .OR. SIZE(velocity_first, 2) /= ncart .OR. &
+          SIZE(velocity_first, 3) /= ncart .OR. SIZE(velocity_first, 4) /= SIZE(velocity_zero, 3) .OR. &
           SIZE(length_first, 1) /= ncart .OR. SIZE(length_first, 2) /= ncart .OR. &
-          SIZE(velocity_zero, 3) /= SIZE(velocity_first, 3) .OR. &
-          SIZE(velocity_zero, 3) /= SIZE(length_zero, 3) .OR. &
-          SIZE(velocity_zero, 3) /= SIZE(length_first, 3) .OR. SIZE(velocity_zero, 3) < 2) THEN
-         CPABORT('ECD| Gauge diagnostics received incompatible response tensors')
+          SIZE(length_first, 3) /= ncart .OR. SIZE(length_first, 4) /= SIZE(velocity_zero, 3)) THEN
+         CPABORT('ECD| Cartesian gauge diagnostics received incompatible response tensors')
       END IF
+
       NULLIFY (logger, tensor_print_key)
       logger => cp_get_default_logger()
       tensor_print_key => section_vals_get_subs_vals(ecd_section, 'PRINT%RESPONSE_TENSOR')
@@ -2121,19 +2193,32 @@ CONTAINS
                                                file_action='WRITE', file_form='FORMATTED')
       IF (diagnostics_unit <= 0) RETURN
 
-      iounit = cp_logger_get_default_io_unit(logger)
-      IF (iounit > 0) THEN
-         WRITE (iounit, '(T2,A,1X,A)') 'ECD| Periodic gauge diagnostics file', TRIM(diagnostics_filename)
-      END IF
-      WRITE (diagnostics_unit, '(A)') '# CP2K periodic ECD gauge diagnostics'
-      WRITE (diagnostics_unit, '(A)') '# Format_version 2'
-      CALL ecd_periodic_write_output_metadata(diagnostics_unit, context, gauge_label, gth_available, fwhm, &
-                                              transition_band_range, ntransitions, candidate_count, requested_count, &
-                                              cutoff_gap, energy_range, SIZE(velocity_zero, 3))
-      WRITE (diagnostics_unit, '(A)') '# Relative residual: 2*norm(velocity-length)/(norm(velocity)+norm(length))'
+      WRITE (diagnostics_unit, '(A)') '# CP2K periodic ECD Cartesian gauge diagnostics'
+      WRITE (diagnostics_unit, '(A)') '# Format_version 4'
+      WRITE (diagnostics_unit, '(A)') '# Gamma_layout IMPLICIT'
+      WRITE (diagnostics_unit, '(A)') '# Electric_representations VELOCITY LENGTH'
+      WRITE (diagnostics_unit, '(A,1X,L1)') '# GTH_current_available', gth_available
+      WRITE (diagnostics_unit, '(A,1X,ES18.10E3)') '# FWHM_hartree', fwhm
+      WRITE (diagnostics_unit, '(A,3(1X,ES18.10E3))') '# Reference_point_bohr', context%ref_point
+      WRITE (diagnostics_unit, '(A,2(1X,I0))') '# Transition_band_range', selection%band_range
+      WRITE (diagnostics_unit, '(A,1X,I0)') '# Requested_occupied_empty_pairs', selection%requested_count
+      WRITE (diagnostics_unit, '(A,1X,I0)') '# Candidate_occupied_empty_pairs', selection%candidate_count
+      WRITE (diagnostics_unit, '(A,1X,I0)') '# Selected_occupied_empty_pairs', selection%selected_count
+      WRITE (diagnostics_unit, '(A,1X,ES18.10E3)') '# Transition_cutoff_gap_hartree', selection%cutoff_gap
+      WRITE (diagnostics_unit, '(A,2(1X,ES18.10E3))') '# Energy_range_hartree', energy_range
+      WRITE (diagnostics_unit, '(A,1X,I0)') '# NPOINTS', SIZE(velocity_zero, 3)
+      WRITE (diagnostics_unit, '(A)') '# Relative residual: 2*norm(velocity-length)/(norm(velocity)+norm(length)).'
       WRITE (diagnostics_unit, '(A)') '# Columns: Energy_hartree Energy_eV velocity0_norm length0_norm '// &
-                                     'absolute0_residual relative0_residual velocity1_norm length1_norm '// &
-                                     'absolute1_residual relative1_residual'
+                                      'absolute0_residual relative0_residual velocity1_x_norm length1_x_norm '// &
+                                      'absolute1_x_residual relative1_x_residual velocity1_y_norm length1_y_norm '// &
+                                      'absolute1_y_residual relative1_y_residual velocity1_z_norm length1_z_norm '// &
+                                      'absolute1_z_residual relative1_z_residual'
+
+      maximum_zero_relative = 0.0_dp
+      maximum_first_relative = 0.0_dp
+      midpoint = (SIZE(velocity_zero, 3) + 1)/2
+      midpoint_zero_relative = 0.0_dp
+      midpoint_first_relative = 0.0_dp
       DO ipoint = 1, SIZE(velocity_zero, 3)
          energy = energy_range(1) + REAL(ipoint - 1, KIND=dp)* &
                   (energy_range(2) - energy_range(1))/REAL(SIZE(velocity_zero, 3) - 1, KIND=dp)
@@ -2141,468 +2226,81 @@ CONTAINS
          length_zero_norm = SQRT(SUM(ABS(length_zero(:, :, ipoint))**2))
          absolute_zero = SQRT(SUM(ABS(velocity_zero(:, :, ipoint) - length_zero(:, :, ipoint))**2))
          relative_zero = 2.0_dp*absolute_zero/MAX(SQRT(TINY(1.0_dp)), velocity_zero_norm + length_zero_norm)
-         velocity_first_norm = SQRT(SUM(ABS(velocity_first(:, :, ipoint))**2))
-         length_first_norm = SQRT(SUM(ABS(length_first(:, :, ipoint))**2))
-         absolute_first = SQRT(SUM(ABS(velocity_first(:, :, ipoint) - length_first(:, :, ipoint))**2))
-         relative_first = 2.0_dp*absolute_first/MAX(SQRT(TINY(1.0_dp)), velocity_first_norm + length_first_norm)
-         WRITE (diagnostics_unit, '(10(1X,ES18.10E3))') energy, energy*evolt, velocity_zero_norm, length_zero_norm, &
-            absolute_zero, relative_zero, velocity_first_norm, length_first_norm, absolute_first, relative_first
+         DO idir = 1, ncart
+            velocity_first_norm(idir) = SQRT(SUM(ABS(velocity_first(:, :, idir, ipoint))**2))
+            length_first_norm(idir) = SQRT(SUM(ABS(length_first(:, :, idir, ipoint))**2))
+            absolute_first(idir) = SQRT(SUM(ABS(velocity_first(:, :, idir, ipoint) - &
+                                                    length_first(:, :, idir, ipoint))**2))
+            relative_first(idir) = 2.0_dp*absolute_first(idir)/MAX(SQRT(TINY(1.0_dp)), &
+                                                                  velocity_first_norm(idir) + length_first_norm(idir))
+         END DO
+         maximum_zero_relative = MAX(maximum_zero_relative, relative_zero)
+         maximum_first_relative = MAX(maximum_first_relative, relative_first)
+         IF (ipoint == midpoint) THEN
+            midpoint_zero_relative = relative_zero
+            midpoint_first_relative = relative_first
+         END IF
+         WRITE (diagnostics_unit, '(18(1X,ES18.10E3))') energy, energy*evolt, velocity_zero_norm, &
+            length_zero_norm, absolute_zero, relative_zero, velocity_first_norm(1), length_first_norm(1), &
+            absolute_first(1), relative_first(1), velocity_first_norm(2), length_first_norm(2), &
+            absolute_first(2), relative_first(2), velocity_first_norm(3), length_first_norm(3), &
+            absolute_first(3), relative_first(3)
       END DO
       CALL cp_print_key_finished_output(diagnostics_unit, logger, ecd_section, 'PRINT%RESPONSE_TENSOR')
 
-   END SUBROUTINE ecd_periodic_print_gauge_diagnostics
+      IF (cp_logger_get_default_io_unit(logger) > 0) THEN
+         WRITE (cp_logger_get_default_io_unit(logger), '(T2,A,1X,A)') &
+            'ECD| Periodic Cartesian gauge diagnostics file', TRIM(diagnostics_filename)
+      END IF
+      CALL ecd_periodic_print_cartesian_output_summary(context, gth_available, selection, midpoint_zero_relative, &
+                                                       midpoint_first_relative, maximum_zero_relative, &
+                                                       maximum_first_relative)
+
+   END SUBROUTINE ecd_periodic_print_cartesian_gauge_diagnostics
 
 ! **************************************************************************************************
-!> \brief Print the compact final implicit-Gamma ECD validation summary.
+!> \brief Print compact Cartesian length--velocity response diagnostics.
 ! **************************************************************************************************
-   SUBROUTINE ecd_periodic_print_output_summary(context, gauge_label, gth_available, ntransitions, candidate_count, &
-                                                requested_count, cutoff_gap, &
-                                                midpoint_zero_relative, midpoint_first_relative, &
-                                                maximum_zero_relative, maximum_first_relative)
+   SUBROUTINE ecd_periodic_print_cartesian_output_summary(context, gth_available, selection, &
+                                                          midpoint_zero_relative, midpoint_first_relative, &
+                                                          maximum_zero_relative, maximum_first_relative)
       TYPE(ecd_gamma_context_type), INTENT(IN)           :: context
-      CHARACTER(LEN=*), INTENT(IN)                       :: gauge_label
       LOGICAL, INTENT(IN)                                :: gth_available
-      INTEGER, INTENT(IN)                                :: candidate_count, ntransitions, requested_count
-      REAL(KIND=dp), INTENT(IN)                          :: cutoff_gap, maximum_first_relative, maximum_zero_relative, &
-                                                            midpoint_first_relative, midpoint_zero_relative
+      TYPE(ecd_periodic_transition_selection_type), INTENT(IN) :: selection
+      REAL(KIND=dp), INTENT(IN)                          :: midpoint_zero_relative, maximum_zero_relative
+      REAL(KIND=dp), DIMENSION(ncart), INTENT(IN)        :: midpoint_first_relative, maximum_first_relative
 
+      INTEGER                                            :: idir
       TYPE(cp_logger_type), POINTER                      :: logger
 
       NULLIFY (logger)
       logger => cp_get_default_logger()
       IF (cp_logger_get_default_io_unit(logger) <= 0) RETURN
-      WRITE (cp_logger_get_default_io_unit(logger), '(T2,A)') 'ECD| Periodic output summary'
-      WRITE (cp_logger_get_default_io_unit(logger), '(T2,A,T55,A)') &
-         'ECD| Primary electric gauge', TRIM(gauge_label)
+      WRITE (cp_logger_get_default_io_unit(logger), '(T2,A)') 'ECD| Periodic Cartesian output summary'
       WRITE (cp_logger_get_default_io_unit(logger), '(T2,A,T55,L1)') &
          'ECD| GTH current available', gth_available
       WRITE (cp_logger_get_default_io_unit(logger), '(T2,A,T55,I10)') &
-         'ECD| Requested occupied-empty pairs', requested_count
+         'ECD| Requested occupied-empty pairs', selection%requested_count
       WRITE (cp_logger_get_default_io_unit(logger), '(T2,A,T55,I10)') &
-         'ECD| Candidate occupied-empty pairs', candidate_count
+         'ECD| Candidate occupied-empty pairs', selection%candidate_count
       WRITE (cp_logger_get_default_io_unit(logger), '(T2,A,T55,I10)') &
-         'ECD| Selected occupied-empty pairs', ntransitions
+         'ECD| Selected occupied-empty pairs', selection%selected_count
       WRITE (cp_logger_get_default_io_unit(logger), '(T2,A,T55,ES14.6)') &
-         'ECD| Transition cutoff gap [hartree]', cutoff_gap
+         'ECD| Transition cutoff gap [hartree]', selection%cutoff_gap
       WRITE (cp_logger_get_default_io_unit(logger), '(T2,A,T55,ES14.6)') &
          'ECD| Midpoint zero-order gauge relative residual', midpoint_zero_relative
       WRITE (cp_logger_get_default_io_unit(logger), '(T2,A,T55,ES14.6)') &
-         'ECD| Midpoint first-order gauge relative residual', midpoint_first_relative
-      WRITE (cp_logger_get_default_io_unit(logger), '(T2,A,T55,ES14.6)') &
          'ECD| Maximum zero-order gauge relative residual', maximum_zero_relative
-      WRITE (cp_logger_get_default_io_unit(logger), '(T2,A,T55,ES14.6)') &
-         'ECD| Maximum first-order gauge relative residual', maximum_first_relative
+      DO idir = 1, ncart
+         WRITE (cp_logger_get_default_io_unit(logger), '(T2,A,I1,T55,ES14.6)') &
+            'ECD| Midpoint first-order gauge relative residual q', idir, midpoint_first_relative(idir)
+         WRITE (cp_logger_get_default_io_unit(logger), '(T2,A,I1,T55,ES14.6)') &
+            'ECD| Maximum first-order gauge relative residual q', idir, maximum_first_relative(idir)
+      END DO
       WRITE (cp_logger_get_default_io_unit(logger), '(T2,A,T55,3F12.6)') &
          'ECD| Reference point [bohr]', context%ref_point
-      WRITE (cp_logger_get_default_io_unit(logger), '(T2,A,T55,3F12.6)') &
-         'ECD| Propagation direction', context%direction
 
-   END SUBROUTINE ecd_periodic_print_output_summary
-
-! **************************************************************************************************
-!> \brief Write the explicit-Gamma zero- and first-order dielectric response tensors.
-!> \param ecd_section ECD input section supplying PRINT%RESPONSE_TENSOR
-!> \param energy_range Photon-energy range in hartree
-!> \param response_zero Full zero-order response contribution, excluding vacuum identity
-!> \param response_first Directional first-order dielectric coefficient
-! **************************************************************************************************
-   SUBROUTINE ecd_periodic_print_response_tensor(ecd_section, energy_range, response_zero, response_first, &
-                                                 context, gauge_label, gth_available, fwhm, transition_band_range, &
-                                                 ntransitions, transition_source, candidate_count, requested_count, cutoff_gap)
-      TYPE(section_vals_type), POINTER                   :: ecd_section
-      REAL(KIND=dp), DIMENSION(2), INTENT(IN)            :: energy_range
-      COMPLEX(KIND=dp), DIMENSION(:, :, :), INTENT(IN)   :: response_first, response_zero
-      TYPE(ecd_gamma_context_type), INTENT(IN), OPTIONAL :: context
-      CHARACTER(LEN=*), INTENT(IN), OPTIONAL             :: gauge_label
-      LOGICAL, INTENT(IN), OPTIONAL                      :: gth_available
-      INTEGER, DIMENSION(2), INTENT(IN), OPTIONAL        :: transition_band_range
-      INTEGER, INTENT(IN), OPTIONAL                      :: candidate_count, ntransitions, requested_count
-      REAL(KIND=dp), INTENT(IN), OPTIONAL                :: cutoff_gap, fwhm
-      CHARACTER(LEN=*), INTENT(IN), OPTIONAL             :: transition_source
-
-      CHARACTER(LEN=default_path_length)                 :: response_filename
-      CHARACTER(LEN=12)                                  :: source_label
-      COMPLEX(KIND=dp)                                   :: epsilon_zero
-      INTEGER                                            :: ia, ib, ipoint, iounit, response_unit
-      REAL(KIND=dp)                                      :: photon_energy
-      TYPE(cp_logger_type), POINTER                      :: logger
-      TYPE(section_vals_type), POINTER                   :: tensor_print_key
-
-      CPASSERT(SIZE(response_zero, 1) == ncart)
-      CPASSERT(SIZE(response_zero, 2) == ncart)
-      CPASSERT(SIZE(response_first, 1) == ncart)
-      CPASSERT(SIZE(response_first, 2) == ncart)
-      CPASSERT(SIZE(response_zero, 3) == SIZE(response_first, 3))
-      CPASSERT(SIZE(response_zero, 3) >= 2)
-
-      NULLIFY (logger, tensor_print_key)
-      source_label = 'IPA'
-      IF (PRESENT(transition_source)) source_label = transition_source
-      logger => cp_get_default_logger()
-      tensor_print_key => section_vals_get_subs_vals(ecd_section, "PRINT%RESPONSE_TENSOR")
-      response_filename = cp_print_key_generate_filename(logger, tensor_print_key, &
-                                                         extension=".ecd_response", my_local=.FALSE.)
-      response_unit = cp_print_key_unit_nr(logger, ecd_section, "PRINT%RESPONSE_TENSOR", &
-                                            extension=".ecd_response", file_position="REWIND", &
-                                            file_action="WRITE", file_form="FORMATTED")
-      IF (response_unit <= 0) RETURN
-
-      iounit = cp_logger_get_default_io_unit(logger)
-      IF (iounit > 0) THEN
-         WRITE (iounit, '(T2,A,1X,A)') 'ECD| Periodic response tensor file', TRIM(response_filename)
-      END IF
-      WRITE (response_unit, '(A)') '# CP2K periodic ECD dielectric response'
-      IF (PRESENT(context)) THEN
-         IF (.NOT. PRESENT(gauge_label) .OR. .NOT. PRESENT(gth_available) .OR. .NOT. PRESENT(fwhm) .OR. &
-             .NOT. PRESENT(transition_band_range) .OR. .NOT. PRESENT(ntransitions) .OR. &
-             .NOT. PRESENT(candidate_count) .OR. .NOT. PRESENT(requested_count) .OR. .NOT. PRESENT(cutoff_gap)) THEN
-            CPABORT('ECD| Periodic response metadata are incomplete')
-         END IF
-         WRITE (response_unit, '(A)') '# Format_version 3'
-         CALL ecd_periodic_write_output_metadata(response_unit, context, gauge_label, gth_available, fwhm, &
-                                                 transition_band_range, ntransitions, candidate_count, requested_count, &
-                                                 cutoff_gap, energy_range, SIZE(response_zero, 3), &
-                                                 source_label)
-      END IF
-      WRITE (response_unit, '(A)') '# epsilon0 includes the vacuum identity and diamagnetic baseline'
-      WRITE (response_unit, '(A)') '# epsilon1 is the directional Taylor coefficient in bohr'
-      WRITE (response_unit, '(A)', ADVANCE='NO') '# Columns: Energy_hartree Energy_eV'
-      DO ia = 1, ncart
-         DO ib = 1, ncart
-            WRITE (response_unit, '(1X,A,I1,I1,A)', ADVANCE='NO') 'epsilon0_', ia, ib, '_re'
-            WRITE (response_unit, '(1X,A,I1,I1,A)', ADVANCE='NO') 'epsilon0_', ia, ib, '_im'
-         END DO
-      END DO
-      DO ia = 1, ncart
-         DO ib = 1, ncart
-            WRITE (response_unit, '(1X,A,I1,I1,A)', ADVANCE='NO') 'epsilon1_', ia, ib, '_re'
-            WRITE (response_unit, '(1X,A,I1,I1,A)', ADVANCE='NO') 'epsilon1_', ia, ib, '_im'
-         END DO
-      END DO
-      WRITE (response_unit, '()')
-
-      DO ipoint = 1, SIZE(response_zero, 3)
-         photon_energy = energy_range(1) + REAL(ipoint - 1, KIND=dp)* &
-                          (energy_range(2) - energy_range(1))/REAL(SIZE(response_zero, 3) - 1, KIND=dp)
-         WRITE (response_unit, '(2(1X,ES18.10E3))', ADVANCE='NO') photon_energy, photon_energy*evolt
-         DO ia = 1, ncart
-            DO ib = 1, ncart
-               epsilon_zero = response_zero(ia, ib, ipoint)
-               IF (ia == ib) epsilon_zero = epsilon_zero + CMPLX(1.0_dp, 0.0_dp, KIND=dp)
-               WRITE (response_unit, '(2(1X,ES18.10E3))', ADVANCE='NO') &
-                  REAL(epsilon_zero, KIND=dp), AIMAG(epsilon_zero)
-            END DO
-         END DO
-         DO ia = 1, ncart
-            DO ib = 1, ncart
-               WRITE (response_unit, '(2(1X,ES18.10E3))', ADVANCE='NO') &
-                  REAL(response_first(ia, ib, ipoint), KIND=dp), AIMAG(response_first(ia, ib, ipoint))
-            END DO
-         END DO
-         WRITE (response_unit, '()')
-      END DO
-
-      CALL cp_print_key_finished_output(response_unit, logger, ecd_section, "PRINT%RESPONSE_TENSOR")
-
-   END SUBROUTINE ecd_periodic_print_response_tensor
-
-! **************************************************************************************************
-!> \brief Solve the first-order transverse Maxwell equation and write a directional ECD spectrum.
-!> \param ecd_section ECD input section supplying PRINT%SPECTRUM
-!> \param energy_range Photon-energy range in hartree
-!> \param direction Normalized propagation direction
-!> \param response_zero Zero-order response contribution, excluding vacuum identity
-!> \param response_first Directional first-order dielectric coefficient
-! **************************************************************************************************
-   SUBROUTINE ecd_periodic_print_maxwell_spectrum(ecd_section, energy_range, direction, response_zero, &
-                                                   response_first, context, gauge_label, gth_available, fwhm, &
-                                                   transition_band_range, ntransitions, transition_source, candidate_count, &
-                                                   requested_count, cutoff_gap)
-      TYPE(section_vals_type), POINTER                   :: ecd_section
-      REAL(KIND=dp), DIMENSION(2), INTENT(IN)            :: energy_range
-      REAL(KIND=dp), DIMENSION(ncart), INTENT(IN)        :: direction
-      COMPLEX(KIND=dp), DIMENSION(:, :, :), INTENT(IN)   :: response_first, response_zero
-      TYPE(ecd_gamma_context_type), INTENT(IN), OPTIONAL :: context
-      CHARACTER(LEN=*), INTENT(IN), OPTIONAL             :: gauge_label
-      LOGICAL, INTENT(IN), OPTIONAL                      :: gth_available
-      INTEGER, DIMENSION(2), INTENT(IN), OPTIONAL        :: transition_band_range
-      INTEGER, INTENT(IN), OPTIONAL                      :: candidate_count, ntransitions, requested_count
-      REAL(KIND=dp), INTENT(IN), OPTIONAL                :: cutoff_gap, fwhm
-      CHARACTER(LEN=*), INTENT(IN), OPTIONAL             :: transition_source
-
-      CHARACTER(LEN=default_path_length)                 :: spectrum_filename
-      CHARACTER(LEN=12)                                  :: source_label
-      COMPLEX(KIND=dp), DIMENSION(2, 2)                  :: epsilon_first_transverse, &
-                                                            epsilon_zero_transverse, maxwell_matrix, &
-                                                            polarizations
-      COMPLEX(KIND=dp), DIMENSION(4)                     :: roots
-      COMPLEX(KIND=dp)                                   :: q_l, q_r
-      INTEGER, DIMENSION(2)                              :: forward_roots
-      INTEGER                                            :: imode, ipoint, iounit, left_index, right_index, spectrum_unit
-      REAL(KIND=dp)                                      :: alpha_l, alpha_r, beta, label_separation, &
-                                                            max_residual, min_label_separation, photon_energy, &
-                                                            residuals(2)
-      REAL(KIND=dp), DIMENSION(ncart, 2)                 :: transverse_basis
-      TYPE(cp_logger_type), POINTER                      :: logger
-      TYPE(section_vals_type), POINTER                   :: spectrum_print_key
-
-      CPASSERT(SIZE(response_zero, 1) == ncart)
-      CPASSERT(SIZE(response_zero, 2) == ncart)
-      CPASSERT(SIZE(response_first, 1) == ncart)
-      CPASSERT(SIZE(response_first, 2) == ncart)
-      CPASSERT(SIZE(response_zero, 3) == SIZE(response_first, 3))
-      CPASSERT(SIZE(response_zero, 3) >= 2)
-
-      CALL ecd_periodic_transverse_basis(direction, transverse_basis)
-      NULLIFY (logger, spectrum_print_key)
-      source_label = 'IPA'
-      IF (PRESENT(transition_source)) source_label = transition_source
-      logger => cp_get_default_logger()
-      spectrum_print_key => section_vals_get_subs_vals(ecd_section, "PRINT%SPECTRUM")
-      spectrum_filename = cp_print_key_generate_filename(logger, spectrum_print_key, &
-                                                         extension=".ecd", my_local=.FALSE.)
-      spectrum_unit = cp_print_key_unit_nr(logger, ecd_section, "PRINT%SPECTRUM", &
-                                            extension=".ecd", file_position="REWIND", &
-                                            file_action="WRITE", file_form="FORMATTED")
-      IF (spectrum_unit <= 0) RETURN
-
-      iounit = cp_logger_get_default_io_unit(logger)
-      WRITE (spectrum_unit, '(A)') '# CP2K periodic ECD Maxwell spectrum'
-      IF (PRESENT(context)) THEN
-         IF (.NOT. PRESENT(gauge_label) .OR. .NOT. PRESENT(gth_available) .OR. .NOT. PRESENT(fwhm) .OR. &
-             .NOT. PRESENT(transition_band_range) .OR. .NOT. PRESENT(ntransitions) .OR. &
-             .NOT. PRESENT(candidate_count) .OR. .NOT. PRESENT(requested_count) .OR. .NOT. PRESENT(cutoff_gap)) THEN
-            CPABORT('ECD| Maxwell-spectrum metadata are incomplete')
-         END IF
-         WRITE (spectrum_unit, '(A)') '# Format_version 3'
-         CALL ecd_periodic_write_output_metadata(spectrum_unit, context, gauge_label, gth_available, fwhm, &
-                                                 transition_band_range, ntransitions, candidate_count, requested_count, &
-                                                 cutoff_gap, energy_range, SIZE(response_zero, 3), &
-                                                 source_label)
-      END IF
-      WRITE (spectrum_unit, '(A,3(1X,ES18.10E3))') '# Propagation_direction', direction
-      WRITE (spectrum_unit, '(A,3(1X,ES18.10E3))') '# Transverse_e1', transverse_basis(:, 1)
-      WRITE (spectrum_unit, '(A,3(1X,ES18.10E3))') '# Transverse_e2', transverse_basis(:, 2)
-      WRITE (spectrum_unit, '(A)') '# Circular convention: eL=(e1+i*e2)/sqrt(2), eR=(e1-i*e2)/sqrt(2)'
-      WRITE (spectrum_unit, '(A)') '# Columns: Energy_hartree Energy_eV q_L_re q_L_im q_R_re q_R_im '// &
-                                   'alpha_L_bohr-1 alpha_R_bohr-1 alpha_mean_bohr-1 Delta_alpha_bohr-1 '// &
-                                   'Maxwell_residual_L Maxwell_residual_R L_label_separation'
-
-      max_residual = 0.0_dp
-      min_label_separation = HUGE(1.0_dp)
-      DO ipoint = 1, SIZE(response_zero, 3)
-         photon_energy = energy_range(1) + REAL(ipoint - 1, KIND=dp)* &
-                         (energy_range(2) - energy_range(1))/REAL(SIZE(response_zero, 3) - 1, KIND=dp)
-         beta = (photon_energy/c_light_au)**2
-         CALL ecd_periodic_project_transverse(response_zero(:, :, ipoint), transverse_basis, &
-                                              epsilon_zero_transverse)
-         epsilon_zero_transverse(1, 1) = epsilon_zero_transverse(1, 1) + CMPLX(1.0_dp, 0.0_dp, KIND=dp)
-         epsilon_zero_transverse(2, 2) = epsilon_zero_transverse(2, 2) + CMPLX(1.0_dp, 0.0_dp, KIND=dp)
-         CALL ecd_periodic_project_transverse(response_first(:, :, ipoint), transverse_basis, &
-                                              epsilon_first_transverse)
-         CALL ecd_periodic_maxwell_roots(beta*epsilon_zero_transverse, beta*epsilon_first_transverse, roots)
-         CALL ecd_periodic_select_forward_roots(roots, forward_roots)
-         DO imode = 1, SIZE(forward_roots)
-            maxwell_matrix = CMPLX(0.0_dp, 0.0_dp, KIND=dp)
-            maxwell_matrix(1, 1) = roots(forward_roots(imode))**2
-            maxwell_matrix(2, 2) = roots(forward_roots(imode))**2
-            maxwell_matrix = maxwell_matrix - roots(forward_roots(imode))*beta*epsilon_first_transverse - &
-                             beta*epsilon_zero_transverse
-            CALL ecd_periodic_maxwell_nullvector(maxwell_matrix, polarizations(:, imode), residuals(imode))
-         END DO
-         CALL ecd_periodic_assign_circular_modes(polarizations, left_index, right_index, label_separation)
-         q_l = roots(forward_roots(left_index))
-         q_r = roots(forward_roots(right_index))
-         alpha_l = 2.0_dp*AIMAG(q_l)
-         alpha_r = 2.0_dp*AIMAG(q_r)
-         max_residual = MAX(max_residual, MAXVAL(residuals))
-         min_label_separation = MIN(min_label_separation, label_separation)
-         WRITE (spectrum_unit, '(13(1X,ES18.10E3))') photon_energy, photon_energy*evolt, &
-            REAL(q_l, KIND=dp), AIMAG(q_l), REAL(q_r, KIND=dp), AIMAG(q_r), alpha_l, alpha_r, &
-            0.5_dp*(alpha_l + alpha_r), alpha_l - alpha_r, residuals(left_index), residuals(right_index), &
-            label_separation
-      END DO
-
-      IF (iounit > 0) THEN
-         ipoint = (SIZE(response_zero, 3) + 1)/2
-         photon_energy = energy_range(1) + REAL(ipoint - 1, KIND=dp)* &
-                         (energy_range(2) - energy_range(1))/REAL(SIZE(response_zero, 3) - 1, KIND=dp)
-         WRITE (iounit, '(T2,A,T55,ES14.6)') 'ECD| Maxwell midpoint photon energy [hartree]', photon_energy
-         WRITE (iounit, '(T2,A,T55,ES14.6)') 'ECD| Maxwell maximum residual', max_residual
-         WRITE (iounit, '(T2,A,T55,ES14.6)') 'ECD| Maxwell minimum L-label separation', min_label_separation
-         WRITE (iounit, '(T2,A,1X,A)') 'ECD| Periodic Maxwell spectrum file', TRIM(spectrum_filename)
-      END IF
-      CALL cp_print_key_finished_output(spectrum_unit, logger, ecd_section, "PRINT%SPECTRUM")
-
-   END SUBROUTINE ecd_periodic_print_maxwell_spectrum
-
-! **************************************************************************************************
-!> \brief Construct a right-handed real transverse basis for a propagation direction.
-! **************************************************************************************************
-   SUBROUTINE ecd_periodic_transverse_basis(direction, transverse_basis)
-      REAL(KIND=dp), DIMENSION(ncart), INTENT(IN)        :: direction
-      REAL(KIND=dp), DIMENSION(ncart, 2), INTENT(OUT)    :: transverse_basis
-
-      INTEGER                                            :: seed_index
-      REAL(KIND=dp)                                      :: norm_e1, projection
-      REAL(KIND=dp), DIMENSION(ncart)                    :: seed
-
-      seed_index = MINLOC(ABS(direction), DIM=1)
-      seed = 0.0_dp
-      seed(seed_index) = 1.0_dp
-      projection = DOT_PRODUCT(seed, direction)
-      transverse_basis(:, 1) = seed - projection*direction
-      norm_e1 = SQRT(SUM(transverse_basis(:, 1)**2))
-      IF (norm_e1 <= SQRT(TINY(1.0_dp))) THEN
-         CPABORT('ECD| Unable to construct a transverse Maxwell basis')
-      END IF
-      transverse_basis(:, 1) = transverse_basis(:, 1)/norm_e1
-      transverse_basis(1, 2) = direction(2)*transverse_basis(3, 1) - direction(3)*transverse_basis(2, 1)
-      transverse_basis(2, 2) = direction(3)*transverse_basis(1, 1) - direction(1)*transverse_basis(3, 1)
-      transverse_basis(3, 2) = direction(1)*transverse_basis(2, 1) - direction(2)*transverse_basis(1, 1)
-
-   END SUBROUTINE ecd_periodic_transverse_basis
-
-! **************************************************************************************************
-!> \brief Project a Cartesian tensor into a real two-dimensional transverse basis.
-! **************************************************************************************************
-   SUBROUTINE ecd_periodic_project_transverse(cartesian_tensor, transverse_basis, transverse_tensor)
-      COMPLEX(KIND=dp), DIMENSION(ncart, ncart), INTENT(IN) :: cartesian_tensor
-      REAL(KIND=dp), DIMENSION(ncart, 2), INTENT(IN)     :: transverse_basis
-      COMPLEX(KIND=dp), DIMENSION(2, 2), INTENT(OUT)     :: transverse_tensor
-
-      INTEGER                                            :: ia, ib, it, jt
-
-      transverse_tensor = CMPLX(0.0_dp, 0.0_dp, KIND=dp)
-      DO it = 1, 2
-         DO jt = 1, 2
-            DO ia = 1, ncart
-               DO ib = 1, ncart
-                  transverse_tensor(it, jt) = transverse_tensor(it, jt) + &
-                                               transverse_basis(ia, it)*cartesian_tensor(ia, ib)* &
-                                               transverse_basis(ib, jt)
-               END DO
-            END DO
-         END DO
-      END DO
-
-   END SUBROUTINE ecd_periodic_project_transverse
-
-! **************************************************************************************************
-!> \brief Solve the quartic first-order transverse Maxwell dispersion polynomial.
-! **************************************************************************************************
-   SUBROUTINE ecd_periodic_maxwell_roots(maxwell_zero, maxwell_first, roots)
-      COMPLEX(KIND=dp), DIMENSION(2, 2), INTENT(IN)      :: maxwell_first, maxwell_zero
-      COMPLEX(KIND=dp), DIMENSION(4), INTENT(OUT)        :: roots
-
-      COMPLEX(KIND=dp)                                   :: a0, a1, a2, a3
-      COMPLEX(KIND=dp), DIMENSION(4, 4)                  :: companion
-      COMPLEX(KIND=dp), DIMENSION(1, 1)                  :: left_dummy, right_dummy
-      COMPLEX(KIND=dp), DIMENSION(8)                     :: work
-      INTEGER                                            :: info
-      REAL(KIND=dp), DIMENSION(8)                        :: rwork
-
-      EXTERNAL                                           :: zgeev
-
-      a3 = -(maxwell_first(1, 1) + maxwell_first(2, 2))
-      a2 = maxwell_first(1, 1)*maxwell_first(2, 2) - maxwell_first(1, 2)*maxwell_first(2, 1) - &
-           maxwell_zero(1, 1) - maxwell_zero(2, 2)
-      a1 = maxwell_first(1, 1)*maxwell_zero(2, 2) + maxwell_first(2, 2)*maxwell_zero(1, 1) - &
-           maxwell_first(1, 2)*maxwell_zero(2, 1) - maxwell_first(2, 1)*maxwell_zero(1, 2)
-      a0 = maxwell_zero(1, 1)*maxwell_zero(2, 2) - maxwell_zero(1, 2)*maxwell_zero(2, 1)
-
-      companion = CMPLX(0.0_dp, 0.0_dp, KIND=dp)
-      companion(1, 4) = -a0
-      companion(2, 1) = CMPLX(1.0_dp, 0.0_dp, KIND=dp)
-      companion(2, 4) = -a1
-      companion(3, 2) = CMPLX(1.0_dp, 0.0_dp, KIND=dp)
-      companion(3, 4) = -a2
-      companion(4, 3) = CMPLX(1.0_dp, 0.0_dp, KIND=dp)
-      companion(4, 4) = -a3
-      CALL zgeev('N', 'N', 4, companion, 4, roots, left_dummy, 1, right_dummy, 1, work, SIZE(work), rwork, info)
-      IF (info /= 0) THEN
-         CPABORT('ECD| Complex Maxwell root solver failed')
-      END IF
-
-   END SUBROUTINE ecd_periodic_maxwell_roots
-
-! **************************************************************************************************
-!> \brief Identify the two roots that propagate along the requested positive direction.
-! **************************************************************************************************
-   SUBROUTINE ecd_periodic_select_forward_roots(roots, forward_roots)
-      COMPLEX(KIND=dp), DIMENSION(4), INTENT(IN)         :: roots
-      INTEGER, DIMENSION(2), INTENT(OUT)                 :: forward_roots
-
-      INTEGER                                            :: iroot, nforward
-      REAL(KIND=dp)                                      :: root_scale, tolerance
-
-      root_scale = MAX(1.0_dp, MAXVAL(ABS(roots)))
-      tolerance = 100.0_dp*EPSILON(1.0_dp)*root_scale
-      nforward = 0
-      DO iroot = 1, SIZE(roots)
-         IF (REAL(roots(iroot), KIND=dp) > tolerance .OR. &
-             (ABS(REAL(roots(iroot), KIND=dp)) <= tolerance .AND. AIMAG(roots(iroot)) > tolerance)) THEN
-            nforward = nforward + 1
-            IF (nforward <= SIZE(forward_roots)) forward_roots(nforward) = iroot
-         END IF
-      END DO
-      IF (nforward /= SIZE(forward_roots)) THEN
-         CPABORT('ECD| Maxwell dispersion did not yield two forward propagation roots')
-      END IF
-
-   END SUBROUTINE ecd_periodic_select_forward_roots
-
-! **************************************************************************************************
-!> \brief Construct a normalized null vector for a two-dimensional Maxwell matrix.
-! **************************************************************************************************
-   SUBROUTINE ecd_periodic_maxwell_nullvector(maxwell_matrix, polarization, residual)
-      COMPLEX(KIND=dp), DIMENSION(2, 2), INTENT(IN)      :: maxwell_matrix
-      COMPLEX(KIND=dp), DIMENSION(2), INTENT(OUT)        :: polarization
-      REAL(KIND=dp), INTENT(OUT)                         :: residual
-
-      COMPLEX(KIND=dp), DIMENSION(2)                     :: candidate
-      REAL(KIND=dp)                                      :: first_norm, second_norm
-
-      first_norm = SQRT(SUM(ABS(maxwell_matrix(1, :))**2))
-      second_norm = SQRT(SUM(ABS(maxwell_matrix(2, :))**2))
-      IF (first_norm >= second_norm) THEN
-         candidate = [-maxwell_matrix(1, 2), maxwell_matrix(1, 1)]
-      ELSE
-         candidate = [-maxwell_matrix(2, 2), maxwell_matrix(2, 1)]
-      END IF
-      IF (SQRT(SUM(ABS(candidate)**2)) <= SQRT(TINY(1.0_dp))) THEN
-         CPABORT('ECD| Maxwell matrix has no stable transverse null vector')
-      END IF
-      polarization = candidate/SQRT(SUM(ABS(candidate)**2))
-      residual = SQRT(SUM(ABS(MATMUL(maxwell_matrix, polarization))**2))
-
-   END SUBROUTINE ecd_periodic_maxwell_nullvector
-
-! **************************************************************************************************
-!> \brief Assign the two forward transverse modes by circular-polarization overlap.
-! **************************************************************************************************
-   SUBROUTINE ecd_periodic_assign_circular_modes(polarizations, left_index, right_index, label_separation)
-      COMPLEX(KIND=dp), DIMENSION(2, 2), INTENT(IN)      :: polarizations
-      INTEGER, INTENT(OUT)                               :: left_index, right_index
-      REAL(KIND=dp), INTENT(OUT)                         :: label_separation
-
-      COMPLEX(KIND=dp), DIMENSION(2)                     :: circular_left
-      REAL(KIND=dp), DIMENSION(2)                        :: left_overlap
-
-      circular_left(1) = CMPLX(1.0_dp/SQRT(2.0_dp), 0.0_dp, KIND=dp)
-      circular_left(2) = CMPLX(0.0_dp, 1.0_dp/SQRT(2.0_dp), KIND=dp)
-      left_overlap(1) = ABS(DOT_PRODUCT(circular_left, polarizations(:, 1)))**2
-      left_overlap(2) = ABS(DOT_PRODUCT(circular_left, polarizations(:, 2)))**2
-      IF (left_overlap(1) >= left_overlap(2)) THEN
-         left_index = 1
-         right_index = 2
-      ELSE
-         left_index = 2
-         right_index = 1
-      END IF
-      label_separation = ABS(left_overlap(1) - left_overlap(2))
-
-   END SUBROUTINE ecd_periodic_assign_circular_modes
+   END SUBROUTINE ecd_periodic_print_cartesian_output_summary
 
 ! **************************************************************************************************
 !> \brief Allocate a Cartesian vector of real AO matrices on an explicit-Gamma neighbour list.

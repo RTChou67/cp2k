@@ -2235,13 +2235,6 @@ CONTAINS
       CALL section_add_keyword(section, keyword)
       CALL keyword_release(keyword)
 
-      CALL keyword_create(keyword, __LOCATION__, name="PROPAGATION_DIRECTION", &
-                          description="Cartesian propagation direction used by the periodic ECD response.", &
-                          usage="PROPAGATION_DIRECTION 0.0 0.0 1.0", &
-                          n_var=3, type_of_var=real_t)
-      CALL section_add_keyword(section, keyword)
-      CALL keyword_release(keyword)
-
       CALL keyword_create(keyword, __LOCATION__, name="REFERENCE", &
                           description="Reference point used consistently by molecular operators and periodic "// &
                           "finite-wave-vector phases.", &
@@ -2282,17 +2275,10 @@ CONTAINS
 
       CALL section_create(subsection, __LOCATION__, name="IPA", &
                           description="Controls independent-particle ECD spectra.", &
-                          n_keywords=4, repeats=.FALSE.)
+                          n_keywords=3, repeats=.FALSE.)
       CALL keyword_create(keyword, __LOCATION__, name="_SECTION_PARAMETERS_", &
                           description="Controls the activation of the independent-particle ECD source.", &
                           default_l_val=.FALSE., lone_keyword_l_val=.TRUE.)
-      CALL section_add_keyword(subsection, keyword)
-      CALL keyword_release(keyword)
-      CALL keyword_create(keyword, __LOCATION__, name="ELECTRIC_GAUGE", &
-                          description="Electric representation used by the periodic independent-particle response.", &
-                          usage="ELECTRIC_GAUGE VELOCITY", &
-                          enum_c_vals=s2a("LENGTH", "VELOCITY"), &
-                          enum_i_vals=[1, 2], default_i_val=2)
       CALL section_add_keyword(subsection, keyword)
       CALL keyword_release(keyword)
       CALL keyword_create(keyword, __LOCATION__, name="NTRANSITIONS", &
@@ -2313,17 +2299,10 @@ CONTAINS
 
       CALL section_create(subsection, __LOCATION__, name="LR_TDDFT", &
                           description="Controls ECD spectra assembled from an existing TDDFPT calculation.", &
-                          n_keywords=3, repeats=.FALSE.)
+                          n_keywords=2, repeats=.FALSE.)
       CALL keyword_create(keyword, __LOCATION__, name="_SECTION_PARAMETERS_", &
                           description="Controls the activation of the TDDFT ECD source.", &
                           default_l_val=.FALSE., lone_keyword_l_val=.TRUE.)
-      CALL section_add_keyword(subsection, keyword)
-      CALL keyword_release(keyword)
-      CALL keyword_create(keyword, __LOCATION__, name="ELECTRIC_GAUGE", &
-                          description="Primary electric representation for periodic TDDFPT/TDA ECD response.", &
-                          usage="ELECTRIC_GAUGE VELOCITY", &
-                          enum_c_vals=s2a("LENGTH", "VELOCITY"), &
-                          enum_i_vals=[1, 2], default_i_val=2)
       CALL section_add_keyword(subsection, keyword)
       CALL keyword_release(keyword)
       CALL keyword_create(keyword, __LOCATION__, name="STATE_LIST", &
@@ -2373,9 +2352,19 @@ CONTAINS
       CALL section_add_subsection(subsection, print_key)
       CALL section_release(print_key)
       CALL cp_print_key_section_create(print_key, __LOCATION__, name="RESPONSE_TENSOR", &
-                                       description="Controls the printing of periodic ECD dielectric-response "// &
-                                       "Taylor coefficients.", &
+                                       description="Controls the printing of periodic ECD Cartesian dielectric-response "// &
+                                       "Taylor tensors.", &
                                        print_level=low_print_level)
+      CALL keyword_create(keyword, __LOCATION__, name="ENERGY_RANGE", &
+                          description="Photon-energy interval used by the periodic Cartesian response grid.", &
+                          usage="ENERGY_RANGE 0.0 10.0", n_var=2, type_of_var=real_t, unit_str="eV")
+      CALL section_add_keyword(print_key, keyword)
+      CALL keyword_release(keyword)
+      CALL keyword_create(keyword, __LOCATION__, name="NPOINTS", &
+                          description="Number of points in the periodic Cartesian response grid.", &
+                          usage="NPOINTS 2001", n_var=1, type_of_var=integer_t, default_i_val=2001)
+      CALL section_add_keyword(print_key, keyword)
+      CALL keyword_release(keyword)
       CALL section_add_subsection(subsection, print_key)
       CALL section_release(print_key)
       CALL cp_print_key_section_create(print_key, __LOCATION__, name="MATRIX_ELEMENTS", &
