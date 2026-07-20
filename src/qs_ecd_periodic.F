@@ -150,6 +150,7 @@ CONTAINS
 
       CHARACTER(LEN=default_string_length)               :: gauge_label
       COMPLEX(KIND=dp), ALLOCATABLE, DIMENSION(:, :, :)  :: velocity_response_first, velocity_response_zero
+      COMPLEX(KIND=dp), ALLOCATABLE, DIMENSION(:, :, :)  :: length_transition, velocity_transition
       INTEGER                                            :: electric_gauge, npoints, spatial_order
       LOGICAL                                            :: direction_explicit, do_kpoints, &
                                                             energy_range_explicit
@@ -276,12 +277,16 @@ CONTAINS
       CALL ecd_periodic_implicit_gamma_velocity_response_g10(qs_env, ecd_section, gamma_context, gamma_operators, &
                                                               transition_selection, energy_range, npoints, fwhm, &
                                                               electric_gauge == ecd_gauge_velocity, velocity_response_zero, &
-                                                              velocity_response_first, diamagnetic_kernel)
+                                                              velocity_response_first, diamagnetic_kernel, velocity_transition)
       CALL ecd_periodic_implicit_gamma_length_response_g13(ecd_section, gamma_context, gamma_operators, &
                                                             transition_selection, energy_range, npoints, fwhm, &
                                                             gauge_label, electric_gauge == ecd_gauge_length, &
                                                             velocity_response_zero, velocity_response_first, &
-                                                            diamagnetic_kernel)
+                                                            diamagnetic_kernel, length_transition)
+      CALL ecd_periodic_print_transition_matrix_elements(ecd_section, gamma_context, transition_selection, &
+                                                          gauge_label, pseudopotential_commutator, &
+                                                          velocity_transition, length_transition)
+      DEALLOCATE (length_transition, velocity_transition)
       DEALLOCATE (velocity_response_first, velocity_response_zero)
       CALL ecd_periodic_transition_selection_release(transition_selection)
       CALL ecd_gamma_zero_order_operators_release(gamma_operators)
@@ -1330,7 +1335,7 @@ CONTAINS
    SUBROUTINE ecd_periodic_implicit_gamma_velocity_response_g10(qs_env, ecd_section, context, operators, &
                                                                  transition_selection, energy_range, npoints, fwhm, &
                                                                  write_response, response_zero_output, response_first_output, &
-                                                                 diamagnetic_kernel_output)
+                                                                 diamagnetic_kernel_output, transition_output)
       TYPE(qs_environment_type), POINTER                 :: qs_env
       TYPE(section_vals_type), POINTER                   :: ecd_section
       TYPE(ecd_gamma_context_type), INTENT(IN), TARGET   :: context
@@ -1342,6 +1347,7 @@ CONTAINS
       REAL(KIND=dp), INTENT(IN)                          :: fwhm
       COMPLEX(KIND=dp), ALLOCATABLE, DIMENSION(:, :, :), INTENT(OUT) :: response_first_output, response_zero_output
       REAL(KIND=dp), DIMENSION(ncart, ncart), INTENT(OUT) :: diamagnetic_kernel_output
+      COMPLEX(KIND=dp), ALLOCATABLE, DIMENSION(:, :, :), INTENT(OUT) :: transition_output
 
       COMPLEX(KIND=dp), ALLOCATABLE, DIMENSION(:, :)     :: current_first_mo, current_first_rotated, &
                                                             current_zero_mo, current_zero_rotated, &
@@ -1389,6 +1395,8 @@ CONTAINS
       response_first = CMPLX(0.0_dp, 0.0_dp, KIND=dp)
       response_first_counter = CMPLX(0.0_dp, 0.0_dp, KIND=dp)
       response_resonant = CMPLX(0.0_dp, 0.0_dp, KIND=dp)
+      ALLOCATE (transition_output(ncart, 0:1, transition_selection%selected_count))
+      transition_output = CMPLX(0.0_dp, 0.0_dp, KIND=dp)
 
       logger => cp_get_default_logger()
       ntransitions_total = 0
@@ -1452,6 +1460,7 @@ CONTAINS
                transition_taylor(idir, 0) = current_zero_components(ivirt, iband, idir)
                transition_taylor(idir, 1) = current_first_components(ivirt, iband, idir)
             END DO
+            transition_output(:, :, itransition) = transition_taylor
             ntransitions = ntransitions + 1
             CALL ecd_periodic_response_add_transition(transition_taylor, gap_taylor, occupation_difference, &
                                                       cell_volume, energy_range, fwhm, response_resonant, &
@@ -1535,7 +1544,7 @@ CONTAINS
    SUBROUTINE ecd_periodic_implicit_gamma_length_response_g13(ecd_section, context, operators, &
                                                                transition_selection, energy_range, npoints, fwhm, &
                                                                gauge_label, write_response, velocity_response_zero, &
-                                                               velocity_response_first, diamagnetic_kernel)
+                                                               velocity_response_first, diamagnetic_kernel, transition_output)
       TYPE(section_vals_type), POINTER                   :: ecd_section
       TYPE(ecd_gamma_context_type), INTENT(IN), TARGET   :: context
       TYPE(ecd_gamma_zero_order_operators_type), INTENT(IN), TARGET :: operators
@@ -1547,6 +1556,7 @@ CONTAINS
       REAL(KIND=dp), INTENT(IN)                          :: fwhm
       COMPLEX(KIND=dp), DIMENSION(:, :, :), INTENT(IN)   :: velocity_response_first, velocity_response_zero
       REAL(KIND=dp), DIMENSION(ncart, ncart), INTENT(IN) :: diamagnetic_kernel
+      COMPLEX(KIND=dp), ALLOCATABLE, DIMENSION(:, :, :), INTENT(OUT) :: transition_output
 
       REAL(KIND=dp), PARAMETER                           :: occupation_threshold = 1.0E-8_dp
 
@@ -1598,6 +1608,8 @@ CONTAINS
       response_first_counter = CMPLX(0.0_dp, 0.0_dp, KIND=dp)
       response_first_resonant = CMPLX(0.0_dp, 0.0_dp, KIND=dp)
       response_resonant = CMPLX(0.0_dp, 0.0_dp, KIND=dp)
+      ALLOCATE (transition_output(ncart, 0:1, transition_selection%selected_count))
+      transition_output = CMPLX(0.0_dp, 0.0_dp, KIND=dp)
 
       logger => cp_get_default_logger()
       ntransitions_total = 0
@@ -1625,6 +1637,7 @@ CONTAINS
                                              gap*(length_first_operator_components(ivirt, iband, idir) + &
                                                   length_first_state_components(ivirt, iband, idir))
             END DO
+            transition_output(:, :, itransition) = transition_taylor
             ntransitions = ntransitions + 1
             CALL ecd_periodic_response_add_transition(transition_taylor, gap_taylor, occupation_difference, &
                                                       cell_volume, energy_range, fwhm, response_resonant, &
@@ -1913,6 +1926,104 @@ CONTAINS
       END IF
 
    END SUBROUTINE ecd_periodic_implicit_gamma_diamagnetic_kernel
+
+! **************************************************************************************************
+!> \brief Write complete periodic IPA transition coefficients for both electric representations.
+! **************************************************************************************************
+   SUBROUTINE ecd_periodic_print_transition_matrix_elements(ecd_section, context, transition_selection, &
+                                                             gauge_label, gth_requested, &
+                                                             velocity_transition, length_transition)
+      TYPE(section_vals_type), POINTER                   :: ecd_section
+      TYPE(ecd_gamma_context_type), INTENT(IN)           :: context
+      TYPE(ecd_periodic_transition_selection_type), INTENT(IN) :: transition_selection
+      CHARACTER(LEN=*), INTENT(IN)                       :: gauge_label
+      LOGICAL, INTENT(IN)                                :: gth_requested
+      COMPLEX(KIND=dp), DIMENSION(:, 0:, :), INTENT(IN)  :: length_transition, velocity_transition
+
+      CHARACTER(LEN=default_path_length)                 :: matrix_filename
+      INTEGER                                            :: idir, iocc, ispin, itransition, ivirt, matrix_unit
+      REAL(KIND=dp)                                      :: gap_derivative
+      TYPE(cp_logger_type), POINTER                      :: logger
+      TYPE(section_vals_type), POINTER                   :: matrix_print_key
+
+      IF (SIZE(velocity_transition, 1) /= ncart .OR. SIZE(length_transition, 1) /= ncart .OR. &
+          LBOUND(velocity_transition, 2) /= 0 .OR. LBOUND(length_transition, 2) /= 0 .OR. &
+          UBOUND(velocity_transition, 2) < 1 .OR. UBOUND(length_transition, 2) < 1 .OR. &
+          SIZE(velocity_transition, 3) /= transition_selection%selected_count .OR. &
+          SIZE(length_transition, 3) /= transition_selection%selected_count) THEN
+         CPABORT('ECD| Periodic transition-matrix output received inconsistent transition coefficients')
+      END IF
+      IF (.NOT. ALLOCATED(context%spin)) THEN
+         CPABORT('ECD| Periodic transition-matrix output requires retained Gamma spin data')
+      END IF
+
+      NULLIFY (logger, matrix_print_key)
+      logger => cp_get_default_logger()
+      matrix_print_key => section_vals_get_subs_vals(ecd_section, 'PRINT%MATRIX_ELEMENTS')
+      matrix_filename = cp_print_key_generate_filename(logger, matrix_print_key, &
+                                                       extension='.ecd_matrix', my_local=.FALSE.)
+      matrix_unit = cp_print_key_unit_nr(logger, ecd_section, 'PRINT%MATRIX_ELEMENTS', &
+                                         extension='.ecd_matrix', file_position='REWIND', &
+                                         file_action='WRITE', file_form='FORMATTED')
+      IF (matrix_unit <= 0) RETURN
+
+      WRITE (matrix_unit, '(A)') '# CP2K periodic ECD IPA transition matrix elements'
+      WRITE (matrix_unit, '(A)') '# Format_version 1'
+      WRITE (matrix_unit, '(A)') '# Gamma_layout IMPLICIT'
+      WRITE (matrix_unit, '(A,1X,A)') '# Primary_electric_gauge', TRIM(gauge_label)
+      WRITE (matrix_unit, '(A,1X,L1)') '# GTH_nonlocal_current_requested', gth_requested
+      WRITE (matrix_unit, '(A,3(1X,ES18.10E3))') '# Reference_point_bohr', context%ref_point
+      WRITE (matrix_unit, '(A,3(1X,ES18.10E3))') '# Propagation_direction', context%direction
+      WRITE (matrix_unit, '(A,2(1X,I0))') '# Transition_band_range', transition_selection%band_range
+      WRITE (matrix_unit, '(A,1X,I0)') '# Requested_occupied_empty_pairs', transition_selection%requested_count
+      WRITE (matrix_unit, '(A,1X,I0)') '# Candidate_occupied_empty_pairs', transition_selection%candidate_count
+      WRITE (matrix_unit, '(A,1X,I0)') '# Selected_occupied_empty_pairs', transition_selection%selected_count
+      WRITE (matrix_unit, '(A,1X,ES18.10E3)') '# Transition_cutoff_gap_hartree', transition_selection%cutoff_gap
+      WRITE (matrix_unit, '(A)') '# Velocity and length coefficients use normalized q-Taylor orders 0 and 1.'
+      WRITE (matrix_unit, '(A)') '# Length coefficients are reconstructed as velocity-equivalent transitions.'
+      WRITE (matrix_unit, '(A)') '# Per Cartesian component: velocity0_re velocity0_im velocity1_re velocity1_im '// &
+                                  'length0_re length0_im length1_re length1_im'
+      WRITE (matrix_unit, '(A)') '# Columns: Transition_index Spin Occupied_band Virtual_band Occupation_difference '// &
+                                  'Gap0_hartree Gap1_hartree followed by X, Y, and Z component groups.'
+
+      DO itransition = 1, transition_selection%selected_count
+         ispin = transition_selection%ispin(itransition)
+         iocc = transition_selection%iocc(itransition)
+         ivirt = transition_selection%ivirt(itransition)
+         IF (ispin < 1 .OR. ispin > context%nspin) THEN
+            CPABORT('ECD| Periodic transition-matrix output found an invalid spin index')
+         END IF
+         IF (iocc < 1 .OR. ivirt < 1 .OR. iocc > context%spin(ispin)%nmo .OR. &
+             ivirt > context%spin(ispin)%nmo .OR. &
+             .NOT. ASSOCIATED(context%spin(ispin)%eigenvalue_first)) THEN
+            CPABORT('ECD| Periodic transition-matrix output found incomplete first-order state data')
+         END IF
+         gap_derivative = 0.5_dp*(context%spin(ispin)%eigenvalue_first(ivirt) + &
+                                  context%spin(ispin)%eigenvalue_first(iocc))
+         WRITE (matrix_unit, '(4(I0,1X),3(ES18.10E3,1X))', ADVANCE='NO') itransition, ispin, iocc, ivirt, &
+            transition_selection%occupation_difference(itransition), transition_selection%gap(itransition), &
+            gap_derivative
+         DO idir = 1, ncart
+            WRITE (matrix_unit, '(8(ES18.10E3,1X))', ADVANCE='NO') &
+               REAL(velocity_transition(idir, 0, itransition), KIND=dp), &
+               AIMAG(velocity_transition(idir, 0, itransition)), &
+               REAL(velocity_transition(idir, 1, itransition), KIND=dp), &
+               AIMAG(velocity_transition(idir, 1, itransition)), &
+               REAL(length_transition(idir, 0, itransition), KIND=dp), &
+               AIMAG(length_transition(idir, 0, itransition)), &
+               REAL(length_transition(idir, 1, itransition), KIND=dp), &
+               AIMAG(length_transition(idir, 1, itransition))
+         END DO
+         WRITE (matrix_unit, '()')
+      END DO
+
+      IF (cp_logger_get_default_io_unit(logger) > 0) THEN
+         WRITE (cp_logger_get_default_io_unit(logger), '(T2,A,1X,A)') &
+            'ECD| Periodic transition matrix file', TRIM(matrix_filename)
+      END IF
+      CALL cp_print_key_finished_output(matrix_unit, logger, ecd_section, 'PRINT%MATRIX_ELEMENTS')
+
+   END SUBROUTINE ecd_periodic_print_transition_matrix_elements
 
 ! **************************************************************************************************
 !> \brief Write common reproducibility metadata for implicit-Gamma periodic ECD files.
