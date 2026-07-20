@@ -183,6 +183,7 @@ CONTAINS
       REAL(KIND=dp)                                      :: direction_norm, eps_degeneracy
       REAL(KIND=dp), DIMENSION(:), POINTER               :: direction_ptr, energy_range
       REAL(KIND=dp), DIMENSION(ncart)                    :: direction
+      REAL(KIND=dp), DIMENSION(ncart, ncart)             :: diamagnetic_kernel
       TYPE(cell_type), POINTER                           :: cell
       TYPE(ecd_gamma_context_type)                       :: gamma_context
       TYPE(ecd_gamma_zero_order_operators_type)          :: gamma_operators
@@ -299,11 +300,12 @@ CONTAINS
       CALL ecd_periodic_implicit_gamma_velocity_response_g10(qs_env, ecd_section, gamma_context, gamma_operators, &
                                                               transition_band_range, energy_range, npoints, fwhm, &
                                                               electric_gauge == ecd_gauge_velocity, velocity_response_zero, &
-                                                              velocity_response_first)
-      CALL ecd_periodic_implicit_gamma_length_response_g13(qs_env, ecd_section, gamma_context, gamma_operators, &
+                                                              velocity_response_first, diamagnetic_kernel)
+      CALL ecd_periodic_implicit_gamma_length_response_g13(ecd_section, gamma_context, gamma_operators, &
                                                             transition_band_range, energy_range, npoints, fwhm, &
                                                             gauge_label, electric_gauge == ecd_gauge_length, &
-                                                            velocity_response_zero, velocity_response_first)
+                                                            velocity_response_zero, velocity_response_first, &
+                                                            diamagnetic_kernel)
       DEALLOCATE (velocity_response_first, velocity_response_zero)
       CALL ecd_gamma_zero_order_operators_release(gamma_operators)
       CALL ecd_gamma_context_release(gamma_context)
@@ -1147,7 +1149,8 @@ CONTAINS
 ! **************************************************************************************************
    SUBROUTINE ecd_periodic_implicit_gamma_velocity_response_g10(qs_env, ecd_section, context, operators, &
                                                                  transition_band_range, energy_range, npoints, fwhm, &
-                                                                 write_response, response_zero_output, response_first_output)
+                                                                 write_response, response_zero_output, response_first_output, &
+                                                                 diamagnetic_kernel_output)
       TYPE(qs_environment_type), POINTER                 :: qs_env
       TYPE(section_vals_type), POINTER                   :: ecd_section
       TYPE(ecd_gamma_context_type), INTENT(IN), TARGET   :: context
@@ -1158,6 +1161,7 @@ CONTAINS
       INTEGER, INTENT(IN)                                :: npoints
       REAL(KIND=dp), INTENT(IN)                          :: fwhm
       COMPLEX(KIND=dp), ALLOCATABLE, DIMENSION(:, :, :), INTENT(OUT) :: response_first_output, response_zero_output
+      REAL(KIND=dp), DIMENSION(ncart, ncart), INTENT(OUT) :: diamagnetic_kernel_output
 
       REAL(KIND=dp), PARAMETER                           :: occupation_threshold = 1.0E-8_dp
 
@@ -1179,7 +1183,6 @@ CONTAINS
                                                             response_first_resonant_norm, response_norm, &
                                                             response_resonant_norm
       REAL(KIND=dp), ALLOCATABLE, DIMENSION(:)           :: gap_taylor
-      REAL(KIND=dp), DIMENSION(ncart, ncart)             :: diamagnetic_kernel
       TYPE(cp_logger_type), POINTER                      :: logger
       TYPE(dbcsr_p_type), DIMENSION(:), POINTER          :: complete_current, gth_current, local_current, position
 
@@ -1303,14 +1306,14 @@ CONTAINS
          DEALLOCATE (current_first_components, current_zero_components, gap_taylor, transition_taylor)
       END DO
 
-      CALL ecd_periodic_implicit_gamma_diamagnetic_kernel(qs_env, context, gth_available, diamagnetic_kernel)
+      CALL ecd_periodic_implicit_gamma_diamagnetic_kernel(qs_env, context, gth_available, diamagnetic_kernel_output)
       response_zero = response_resonant + response_counter
       DO ipoint = 1, npoints
          photon_energy = energy_range(1) + REAL(ipoint - 1, KIND=dp)* &
                          (energy_range(2) - energy_range(1))/REAL(npoints - 1, KIND=dp)
          prefactor = 2.0_dp*twopi/(cell_volume*photon_energy**2)
          response_zero(:, :, ipoint) = response_zero(:, :, ipoint) + &
-                                        CMPLX(prefactor*diamagnetic_kernel, 0.0_dp, KIND=dp)
+                                        CMPLX(prefactor*diamagnetic_kernel_output, 0.0_dp, KIND=dp)
       END DO
       response_first = response_first + response_first_counter
 
@@ -1365,11 +1368,10 @@ CONTAINS
 ! **************************************************************************************************
 !> \brief Assemble the first-order length-gauge causal response and compare it with the velocity tensor.
 ! **************************************************************************************************
-   SUBROUTINE ecd_periodic_implicit_gamma_length_response_g13(qs_env, ecd_section, context, operators, &
+   SUBROUTINE ecd_periodic_implicit_gamma_length_response_g13(ecd_section, context, operators, &
                                                                transition_band_range, energy_range, npoints, fwhm, &
                                                                gauge_label, write_response, velocity_response_zero, &
-                                                               velocity_response_first)
-      TYPE(qs_environment_type), POINTER                 :: qs_env
+                                                               velocity_response_first, diamagnetic_kernel)
       TYPE(section_vals_type), POINTER                   :: ecd_section
       TYPE(ecd_gamma_context_type), INTENT(IN), TARGET   :: context
       TYPE(ecd_gamma_zero_order_operators_type), INTENT(IN), TARGET :: operators
@@ -1380,6 +1382,7 @@ CONTAINS
       INTEGER, INTENT(IN)                                :: npoints
       REAL(KIND=dp), INTENT(IN)                          :: fwhm
       COMPLEX(KIND=dp), DIMENSION(:, :, :), INTENT(IN)   :: velocity_response_first, velocity_response_zero
+      REAL(KIND=dp), DIMENSION(ncart, ncart), INTENT(IN) :: diamagnetic_kernel
 
       REAL(KIND=dp), PARAMETER                           :: occupation_threshold = 1.0E-8_dp
 
@@ -1404,7 +1407,6 @@ CONTAINS
                                                             response_norm, response_resonant_norm
       REAL(KIND=dp)                                      :: velocity_first_norm, velocity_zero_norm
       REAL(KIND=dp), DIMENSION(0:1)                      :: gap_taylor
-      REAL(KIND=dp), DIMENSION(ncart, ncart)             :: diamagnetic_kernel
       TYPE(cp_logger_type), POINTER                      :: logger
       TYPE(dbcsr_p_type), DIMENSION(:), POINTER          :: complete_current, gth_current, local_current, position
 
@@ -1492,7 +1494,6 @@ CONTAINS
                      transition_taylor)
       END DO
 
-      CALL ecd_periodic_implicit_gamma_diamagnetic_kernel(qs_env, context, gth_available, diamagnetic_kernel)
       response_zero = response_resonant + response_counter
       response_first = response_first_resonant + response_first_counter
       DO ipoint = 1, npoints
