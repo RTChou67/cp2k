@@ -417,7 +417,7 @@ CONTAINS
 ! **************************************************************************************************
 !> \brief Calculate [r,Vnl] (matrix_rv), r x [r,Vnl] (matrix_rxrv)
 !>        or [rr,Vnl] (matrix_rrv) in AO basis.
-!>        Reference point is required for the two latter options
+!>        Non-periodic high-order moments use an explicit reference point.
 !>        Update: Calculate rxVnlxr (matrix_rvr) and rxrxVnl + Vnlxrxr (matrix_rrv_vrr)
 !>        in AO basis. Added in the first place for current correction in
 !>        the VG formalism (first order wrt vector potential).
@@ -513,10 +513,13 @@ CONTAINS
       END IF
 
       natom = SIZE(particle_set)
+      periodic = ANY(cell%perd > 0)
 
       IF (my_rxrv .OR. my_rrv .OR. my_r_rxvr .OR. my_rxvr_r .OR. my_r_doublecom) THEN
          order = 2
-         CPASSERT(PRESENT(ref_point)) ! need reference point for r x [r,Vnl] and [rr,Vnl]
+         IF (.NOT. periodic) THEN
+            CPASSERT(PRESENT(ref_point))
+         END IF
       ELSE IF (my_rvr .OR. my_rrv_vrr) THEN
          order = 2
       ELSE
@@ -528,7 +531,6 @@ CONTAINS
          CPASSERT(PRESENT(pseudoatom))
       END IF
 
-      periodic = ANY(cell%perd > 0)
       my_ref = .FALSE.
       IF (PRESENT(ref_point)) THEN
          IF (.NOT. periodic) THEN
