@@ -2573,7 +2573,11 @@ CONTAINS
       END IF
       WRITE (response_unit, '(A)') '# Length epsilon uses direct length-polarization transitions without a diamagnetic kernel.'
       WRITE (response_unit, '(A)') '# epsilon1_abq stores the q_x, q_y, q_z Cartesian derivative components.'
-      WRITE (response_unit, '(A)') '# Velocity epsilon1 includes the GTH finite-q two-field diamagnetic coefficient.'
+      IF (pseudopotential_commutator) THEN
+         WRITE (response_unit, '(A)') '# Velocity epsilon1 includes the GTH finite-q two-field diamagnetic coefficient.'
+      ELSE
+         WRITE (response_unit, '(A)') '# Velocity epsilon1 uses the local-current ablation and excludes the GTH two-field coefficient.'
+      END IF
       WRITE (response_unit, '(A)', ADVANCE='NO') '# Columns: Energy_hartree Energy_eV'
       DO idir = 1, 2
          representation_label = 'length'
