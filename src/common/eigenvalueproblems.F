@@ -20,7 +20,7 @@ MODULE eigenvalueproblems
 
    PRIVATE
 
-   PUBLIC :: diagonalise
+   PUBLIC :: diagonalise, singular_values
 
    CHARACTER(len=*), PARAMETER, PRIVATE :: moduleN = 'eigenvalueproblems'
 
@@ -171,4 +171,3 @@ CONTAINS
    END SUBROUTINE cp2k_cgesvd
 
 END MODULE eigenvalueproblems
-

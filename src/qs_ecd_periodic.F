@@ -13,6 +13,7 @@ MODULE qs_ecd_periodic
    USE cp_control_types,                ONLY: dft_control_type
    USE cp_cfm_diag,                     ONLY: cp_cfm_geeig
    USE cp_cfm_types,                    ONLY: cp_cfm_create,&
+                                              cp_cfm_get_submatrix,&
                                               cp_cfm_release,&
                                               cp_cfm_type,&
                                               cp_fm_to_cfm
@@ -37,6 +38,7 @@ MODULE qs_ecd_periodic
                                               cp_fm_get_submatrix,&
                                               cp_fm_release,&
                                               cp_fm_type
+   USE eigenvalueproblems,               ONLY: singular_values
    USE cp_log_handling,                 ONLY: cp_get_default_logger,&
                                               cp_logger_get_default_io_unit,&
                                               cp_logger_type
@@ -54,6 +56,7 @@ MODULE qs_ecd_periodic
    USE mathconstants,                   ONLY: twopi
    USE orbital_pointers,                 ONLY: coset, ncoset
    USE qs_ecd_subspace,                 ONLY: ecd_band_first_order_response,&
+                                              ecd_band_manifold_type,&
                                               ecd_band_manifolds_validate_window,&
                                               ecd_taylor_retarded_response_pair,&
                                               ecd_taylor_retarded_response
@@ -428,7 +431,9 @@ CONTAINS
       INTEGER                                            :: first_band, icandidate, ispin, ivirt, iocc, last_band, &
                                                             nbase, ncandidates, nmo
       REAL(KIND=dp), PARAMETER                           :: occupation_threshold = 1.0E-8_dp
-      INTEGER, ALLOCATABLE, DIMENSION(:)                 :: candidate_iocc, candidate_ispin, candidate_ivirt, order
+      INTEGER, ALLOCATABLE, DIMENSION(:)                 :: candidate_iocc, candidate_ispin, candidate_ivirt, &
+                                                            candidate_occ_manifold, candidate_virt_manifold, order
+      LOGICAL, ALLOCATABLE, DIMENSION(:)                 :: candidate_selected
       REAL(KIND=dp), ALLOCATABLE, DIMENSION(:)           :: candidate_gap, candidate_occupation_difference
 
       CALL ecd_periodic_transition_selection_release(selection)
@@ -462,7 +467,8 @@ CONTAINS
       END IF
 
       ALLOCATE (candidate_gap(ncandidates), candidate_iocc(ncandidates), candidate_ispin(ncandidates), &
-                candidate_ivirt(ncandidates), candidate_occupation_difference(ncandidates), order(ncandidates))
+                candidate_ivirt(ncandidates), candidate_occ_manifold(ncandidates), &
+                candidate_virt_manifold(ncandidates), candidate_occupation_difference(ncandidates), order(ncandidates))
       icandidate = 0
       DO ispin = 1, context%nspin
          CALL ecd_periodic_transition_window(context%spin(ispin), transition_band_range, first_band, last_band)
@@ -480,6 +486,10 @@ CONTAINS
                candidate_iocc(icandidate) = iocc
                candidate_ispin(icandidate) = ispin
                candidate_ivirt(icandidate) = ivirt
+               candidate_occ_manifold(icandidate) = ecd_periodic_band_manifold_index( &
+                  context%spin(ispin)%manifolds, iocc)
+               candidate_virt_manifold(icandidate) = ecd_periodic_band_manifold_index( &
+                  context%spin(ispin)%manifolds, ivirt)
                candidate_occupation_difference(icandidate) = context%spin(ispin)%occupations(iocc) - &
                                                                context%spin(ispin)%occupations(ivirt)
             END DO
@@ -494,12 +504,25 @@ CONTAINS
          nbase = MIN(nrequested, ncandidates)
       END IF
       selection%cutoff_gap = candidate_gap(order(nbase))
-      selection%selected_count = nbase
-      DO WHILE (selection%selected_count < ncandidates)
-         icandidate = order(selection%selected_count + 1)
-         IF (ABS(candidate_gap(icandidate) - selection%cutoff_gap) > eps_degeneracy) EXIT
-         selection%selected_count = selection%selected_count + 1
-      END DO
+      ALLOCATE (candidate_selected(ncandidates))
+      candidate_selected = .FALSE.
+      IF (nrequested == -1) THEN
+         candidate_selected = .TRUE.
+      ELSE
+         DO icandidate = 1, nbase
+            candidate_selected(order(icandidate)) = .TRUE.
+         END DO
+         DO icandidate = 1, ncandidates
+            IF (.NOT. candidate_selected(icandidate)) CYCLE
+            DO nbase = 1, ncandidates
+               IF (candidate_ispin(nbase) /= candidate_ispin(icandidate)) CYCLE
+               IF (candidate_occ_manifold(nbase) /= candidate_occ_manifold(icandidate)) CYCLE
+               IF (candidate_virt_manifold(nbase) /= candidate_virt_manifold(icandidate)) CYCLE
+               candidate_selected(nbase) = .TRUE.
+            END DO
+         END DO
+      END IF
+      selection%selected_count = COUNT(candidate_selected)
       IF (nrequested > ncandidates) THEN
          CPWARN('ECD| Requested more periodic IPA transitions than available')
       END IF
@@ -509,18 +532,39 @@ CONTAINS
       ALLOCATE (selection%gap(selection%selected_count), selection%iocc(selection%selected_count), &
                 selection%ispin(selection%selected_count), selection%ivirt(selection%selected_count), &
                 selection%occupation_difference(selection%selected_count))
-      DO icandidate = 1, selection%selected_count
-         nbase = order(icandidate)
-         selection%gap(icandidate) = candidate_gap(nbase)
-         selection%iocc(icandidate) = candidate_iocc(nbase)
-         selection%ispin(icandidate) = candidate_ispin(nbase)
-         selection%ivirt(icandidate) = candidate_ivirt(nbase)
-         selection%occupation_difference(icandidate) = candidate_occupation_difference(nbase)
+      nbase = 0
+      DO icandidate = 1, ncandidates
+         IF (.NOT. candidate_selected(order(icandidate))) CYCLE
+         nbase = nbase + 1
+         selection%gap(nbase) = candidate_gap(order(icandidate))
+         selection%iocc(nbase) = candidate_iocc(order(icandidate))
+         selection%ispin(nbase) = candidate_ispin(order(icandidate))
+         selection%ivirt(nbase) = candidate_ivirt(order(icandidate))
+         selection%occupation_difference(nbase) = candidate_occupation_difference(order(icandidate))
       END DO
-      DEALLOCATE (candidate_gap, candidate_iocc, candidate_ispin, candidate_ivirt, &
-                  candidate_occupation_difference, order)
+      CPASSERT(nbase == selection%selected_count)
+      DEALLOCATE (candidate_gap, candidate_iocc, candidate_ispin, candidate_ivirt, candidate_occ_manifold, &
+                  candidate_virt_manifold, candidate_occupation_difference, candidate_selected, order)
 
    END SUBROUTINE ecd_periodic_transition_selection_build
+
+! **************************************************************************************************
+!> \brief Return the complete degenerate-manifold index containing a band.
+! **************************************************************************************************
+   FUNCTION ecd_periodic_band_manifold_index(manifolds, iband) RESULT(imanifold)
+      TYPE(ecd_band_manifold_type), DIMENSION(:), POINTER :: manifolds
+      INTEGER, INTENT(IN)                                :: iband
+      INTEGER                                            :: imanifold
+
+      IF (.NOT. ASSOCIATED(manifolds)) THEN
+         CPABORT('ECD| Periodic transition selection requires degenerate-manifold metadata')
+      END IF
+      DO imanifold = 1, SIZE(manifolds)
+         IF (iband >= manifolds(imanifold)%first_band .AND. iband <= manifolds(imanifold)%last_band) RETURN
+      END DO
+      CPABORT('ECD| Periodic transition selection encountered a band outside the manifold partition')
+
+   END FUNCTION ecd_periodic_band_manifold_index
 
 ! **************************************************************************************************
 !> \brief Resolve a complete-manifold periodic IPA transition window for one spin channel.
@@ -991,7 +1035,8 @@ CONTAINS
       REAL(KIND=dp), PARAMETER                           :: fd_step = 1.0E-5_dp
       REAL(KIND=dp)                                      :: direct_energy_residual_max, direct_energy_residual_norm, &
                                                             eigenvector_derivative_norm, equation_residual_norm, &
-                                                            manifold_residual_norm, normalization_residual_norm
+                                                            manifold_residual_norm, normalization_residual_norm, &
+                                                            state_derivative_residual_max, state_derivative_residual_norm
       REAL(KIND=dp), ALLOCATABLE, DIMENSION(:)           :: eigenvalue_derivative, eigenvalue_reference, plus_eigenvalues
       REAL(KIND=dp), DIMENSION(3)                        :: xkp_plus, xkp_step, xkp_zero
       TYPE(cp_cfm_type)                                  :: hamiltonian_derivative_mo, hamiltonian_plus, &
@@ -1115,6 +1160,8 @@ CONTAINS
                                                  (eigenvalue_reference + fd_step*eigenvalue_derivative))**2))
          direct_energy_residual_max = MAXVAL(ABS(plus_eigenvalues - &
                                                  (eigenvalue_reference + fd_step*eigenvalue_derivative)))
+         CALL ecd_periodic_state_derivative_validate(context, ispin, plus_eigenvectors, fd_step, &
+                                                     state_derivative_residual_norm, state_derivative_residual_max)
          IF (cp_logger_get_default_io_unit(logger) > 0) THEN
             WRITE (cp_logger_get_default_io_unit(logger), '(T2,A,I2,T55,ES14.6)') &
                'ECD| Stage G8 band-energy derivative norm spin', ispin, SQRT(SUM(eigenvalue_derivative**2))
@@ -1130,6 +1177,10 @@ CONTAINS
                'ECD| Stage G8 positive-q energy residual spin', ispin, direct_energy_residual_norm
             WRITE (cp_logger_get_default_io_unit(logger), '(T2,A,I2,T55,ES14.6)') &
                'ECD| Stage G8 positive-q maximum residual spin', ispin, direct_energy_residual_max
+            WRITE (cp_logger_get_default_io_unit(logger), '(T2,A,I2,T55,ES14.6)') &
+               'ECD| Stage G8 state derivative residual spin', ispin, state_derivative_residual_norm
+            WRITE (cp_logger_get_default_io_unit(logger), '(T2,A,I2,T55,ES14.6)') &
+               'ECD| Stage G8 state derivative maximum residual spin', ispin, state_derivative_residual_max
          END IF
          DEALLOCATE (eigenvalue_derivative, eigenvalue_reference, plus_eigenvalues)
          CALL cp_cfm_release(hamiltonian_derivative_mo)
@@ -1149,6 +1200,96 @@ CONTAINS
       CALL dbcsr_deallocate_matrix_set(overlap_plus_real_ao)
 
    END SUBROUTINE ecd_periodic_implicit_gamma_state_g8
+
+! **************************************************************************************************
+!> \brief Validate the retained first-order state coefficients against the positive-q eigenspace.
+!>
+!> The positive-q generalized eigensolver is free to choose arbitrary phases
+!> and unitary bases within each zero-order degenerate manifold.  This routine
+!> removes that freedom through the polar factor of the manifold overlap before
+!> comparing the resulting coefficient matrix with the analytic G8 result.
+! **************************************************************************************************
+   SUBROUTINE ecd_periodic_state_derivative_validate(context, ispin, plus_eigenvectors, fd_step, &
+                                                     residual_norm, residual_max)
+      TYPE(ecd_gamma_context_type), INTENT(IN), TARGET  :: context
+      INTEGER, INTENT(IN)                               :: ispin
+      TYPE(cp_cfm_type), INTENT(IN)                     :: plus_eigenvectors
+      REAL(KIND=dp), INTENT(IN)                         :: fd_step
+      REAL(KIND=dp), INTENT(OUT)                        :: residual_norm, residual_max
+
+      COMPLEX(KIND=dp), ALLOCATABLE, DIMENSION(:, :)    :: aligned_overlap, coefficient_prediction, &
+                                                           left_singular, manifold_overlap, plus_coefficients, &
+                                                           reference_coefficients, right_singular_adjoint, rotation
+      INTEGER                                            :: first_band, imanifold, last_band, nao, nmanifold, nmo
+      REAL(KIND=dp), ALLOCATABLE, DIMENSION(:)           :: singular_value
+      REAL(KIND=dp), ALLOCATABLE, DIMENSION(:, :)        :: overlap_zero, zero_coefficients
+      TYPE(cp_fm_type)                                  :: overlap_zero_fm
+
+      IF (ispin < 1 .OR. ispin > context%nspin .OR. fd_step <= 0.0_dp) THEN
+         CPABORT('ECD| Stage G8 state-derivative validation received invalid controls')
+      END IF
+      nao = context%spin(ispin)%nao
+      nmo = context%spin(ispin)%nmo
+      IF (nao < 1 .OR. nmo < 1 .OR. .NOT. ASSOCIATED(context%spin(ispin)%mo_coeff) .OR. &
+          .NOT. ASSOCIATED(context%spin(ispin)%manifolds) .OR. &
+          .NOT. ALLOCATED(context%spin(ispin)%band_rotation) .OR. &
+          .NOT. ALLOCATED(context%spin(ispin)%coefficient_first)) THEN
+         CPABORT('ECD| Stage G8 state-derivative validation requires retained state data')
+      END IF
+      IF (SIZE(context%spin(ispin)%band_rotation, 1) /= nmo .OR. &
+          SIZE(context%spin(ispin)%band_rotation, 2) /= nmo .OR. &
+          SIZE(context%spin(ispin)%coefficient_first, 1) /= nmo .OR. &
+          SIZE(context%spin(ispin)%coefficient_first, 2) /= nmo) THEN
+         CPABORT('ECD| Stage G8 state-derivative validation received inconsistent state dimensions')
+      END IF
+      IF (plus_eigenvectors%matrix_struct%nrow_global /= nao .OR. &
+          plus_eigenvectors%matrix_struct%ncol_global /= nmo) THEN
+         CPABORT('ECD| Stage G8 positive-q eigenvector dimensions are inconsistent')
+      END IF
+
+      ALLOCATE (aligned_overlap(nmo, nmo), coefficient_prediction(nmo, nmo), plus_coefficients(nao, nmo), &
+                reference_coefficients(nao, nmo), overlap_zero(nao, nao), zero_coefficients(nao, nmo))
+      CALL cp_fm_get_submatrix(context%spin(ispin)%mo_coeff, zero_coefficients)
+      reference_coefficients = MATMUL(CMPLX(zero_coefficients, 0.0_dp, KIND=dp), &
+                                      context%spin(ispin)%band_rotation)
+      CALL cp_cfm_get_submatrix(plus_eigenvectors, plus_coefficients)
+      CALL cp_fm_create(overlap_zero_fm, context%spin(ispin)%mo_coeff%matrix_struct, nrow=nao, ncol=nao, &
+                        set_zero=.TRUE.)
+      CALL copy_dbcsr_to_fm(context%matrix_s(1)%matrix, overlap_zero_fm)
+      CALL cp_fm_get_submatrix(overlap_zero_fm, overlap_zero)
+      CALL cp_fm_release(overlap_zero_fm)
+
+      aligned_overlap = MATMUL(CONJG(TRANSPOSE(reference_coefficients)), &
+                               MATMUL(CMPLX(overlap_zero, 0.0_dp, KIND=dp), plus_coefficients))
+      DO imanifold = 1, SIZE(context%spin(ispin)%manifolds)
+         first_band = context%spin(ispin)%manifolds(imanifold)%first_band
+         last_band = context%spin(ispin)%manifolds(imanifold)%last_band
+         nmanifold = last_band - first_band + 1
+         IF (first_band < 1 .OR. last_band > nmo .OR. nmanifold < 1) THEN
+            CPABORT('ECD| Stage G8 state-derivative validation encountered invalid manifold bounds')
+         END IF
+         ALLOCATE (left_singular(nmanifold, nmanifold), manifold_overlap(nmanifold, nmanifold), &
+                   right_singular_adjoint(nmanifold, nmanifold), rotation(nmanifold, nmanifold), &
+                   singular_value(nmanifold))
+         manifold_overlap = aligned_overlap(first_band:last_band, first_band:last_band)
+         CALL singular_values(manifold_overlap, singular_value, nmanifold, nmanifold, left_singular, &
+                              right_singular_adjoint)
+         rotation = MATMUL(CONJG(TRANSPOSE(right_singular_adjoint)), CONJG(TRANSPOSE(left_singular)))
+         aligned_overlap(:, first_band:last_band) = MATMUL(aligned_overlap(:, first_band:last_band), rotation)
+         DEALLOCATE (left_singular, manifold_overlap, right_singular_adjoint, rotation, singular_value)
+      END DO
+
+      coefficient_prediction = fd_step*context%spin(ispin)%coefficient_first
+      DO imanifold = 1, nmo
+         coefficient_prediction(imanifold, imanifold) = coefficient_prediction(imanifold, imanifold) + &
+                                                          CMPLX(1.0_dp, 0.0_dp, KIND=dp)
+      END DO
+      residual_norm = SQRT(SUM(ABS(aligned_overlap - coefficient_prediction)**2))/fd_step
+      residual_max = MAXVAL(ABS(aligned_overlap - coefficient_prediction))/fd_step
+      DEALLOCATE (aligned_overlap, coefficient_prediction, plus_coefficients, reference_coefficients, overlap_zero, &
+                  zero_coefficients)
+
+   END SUBROUTINE ecd_periodic_state_derivative_validate
 
 ! **************************************************************************************************
 !> \brief Project first-order length vertices into the rotated Gamma MO frame.
@@ -1317,7 +1458,10 @@ CONTAINS
       TYPE(dbcsr_p_type), DIMENSION(:, :), POINTER       :: current_taylor_imag, current_taylor_real, &
                                                             gth_current_taylor_imag, gth_current_taylor_real, &
                                                             local_moments_rs, local_momentum_rs, overlap_images
-      TYPE(dbcsr_p_type), DIMENSION(:, :, :), POINTER    :: gth_current_path_rs, local_moments_der_rs
+      TYPE(dbcsr_p_type), DIMENSION(:, :, :), POINTER    :: gth_diamagnetic_taylor_imag, &
+                                                            gth_diamagnetic_taylor_real, gth_current_path_rs, &
+                                                            local_moments_der_rs
+      TYPE(dbcsr_p_type), DIMENSION(:, :, :, :), POINTER :: gth_diamagnetic_path_rs
       TYPE(ecd_periodic_gth_operators_type)              :: gth_operators
       TYPE(ecd_periodic_local_operators_type)            :: local_operators
       INTEGER, DIMENSION(:, :, :), POINTER               :: gth_cell_to_index, local_cell_to_index, &
@@ -1325,7 +1469,8 @@ CONTAINS
 
       NULLIFY (complete_current, current_residual, current_taylor_imag, current_taylor_real, &
                gth_cell_to_index, gth_current, gth_current_path_rs, gth_current_taylor_imag, &
-               gth_current_taylor_real, local_cell_to_index, local_current, local_moments_der_rs, &
+               gth_current_taylor_real, gth_diamagnetic_path_rs, gth_diamagnetic_taylor_imag, &
+               gth_diamagnetic_taylor_real, local_cell_to_index, local_current, local_moments_der_rs, &
                local_moments_rs, local_momentum_rs, logger, translation_cell_to_index, overlap_images, position)
       xkp_zero = 0.0_dp
       CALL ecd_gamma_context_overlap_images_get(context, overlap_images, translation_cell_to_index)
@@ -1341,8 +1486,9 @@ CONTAINS
                                             local_moments_der_rs, local_moments_rs)
       gth_enabled = gth_available
       IF (gth_enabled) THEN
-         CALL ecd_periodic_gth_operators_build(gth_operators, qs_env, context%direction, context%ref_point, 1)
-         CALL ecd_periodic_gth_operators_get(gth_operators, gth_cell_to_index, gth_current_path_rs)
+          CALL ecd_periodic_gth_operators_build(gth_operators, qs_env, context%direction, context%ref_point, 1)
+         CALL ecd_periodic_gth_operators_get(gth_operators, gth_cell_to_index, gth_current_path_rs, &
+                                              gth_diamagnetic_path_rs)
       END IF
 
       CALL ecd_periodic_current_taylor_build(current_taylor_real, current_taylor_imag, &
@@ -1351,6 +1497,11 @@ CONTAINS
                                              gth_current_path_rs, gth_enabled, overlap_images, xkp_zero, &
                                              translation_cell_to_index, local_cell_to_index, gth_cell_to_index, &
                                              context%sab_all, context%cell%hmat, context%direction, 1)
+      IF (gth_enabled) THEN
+         CALL ecd_periodic_gth_diamagnetic_taylor_build(gth_diamagnetic_taylor_real, &
+                                                         gth_diamagnetic_taylor_imag, gth_diamagnetic_path_rs, &
+                                                         xkp_zero, gth_cell_to_index, context%sab_all)
+      END IF
       CALL ecd_periodic_ao_vector_create(current_residual, context%matrix_s(1)%matrix, context%sab_all, &
                                          'ECD G4 current zeroth residual', dbcsr_type_no_symmetry)
 
@@ -1381,7 +1532,10 @@ CONTAINS
       context%current_taylor_real => current_taylor_real
       context%gth_current_taylor_imag => gth_current_taylor_imag
       context%gth_current_taylor_real => gth_current_taylor_real
-      NULLIFY (current_taylor_imag, current_taylor_real, gth_current_taylor_imag, gth_current_taylor_real)
+      context%gth_diamagnetic_taylor_imag => gth_diamagnetic_taylor_imag
+      context%gth_diamagnetic_taylor_real => gth_diamagnetic_taylor_real
+      NULLIFY (current_taylor_imag, current_taylor_real, gth_current_taylor_imag, gth_current_taylor_real, &
+               gth_diamagnetic_taylor_imag, gth_diamagnetic_taylor_real)
       CALL ecd_periodic_gth_operators_release(gth_operators)
       CALL ecd_periodic_local_operators_release(local_operators)
 
@@ -1502,11 +1656,13 @@ CONTAINS
       REAL(KIND=dp)                                      :: antisymmetric_first_norm, cell_volume, gap, gap_derivative, &
                                                             occupation_difference, photon_energy, prefactor, response_counter_norm, &
                                                             response_first_counter_norm, response_first_norm, &
-                                                            response_first_resonant_norm, response_norm, &
+                                                            response_first_resonant_norm, response_norm, gth_diamagnetic_zero_residual, &
                                                             response_resonant_norm
       REAL(KIND=dp), ALLOCATABLE, DIMENSION(:)           :: gap_taylor
       REAL(KIND=dp), ALLOCATABLE, DIMENSION(:, :)        :: magnetic_buffer
       REAL(KIND=dp), DIMENSION(ncart, ncart)             :: gth_diamagnetic_kernel, local_diamagnetic_kernel
+      COMPLEX(KIND=dp), DIMENSION(ncart, ncart)          :: gth_diamagnetic_first
+      REAL(KIND=dp), DIMENSION(ncart, ncart)             :: gth_diamagnetic_path_zero
       TYPE(cp_fm_type)                                   :: magnetic_mo
       TYPE(cp_logger_type), POINTER                      :: logger
       TYPE(dbcsr_p_type), DIMENSION(:), POINTER          :: complete_current, gth_current, local_current, magnetic, position
@@ -1694,13 +1850,29 @@ CONTAINS
 
       IF (PRESENT(diamagnetic_kernel_reference)) THEN
          diamagnetic_kernel_output = diamagnetic_kernel_reference
-         CALL ecd_periodic_implicit_gamma_diamagnetic_kernel(qs_env, context, gth_available, &
-                                                              local_diamagnetic_kernel, gth_diamagnetic_kernel, &
-                                                              diamagnetic_kernel_output)
+         local_diamagnetic_kernel = 0.0_dp
+         DO ispin = 1, context%nspin
+            DO idir = 1, ncart
+               local_diamagnetic_kernel(idir, idir) = local_diamagnetic_kernel(idir, idir) - &
+                                                      SUM(context%spin(ispin)%occupations)
+            END DO
+         END DO
+         gth_diamagnetic_kernel = diamagnetic_kernel_output - local_diamagnetic_kernel
+         IF (.NOT. gth_available .AND. MAXVAL(ABS(gth_diamagnetic_kernel)) > 100.0_dp*EPSILON(1.0_dp)) THEN
+            CPABORT('ECD| Cached diamagnetic kernel contains a GTH contribution without GTH current data')
+         END IF
       ELSE
          CALL ecd_periodic_implicit_gamma_diamagnetic_kernel(qs_env, context, gth_available, &
                                                               local_diamagnetic_kernel, gth_diamagnetic_kernel, &
                                                               diamagnetic_kernel_output)
+      END IF
+      gth_diamagnetic_first = CMPLX(0.0_dp, 0.0_dp, KIND=dp)
+      gth_diamagnetic_path_zero = 0.0_dp
+      gth_diamagnetic_zero_residual = 0.0_dp
+      IF (gth_available) THEN
+         CALL ecd_periodic_implicit_gamma_gth_diamagnetic_taylor(context, gth_diamagnetic_path_zero, &
+                                                                   gth_diamagnetic_first)
+         gth_diamagnetic_zero_residual = SQRT(SUM((gth_diamagnetic_path_zero - gth_diamagnetic_kernel)**2))
       END IF
       ALLOCATE (complete_zero_output(ncart, ncart, npoints), complete_first_output(ncart, ncart, npoints), &
                 local_zero_output(ncart, ncart, npoints), local_first_output(ncart, ncart, npoints), &
@@ -1720,6 +1892,8 @@ CONTAINS
                                            CMPLX(prefactor*local_diamagnetic_kernel, 0.0_dp, KIND=dp)
          nonlocal_zero_output(:, :, ipoint) = nonlocal_zero_output(:, :, ipoint) + &
                                               CMPLX(prefactor*gth_diamagnetic_kernel, 0.0_dp, KIND=dp)
+         nonlocal_first_output(:, :, ipoint) = nonlocal_first_output(:, :, ipoint) + &
+                                               prefactor*gth_diamagnetic_first
       END DO
       complete_zero_output = local_zero_output + cross_zero_output + nonlocal_zero_output
       complete_first_output = local_first_output + cross_first_output + nonlocal_first_output
@@ -1768,6 +1942,10 @@ CONTAINS
             'ECD| Stage G10 midpoint full first-order norm', response_first_norm
          WRITE (cp_logger_get_default_io_unit(logger), '(T2,A,T55,ES14.6)') &
             'ECD| Stage G10 midpoint antisymmetric first-order norm', antisymmetric_first_norm
+         WRITE (cp_logger_get_default_io_unit(logger), '(T2,A,T55,ES14.6)') &
+            'ECD| Stage G10 GTH diamagnetic zero-order residual', gth_diamagnetic_zero_residual
+         WRITE (cp_logger_get_default_io_unit(logger), '(T2,A,T55,ES14.6)') &
+            'ECD| Stage G10 GTH diamagnetic first-order norm', SQRT(SUM(ABS(gth_diamagnetic_first)**2))
       END IF
       DEALLOCATE (cross_counter, cross_first_counter, cross_first_resonant, cross_resonant, local_counter, &
                   local_first_counter, local_first_resonant, local_resonant, nonlocal_counter, &
@@ -2276,6 +2454,59 @@ CONTAINS
    END SUBROUTINE ecd_periodic_implicit_gamma_diamagnetic_kernel
 
 ! **************************************************************************************************
+!> \brief Contract folded GTH two-field Taylor matrices with the occupied Gamma density.
+! **************************************************************************************************
+   SUBROUTINE ecd_periodic_implicit_gamma_gth_diamagnetic_taylor(context, zero_kernel, first_kernel)
+      TYPE(ecd_gamma_context_type), INTENT(IN), TARGET   :: context
+      REAL(KIND=dp), DIMENSION(ncart, ncart), INTENT(OUT) :: zero_kernel
+      COMPLEX(KIND=dp), DIMENSION(ncart, ncart), INTENT(OUT) :: first_kernel
+
+      COMPLEX(KIND=dp), ALLOCATABLE, DIMENSION(:, :)     :: operator_mo
+      INTEGER                                            :: ia, ib, iband, ispin, nmo
+
+      IF (.NOT. ASSOCIATED(context%gth_diamagnetic_taylor_real) .OR. &
+          .NOT. ASSOCIATED(context%gth_diamagnetic_taylor_imag)) THEN
+         CPABORT('ECD| GTH diamagnetic Taylor coefficients are unavailable')
+      END IF
+      IF (SIZE(context%gth_diamagnetic_taylor_real, 1) /= ncart .OR. &
+          SIZE(context%gth_diamagnetic_taylor_real, 2) /= ncart .OR. &
+          SIZE(context%gth_diamagnetic_taylor_real, 3) /= 2 .OR. &
+          SIZE(context%gth_diamagnetic_taylor_imag, 1) /= ncart .OR. &
+          SIZE(context%gth_diamagnetic_taylor_imag, 2) /= ncart .OR. &
+          SIZE(context%gth_diamagnetic_taylor_imag, 3) /= 2) THEN
+         CPABORT('ECD| GTH diamagnetic Taylor coefficient dimensions are inconsistent')
+      END IF
+      zero_kernel = 0.0_dp
+      first_kernel = CMPLX(0.0_dp, 0.0_dp, KIND=dp)
+      DO ia = 1, ncart
+         DO ib = 1, ncart
+            DO ispin = 1, context%nspin
+               nmo = context%spin(ispin)%nmo
+               CALL ecd_project_complex_operator_to_mo(context%gth_diamagnetic_taylor_real(ia, ib, 1), &
+                                                       context%gth_diamagnetic_taylor_imag(ia, ib, 1), &
+                                                       context%spin(ispin)%mo_coeff, context%spin(ispin)%nao, nmo, &
+                                                       operator_mo)
+               DO iband = 1, nmo
+                  zero_kernel(ia, ib) = zero_kernel(ia, ib) - context%spin(ispin)%occupations(iband)* &
+                                         REAL(operator_mo(iband, iband), KIND=dp)
+               END DO
+               DEALLOCATE (operator_mo)
+               CALL ecd_project_complex_operator_to_mo(context%gth_diamagnetic_taylor_real(ia, ib, 2), &
+                                                       context%gth_diamagnetic_taylor_imag(ia, ib, 2), &
+                                                       context%spin(ispin)%mo_coeff, context%spin(ispin)%nao, nmo, &
+                                                       operator_mo)
+               DO iband = 1, nmo
+                  first_kernel(ia, ib) = first_kernel(ia, ib) - context%spin(ispin)%occupations(iband)* &
+                                          operator_mo(iband, iband)
+               END DO
+               DEALLOCATE (operator_mo)
+            END DO
+         END DO
+      END DO
+
+   END SUBROUTINE ecd_periodic_implicit_gamma_gth_diamagnetic_taylor
+
+! **************************************************************************************************
 !> \brief Write complete Cartesian first-order periodic IPA response tensors.
 ! **************************************************************************************************
    SUBROUTINE ecd_periodic_print_cartesian_response(ecd_section, energy_range, velocity_zero, velocity_first, &
@@ -2342,6 +2573,7 @@ CONTAINS
       END IF
       WRITE (response_unit, '(A)') '# Length epsilon uses direct length-polarization transitions without a diamagnetic kernel.'
       WRITE (response_unit, '(A)') '# epsilon1_abq stores the q_x, q_y, q_z Cartesian derivative components.'
+      WRITE (response_unit, '(A)') '# Velocity epsilon1 includes the GTH finite-q two-field diamagnetic coefficient.'
       WRITE (response_unit, '(A)', ADVANCE='NO') '# Columns: Energy_hartree Energy_eV'
       DO idir = 1, 2
          representation_label = 'length'
@@ -2679,7 +2911,9 @@ CONTAINS
       INTEGER                                            :: diagnostics_unit, idir, ipoint, midpoint
       REAL(KIND=dp)                                      :: absolute_zero, energy, length_zero_norm, relative_zero, &
                                                             velocity_zero_norm
-      REAL(KIND=dp), DIMENSION(ncart)                    :: absolute_first, length_first_norm, relative_first, &
+      REAL(KIND=dp), DIMENSION(ncart)                    :: absolute_first, gyrotropic_absolute, &
+                                                            gyrotropic_length_norm, gyrotropic_relative, &
+                                                            gyrotropic_velocity_norm, length_first_norm, relative_first, &
                                                             velocity_first_norm
       REAL(KIND=dp), DIMENSION(ncart)                    :: maximum_first_relative, midpoint_first_relative
       REAL(KIND=dp)                                      :: maximum_zero_relative, midpoint_zero_relative
@@ -2707,7 +2941,7 @@ CONTAINS
       IF (diagnostics_unit <= 0) RETURN
 
       WRITE (diagnostics_unit, '(A)') '# CP2K periodic ECD Cartesian gauge diagnostics'
-      WRITE (diagnostics_unit, '(A)') '# Format_version 4'
+      WRITE (diagnostics_unit, '(A)') '# Format_version 5'
       WRITE (diagnostics_unit, '(A)') '# Gamma_layout IMPLICIT'
       WRITE (diagnostics_unit, '(A)') '# Electric_representations VELOCITY LENGTH'
       WRITE (diagnostics_unit, '(A)') '# Velocity tensor uses the complete current for both selector values.'
@@ -2722,11 +2956,16 @@ CONTAINS
       WRITE (diagnostics_unit, '(A,2(1X,ES18.10E3))') '# Energy_range_hartree', energy_range
       WRITE (diagnostics_unit, '(A,1X,I0)') '# NPOINTS', SIZE(velocity_zero, 3)
       WRITE (diagnostics_unit, '(A)') '# Relative residual: 2*norm(velocity-length)/(norm(velocity)+norm(length)).'
+      WRITE (diagnostics_unit, '(A)') '# Gyrotropic component q_c: epsilon_abc epsilon1_abq_c.'
       WRITE (diagnostics_unit, '(A)') '# Columns: Energy_hartree Energy_eV velocity0_norm length0_norm '// &
                                       'absolute0_residual relative0_residual velocity1_x_norm length1_x_norm '// &
                                       'absolute1_x_residual relative1_x_residual velocity1_y_norm length1_y_norm '// &
                                       'absolute1_y_residual relative1_y_residual velocity1_z_norm length1_z_norm '// &
-                                      'absolute1_z_residual relative1_z_residual'
+                                      'absolute1_z_residual relative1_z_residual gyrotropic_velocity_x '// &
+                                      'gyrotropic_length_x gyrotropic_absolute_x gyrotropic_relative_x '// &
+                                      'gyrotropic_velocity_y gyrotropic_length_y gyrotropic_absolute_y '// &
+                                      'gyrotropic_relative_y gyrotropic_velocity_z gyrotropic_length_z '// &
+                                      'gyrotropic_absolute_z gyrotropic_relative_z'
 
       maximum_zero_relative = 0.0_dp
       maximum_first_relative = 0.0_dp
@@ -2747,6 +2986,12 @@ CONTAINS
                                                     length_first(:, :, idir, ipoint))**2))
             relative_first(idir) = 2.0_dp*absolute_first(idir)/MAX(SQRT(TINY(1.0_dp)), &
                                                                   velocity_first_norm(idir) + length_first_norm(idir))
+            gyrotropic_velocity_norm(idir) = ABS(ecd_periodic_gyrotropic_component(velocity_first, idir, ipoint))
+            gyrotropic_length_norm(idir) = ABS(ecd_periodic_gyrotropic_component(length_first, idir, ipoint))
+            gyrotropic_absolute(idir) = ABS(ecd_periodic_gyrotropic_component(velocity_first, idir, ipoint) - &
+                                            ecd_periodic_gyrotropic_component(length_first, idir, ipoint))
+            gyrotropic_relative(idir) = 2.0_dp*gyrotropic_absolute(idir)/MAX(SQRT(TINY(1.0_dp)), &
+                                                      gyrotropic_velocity_norm(idir) + gyrotropic_length_norm(idir))
          END DO
          maximum_zero_relative = MAX(maximum_zero_relative, relative_zero)
          maximum_first_relative = MAX(maximum_first_relative, relative_first)
@@ -2754,11 +2999,15 @@ CONTAINS
             midpoint_zero_relative = relative_zero
             midpoint_first_relative = relative_first
          END IF
-         WRITE (diagnostics_unit, '(18(1X,ES18.10E3))') energy, energy*evolt, velocity_zero_norm, &
+         WRITE (diagnostics_unit, '(30(1X,ES18.10E3))') energy, energy*evolt, velocity_zero_norm, &
             length_zero_norm, absolute_zero, relative_zero, velocity_first_norm(1), length_first_norm(1), &
             absolute_first(1), relative_first(1), velocity_first_norm(2), length_first_norm(2), &
             absolute_first(2), relative_first(2), velocity_first_norm(3), length_first_norm(3), &
-            absolute_first(3), relative_first(3)
+            absolute_first(3), relative_first(3), gyrotropic_velocity_norm(1), gyrotropic_length_norm(1), &
+            gyrotropic_absolute(1), gyrotropic_relative(1), gyrotropic_velocity_norm(2), &
+            gyrotropic_length_norm(2), gyrotropic_absolute(2), gyrotropic_relative(2), &
+            gyrotropic_velocity_norm(3), gyrotropic_length_norm(3), gyrotropic_absolute(3), &
+            gyrotropic_relative(3)
       END DO
       CALL cp_print_key_finished_output(diagnostics_unit, logger, ecd_section, 'PRINT%RESPONSE_TENSOR')
 
@@ -2771,6 +3020,31 @@ CONTAINS
                                                        maximum_first_relative)
 
    END SUBROUTINE ecd_periodic_print_cartesian_gauge_diagnostics
+
+! **************************************************************************************************
+!> \brief Return the transverse antisymmetric spatial-dispersion component for one Cartesian q derivative.
+! **************************************************************************************************
+   FUNCTION ecd_periodic_gyrotropic_component(response_first, idir, ipoint) RESULT(component)
+      COMPLEX(KIND=dp), DIMENSION(:, :, :, :), INTENT(IN) :: response_first
+      INTEGER, INTENT(IN)                                :: idir, ipoint
+      COMPLEX(KIND=dp)                                   :: component
+
+      IF (SIZE(response_first, 1) /= ncart .OR. SIZE(response_first, 2) /= ncart .OR. &
+          SIZE(response_first, 3) /= ncart .OR. ipoint < 1 .OR. ipoint > SIZE(response_first, 4)) THEN
+         CPABORT('ECD| Gyrotropic gauge diagnostic received incompatible response dimensions')
+      END IF
+      SELECT CASE (idir)
+      CASE (1)
+         component = response_first(2, 3, 1, ipoint) - response_first(3, 2, 1, ipoint)
+      CASE (2)
+         component = response_first(3, 1, 2, ipoint) - response_first(1, 3, 2, ipoint)
+      CASE (3)
+         component = response_first(1, 2, 3, ipoint) - response_first(2, 1, 3, ipoint)
+      CASE DEFAULT
+         CPABORT('ECD| Gyrotropic gauge diagnostic received an invalid Cartesian direction')
+      END SELECT
+
+   END FUNCTION ecd_periodic_gyrotropic_component
 
 ! **************************************************************************************************
 !> \brief Print compact Cartesian length--velocity response diagnostics.
@@ -3039,6 +3313,59 @@ CONTAINS
       CALL dbcsr_deallocate_matrix_set(work_real)
 
    END SUBROUTINE ecd_periodic_current_taylor_build
+
+! **************************************************************************************************
+!> \brief Fold Pickard--Mauri two-field path coefficients into the implicit-Gamma AO basis.
+!>
+!> The raw first path coefficient is real.  Its physical Hamiltonian
+!> coefficient carries the explicit imaginary Taylor factor.
+! **************************************************************************************************
+   SUBROUTINE ecd_periodic_gth_diamagnetic_taylor_build(diamagnetic_real, diamagnetic_imag, path_rs, xkp_zero, &
+                                                         cell_to_index, sab_nl)
+      TYPE(dbcsr_p_type), DIMENSION(:, :, :), POINTER    :: diamagnetic_imag, diamagnetic_real
+      TYPE(dbcsr_p_type), DIMENSION(:, :, :, :), POINTER :: path_rs
+      REAL(KIND=dp), DIMENSION(3), INTENT(IN)            :: xkp_zero
+      INTEGER, DIMENSION(:, :, :), POINTER               :: cell_to_index
+      TYPE(neighbor_list_set_p_type), DIMENSION(:), POINTER :: sab_nl
+
+      INTEGER                                            :: ia, ib, iorder
+      TYPE(dbcsr_p_type), DIMENSION(:, :), POINTER       :: source_rs
+
+      IF (SIZE(path_rs, 1) /= ncart .OR. SIZE(path_rs, 2) /= ncart .OR. SIZE(path_rs, 3) /= 2) THEN
+         CPABORT('ECD| GTH diamagnetic Taylor construction received incompatible path storage')
+      END IF
+      CALL dbcsr_allocate_matrix_set(diamagnetic_real, ncart, ncart, 2)
+      CALL dbcsr_allocate_matrix_set(diamagnetic_imag, ncart, ncart, 2)
+      DO iorder = 1, 2
+         DO ia = 1, ncart
+            DO ib = 1, ncart
+               CALL dbcsr_init_p(diamagnetic_real(ia, ib, iorder)%matrix)
+               CALL dbcsr_create(diamagnetic_real(ia, ib, iorder)%matrix, &
+                                 template=path_rs(ia, ib, iorder, 1)%matrix, matrix_type=dbcsr_type_no_symmetry, &
+                                 name='ECD GTH DIAMAGNETIC TAYLOR REAL')
+               CALL cp_dbcsr_alloc_block_from_nbl(diamagnetic_real(ia, ib, iorder)%matrix, sab_nl)
+               CALL dbcsr_set(diamagnetic_real(ia, ib, iorder)%matrix, 0.0_dp)
+               CALL dbcsr_init_p(diamagnetic_imag(ia, ib, iorder)%matrix)
+               CALL dbcsr_create(diamagnetic_imag(ia, ib, iorder)%matrix, &
+                                 template=path_rs(ia, ib, iorder, 1)%matrix, matrix_type=dbcsr_type_no_symmetry, &
+                                 name='ECD GTH DIAMAGNETIC TAYLOR IMAG')
+               CALL cp_dbcsr_alloc_block_from_nbl(diamagnetic_imag(ia, ib, iorder)%matrix, sab_nl)
+               CALL dbcsr_set(diamagnetic_imag(ia, ib, iorder)%matrix, 0.0_dp)
+               source_rs => path_rs(ia:ia, ib, iorder, :)
+               CALL rskp_transform(diamagnetic_real(ia, ib, iorder)%matrix, &
+                                   diamagnetic_imag(ia, ib, iorder)%matrix, source_rs, 1, xkp_zero, &
+                                   cell_to_index, sab_nl)
+               IF (iorder == 2) THEN
+                  CALL dbcsr_add(diamagnetic_imag(ia, ib, iorder)%matrix, &
+                                 diamagnetic_real(ia, ib, iorder)%matrix, 0.0_dp, 1.0_dp)
+                  CALL dbcsr_set(diamagnetic_real(ia, ib, iorder)%matrix, 0.0_dp)
+               END IF
+               NULLIFY (source_rs)
+            END DO
+         END DO
+      END DO
+
+   END SUBROUTINE ecd_periodic_gth_diamagnetic_taylor_build
 
 ! **************************************************************************************************
 !> \brief Build directional Taylor coefficients of the length-gauge position vertex.

@@ -64,7 +64,7 @@ MODULE commutator_rpnl
    CHARACTER(len=*), PARAMETER, PRIVATE :: moduleN = 'commutator_rpnl'
 
    PUBLIC :: build_com_rpnl, build_com_mom_nl, build_com_nl_mag, build_com_vnl_giao
-   PUBLIC :: build_com_current_nl_path
+   PUBLIC :: build_com_current_nl_path, build_com_diamagnetic_nl_path
 
 CONTAINS
 
@@ -1657,6 +1657,198 @@ CONTAINS
       CALL timestop(handle)
 
    END SUBROUTINE build_com_current_nl_path
+
+! **************************************************************************************************
+!> \brief Build zero- and first-order Pickard--Mauri nonlocal two-field path kernels.
+!>
+!> The third matrix index stores the real zero-order Hamiltonian curvature
+!> and the real coefficient whose multiplication by i gives the first
+!> spatial coefficient. Same-segment products cancel at first spatial order.
+! **************************************************************************************************
+   SUBROUTINE build_com_diamagnetic_nl_path(qs_kind_set, sab_all, sap_ppnl, eps_ppnl, particle_set, cell, &
+                                            cell_to_index, direction, ref_point, matrix_d_nl_rs)
+      TYPE(qs_kind_type), DIMENSION(:), POINTER          :: qs_kind_set
+      TYPE(neighbor_list_set_p_type), DIMENSION(:), POINTER :: sab_all, sap_ppnl
+      REAL(KIND=dp), INTENT(IN)                          :: eps_ppnl
+      TYPE(particle_type), DIMENSION(:), POINTER         :: particle_set
+      TYPE(cell_type), POINTER                           :: cell
+      INTEGER, DIMENSION(:, :, :), POINTER               :: cell_to_index
+      REAL(KIND=dp), DIMENSION(3), INTENT(IN)            :: direction, ref_point
+      TYPE(dbcsr_p_type), DIMENSION(:, :, :, :), INTENT(INOUT) :: matrix_d_nl_rs
+
+      CHARACTER(LEN=*), PARAMETER :: routineN = 'build_com_diamagnetic_nl_path'
+
+      INTEGER :: ia, ib, i, iac, iatom, ibc, ic, ikind, jatom, jkind, kac, kbc, kkind, na, nb, nkind, np, slot, handle
+      INTEGER, DIMENSION(3) :: cell_b
+      LOGICAL :: found, ppnl_present
+      REAL(KIND=dp), DIMENSION(3) :: projector_position
+      REAL(KIND=dp), DIMENSION(:, :), POINTER :: first_block, zero_block
+      REAL(KIND=dp), DIMENSION(:, :, :), POINTER :: achint, acint, bcint
+      TYPE(alist_type), POINTER :: alist_ac, alist_bc
+      TYPE(sap_int_type), DIMENSION(:), POINTER :: sap_int
+
+      IF (SIZE(matrix_d_nl_rs, 1) /= 3 .OR. SIZE(matrix_d_nl_rs, 2) /= 3 .OR. &
+          SIZE(matrix_d_nl_rs, 3) /= 2) THEN
+         CPABORT('ECD| GTH two-field path-kernel storage has incompatible dimensions')
+      END IF
+      CALL timeset(routineN, handle)
+      DO ic = 1, SIZE(matrix_d_nl_rs, 4)
+         DO ia = 1, 3
+            DO ib = 1, 3
+               CALL dbcsr_set(matrix_d_nl_rs(ia, ib, 1, ic)%matrix, 0.0_dp)
+               CALL dbcsr_set(matrix_d_nl_rs(ia, ib, 2, ic)%matrix, 0.0_dp)
+            END DO
+         END DO
+      END DO
+      ppnl_present = ASSOCIATED(sap_ppnl)
+      IF (.NOT. ppnl_present) THEN
+         CALL timestop(handle)
+         RETURN
+      END IF
+      nkind = SIZE(qs_kind_set)
+      CALL init_orbital_pointers(2)
+      ALLOCATE (sap_int(nkind*nkind))
+      DO i = 1, SIZE(sap_int)
+         NULLIFY (sap_int(i)%alist, sap_int(i)%asort, sap_int(i)%aindex)
+         sap_int(i)%nalist = 0
+      END DO
+      CALL build_sap_ints(sap_int, sap_ppnl, qs_kind_set, nder=2, moment_mode=.TRUE., &
+                          refpoint=ref_point, particle_set=particle_set, cell=cell)
+      CALL sap_sort(sap_int)
+      DO slot = 1, sab_all(1)%nl_size
+         ikind = sab_all(1)%nlist_task(slot)%ikind
+         jkind = sab_all(1)%nlist_task(slot)%jkind
+         iatom = sab_all(1)%nlist_task(slot)%iatom
+         jatom = sab_all(1)%nlist_task(slot)%jatom
+         cell_b = sab_all(1)%nlist_task(slot)%cell
+         ic = cell_to_index(cell_b(1), cell_b(2), cell_b(3))
+         IF (ic < 1 .OR. ic > SIZE(matrix_d_nl_rs, 4)) CYCLE
+         DO kkind = 1, nkind
+            iac = ikind + nkind*(kkind - 1)
+            ibc = jkind + nkind*(kkind - 1)
+            IF (.NOT. ASSOCIATED(sap_int(iac)%alist) .OR. .NOT. ASSOCIATED(sap_int(ibc)%alist)) CYCLE
+            CALL get_alist(sap_int(iac), alist_ac, iatom)
+            CALL get_alist(sap_int(ibc), alist_bc, jatom)
+            IF (.NOT. ASSOCIATED(alist_ac) .OR. .NOT. ASSOCIATED(alist_bc)) CYCLE
+            DO kac = 1, alist_ac%nclist
+               DO kbc = 1, alist_bc%nclist
+                  IF (alist_ac%clist(kac)%catom /= alist_bc%clist(kbc)%catom) CYCLE
+                  IF (.NOT. ALL(cell_b + alist_bc%clist(kbc)%cell - alist_ac%clist(kac)%cell == 0)) CYCLE
+                  IF (alist_ac%clist(kac)%maxac*alist_bc%clist(kbc)%maxach < eps_ppnl) CYCLE
+                  acint => alist_ac%clist(kac)%acint
+                  achint => alist_ac%clist(kac)%achint
+                  bcint => alist_bc%clist(kbc)%acint
+                  na = SIZE(acint, 1)
+                  np = SIZE(acint, 2)
+                  nb = SIZE(bcint, 1)
+                  projector_position = ref_point + pbc(particle_set(alist_ac%clist(kac)%catom)%r - ref_point, cell)
+                  DO ia = 1, 3
+                     DO ib = 1, 3
+                        NULLIFY (zero_block, first_block)
+                        CALL dbcsr_get_block_p(matrix_d_nl_rs(ia, ib, 1, ic)%matrix, iatom, jatom, zero_block, found)
+                        CPASSERT(found .AND. ASSOCIATED(zero_block))
+                        CALL dbcsr_get_block_p(matrix_d_nl_rs(ia, ib, 2, ic)%matrix, iatom, jatom, first_block, found)
+                        CPASSERT(found .AND. ASSOCIATED(first_block))
+                        CALL ecd_add_gth_diamagnetic_path_moments(zero_block, first_block, acint, achint, bcint, &
+                           direction, projector_position, ref_point, ia, ib, na, nb, np)
+                        NULLIFY (zero_block, first_block)
+                     END DO
+                  END DO
+               END DO
+            END DO
+         END DO
+      END DO
+      CALL release_sap_int(sap_int)
+      CALL timestop(handle)
+
+   END SUBROUTINE build_com_diamagnetic_nl_path
+
+! **************************************************************************************************
+!> \brief Add one Pickard--Mauri two-field curvature block through first spatial order.
+! **************************************************************************************************
+   SUBROUTINE ecd_add_gth_diamagnetic_path_moments(zero_block, first_block, acint, achint, bcint, direction, &
+                                                    projector_position, ref_point, ia, ib, na, nb, np)
+      REAL(KIND=dp), DIMENSION(:, :), POINTER :: zero_block, first_block
+      REAL(KIND=dp), DIMENSION(:, :, :), POINTER :: acint, achint, bcint
+      REAL(KIND=dp), DIMENSION(3), INTENT(IN) :: direction, projector_position, ref_point
+      INTEGER, INTENT(IN) :: ia, ib, na, nb, np
+
+      INTEGER :: idir, jdir
+      REAL(KIND=dp), DIMENSION(3) :: projector_shift
+      REAL(KIND=dp), ALLOCATABLE, DIMENSION(:, :, :) :: left_zero, left_first, right_zero, right_first
+      REAL(KIND=dp), ALLOCATABLE, DIMENSION(:, :, :, :) :: left_pair, right_pair
+
+      projector_shift = projector_position - ref_point
+      ALLOCATE (left_zero(na, np, 3), left_first(na, np, 3), right_zero(nb, np, 3), right_first(nb, np, 3), &
+                left_pair(na, np, 3, 3), right_pair(nb, np, 3, 3))
+      DO idir = 1, 3
+         left_zero(:, :, idir) = achint(1:na, 1:np, ecd_gth_path_moment_index(idir)) - &
+                                  projector_shift(idir)*achint(1:na, 1:np, 1)
+         right_zero(:, :, idir) = bcint(1:nb, 1:np, ecd_gth_path_moment_index(idir)) - &
+                                   projector_shift(idir)*bcint(1:nb, 1:np, 1)
+      END DO
+      DO idir = 1, 3
+         DO jdir = 1, 3
+            left_pair(:, :, idir, jdir) = achint(1:na, 1:np, ecd_gth_path_pair_index(idir, jdir)) - &
+               projector_shift(idir)*achint(1:na, 1:np, ecd_gth_path_moment_index(jdir)) - &
+               projector_shift(jdir)*achint(1:na, 1:np, ecd_gth_path_moment_index(idir)) + &
+               projector_shift(idir)*projector_shift(jdir)*achint(1:na, 1:np, 1)
+            right_pair(:, :, idir, jdir) = bcint(1:nb, 1:np, ecd_gth_path_pair_index(idir, jdir)) - &
+               projector_shift(idir)*bcint(1:nb, 1:np, ecd_gth_path_moment_index(jdir)) - &
+               projector_shift(jdir)*bcint(1:nb, 1:np, ecd_gth_path_moment_index(idir)) + &
+               projector_shift(idir)*projector_shift(jdir)*bcint(1:nb, 1:np, 1)
+         END DO
+      END DO
+      DO idir = 1, 3
+         left_first(:, :, idir) = DOT_PRODUCT(direction, projector_shift)*left_zero(:, :, idir)
+         right_first(:, :, idir) = DOT_PRODUCT(direction, projector_shift)*right_zero(:, :, idir)
+         DO jdir = 1, 3
+            left_first(:, :, idir) = left_first(:, :, idir) + 0.5_dp*direction(jdir)*left_pair(:, :, idir, jdir)
+            right_first(:, :, idir) = right_first(:, :, idir) + 0.5_dp*direction(jdir)*right_pair(:, :, idir, jdir)
+         END DO
+      END DO
+      zero_block(1:na, 1:nb) = zero_block(1:na, 1:nb) - &
+         MATMUL(left_pair(:, :, ia, ib), TRANSPOSE(bcint(1:nb, 1:np, 1))) - &
+         MATMUL(achint(1:na, 1:np, 1), TRANSPOSE(right_pair(:, :, ia, ib))) + &
+         MATMUL(left_zero(:, :, ia), TRANSPOSE(right_zero(:, :, ib))) + &
+         MATMUL(left_zero(:, :, ib), TRANSPOSE(right_zero(:, :, ia)))
+      first_block(1:na, 1:nb) = first_block(1:na, 1:nb) - &
+         MATMUL(left_first(:, :, ia), TRANSPOSE(right_zero(:, :, ib))) + &
+         MATMUL(left_zero(:, :, ia), TRANSPOSE(right_first(:, :, ib))) + &
+         MATMUL(left_first(:, :, ib), TRANSPOSE(right_zero(:, :, ia))) - &
+         MATMUL(left_zero(:, :, ib), TRANSPOSE(right_first(:, :, ia)))
+      DEALLOCATE (left_zero, left_first, right_zero, right_first, left_pair, right_pair)
+
+   END SUBROUTINE ecd_add_gth_diamagnetic_path_moments
+
+! **************************************************************************************************
+   PURE FUNCTION ecd_gth_path_moment_index(component) RESULT(index)
+      INTEGER, INTENT(IN) :: component
+      INTEGER :: index
+      SELECT CASE (component)
+      CASE (1)
+         index = coset(1, 0, 0)
+      CASE (2)
+         index = coset(0, 1, 0)
+      CASE (3)
+         index = coset(0, 0, 1)
+      CASE DEFAULT
+         index = 0
+      END SELECT
+   END FUNCTION ecd_gth_path_moment_index
+
+! **************************************************************************************************
+   PURE FUNCTION ecd_gth_path_pair_index(ia, ib) RESULT(index)
+      INTEGER, INTENT(IN) :: ia, ib
+      INTEGER :: index, ix, iy, iz
+      ix = 0
+      iy = 0
+      iz = 0
+      IF (ia == 1 .OR. ib == 1) ix = COUNT((/ ia, ib /) == 1)
+      IF (ia == 2 .OR. ib == 2) iy = COUNT((/ ia, ib /) == 2)
+      IF (ia == 3 .OR. ib == 3) iz = COUNT((/ ia, ib /) == 3)
+      index = coset(ix, iy, iz)
+   END FUNCTION ecd_gth_path_pair_index
 
 ! **************************************************************************************************
 !> \brief Add one real Pickard--Mauri path polynomial to an AO matrix block.

@@ -10,7 +10,8 @@
 ! **************************************************************************************************
 MODULE qs_ecd_operators
    USE cell_types,                      ONLY: cell_type
-   USE commutator_rpnl,                 ONLY: build_com_current_nl_path
+   USE commutator_rpnl,                 ONLY: build_com_current_nl_path,&
+                                              build_com_diamagnetic_nl_path
    USE cp_control_types,                ONLY: dft_control_type
    USE cp_dbcsr_api,                    ONLY: dbcsr_create,&
                                               dbcsr_p_type,&
@@ -63,6 +64,8 @@ MODULE qs_ecd_operators
       INTEGER, DIMENSION(:, :, :), POINTER, PRIVATE         :: cell_to_index => NULL()
       TYPE(dbcsr_p_type), DIMENSION(:, :, :), POINTER, &
          PRIVATE                                            :: current_path_rs => NULL()
+      TYPE(dbcsr_p_type), DIMENSION(:, :, :, :), POINTER, &
+         PRIVATE                                            :: diamagnetic_path_rs => NULL()
    END TYPE ecd_periodic_gth_operators_type
 
    PUBLIC :: ecd_periodic_local_operators_build, &
@@ -221,7 +224,7 @@ CONTAINS
       REAL(KIND=dp), DIMENSION(3), INTENT(IN)            :: direction, ref_point
       INTEGER, INTENT(IN)                                :: max_order
 
-      INTEGER                                            :: component, iimage, nimages, order
+      INTEGER                                            :: component, i, iimage, nimages, order
       INTEGER, DIMENSION(:, :, :), POINTER               :: cell_to_index
       TYPE(cell_type), POINTER                           :: cell
       TYPE(dbcsr_p_type), DIMENSION(:, :), POINTER       :: matrix_ks_kp
@@ -236,7 +239,8 @@ CONTAINS
       IF (max_order < 0) THEN
          CPABORT("ECD| Periodic GTH path moments require a non-negative Taylor order")
       END IF
-      IF (ASSOCIATED(operators%cell_to_index) .OR. ASSOCIATED(operators%current_path_rs)) THEN
+      IF (ASSOCIATED(operators%cell_to_index) .OR. ASSOCIATED(operators%current_path_rs) .OR. &
+          ASSOCIATED(operators%diamagnetic_path_rs)) THEN
          CPABORT("ECD| Periodic GTH path operators are already allocated")
       END IF
 
@@ -277,6 +281,26 @@ CONTAINS
       CALL build_com_current_nl_path(qs_kind_set, sab_all, sap_ppnl, dft_control%qs_control%eps_ppnl, &
                                      particle_set, cell, cell_to_index, direction, ref_point, max_order, &
                                      operators%current_path_rs)
+      ALLOCATE (operators%diamagnetic_path_rs(3, 3, 2, nimages))
+      DO iimage = 1, nimages
+         DO order = 1, 2
+            DO component = 1, 3
+               DO i = 1, 3
+                  NULLIFY (operators%diamagnetic_path_rs(component, i, order, iimage)%matrix)
+                  ALLOCATE (operators%diamagnetic_path_rs(component, i, order, iimage)%matrix)
+                  CALL dbcsr_create(operators%diamagnetic_path_rs(component, i, order, iimage)%matrix, &
+                                    template=matrix_ks_kp(1, 1)%matrix, matrix_type=dbcsr_type_no_symmetry, &
+                                    name='ECD GTH PATH DIAMAGNETIC')
+                  CALL cp_dbcsr_alloc_block_from_nbl(operators%diamagnetic_path_rs(component, i, order, iimage)%matrix, &
+                                                     sab_all)
+                  CALL dbcsr_set(operators%diamagnetic_path_rs(component, i, order, iimage)%matrix, 0.0_dp)
+               END DO
+            END DO
+         END DO
+      END DO
+      CALL build_com_diamagnetic_nl_path(qs_kind_set, sab_all, sap_ppnl, dft_control%qs_control%eps_ppnl, &
+                                          particle_set, cell, cell_to_index, direction, ref_point, &
+                                          operators%diamagnetic_path_rs)
       CALL kpoint_release(kpoints_all)
       operators%max_order = max_order
 
@@ -285,17 +309,20 @@ CONTAINS
 ! **************************************************************************************************
 !> \brief Return ECD-owned GTH path kernels without transferring ownership.
 ! **************************************************************************************************
-   SUBROUTINE ecd_periodic_gth_operators_get(operators, cell_to_index, current_path_rs)
+   SUBROUTINE ecd_periodic_gth_operators_get(operators, cell_to_index, current_path_rs, diamagnetic_path_rs)
       TYPE(ecd_periodic_gth_operators_type), &
          INTENT(IN), TARGET                              :: operators
       INTEGER, DIMENSION(:, :, :), POINTER               :: cell_to_index
       TYPE(dbcsr_p_type), DIMENSION(:, :, :), POINTER    :: current_path_rs
+      TYPE(dbcsr_p_type), DIMENSION(:, :, :, :), OPTIONAL, POINTER :: diamagnetic_path_rs
 
-      IF (.NOT. ASSOCIATED(operators%cell_to_index) .OR. .NOT. ASSOCIATED(operators%current_path_rs)) THEN
+      IF (.NOT. ASSOCIATED(operators%cell_to_index) .OR. .NOT. ASSOCIATED(operators%current_path_rs) .OR. &
+          .NOT. ASSOCIATED(operators%diamagnetic_path_rs)) THEN
          CPABORT("ECD| Periodic GTH path operators are unavailable")
       END IF
       cell_to_index => operators%cell_to_index
       current_path_rs => operators%current_path_rs
+      IF (PRESENT(diamagnetic_path_rs)) diamagnetic_path_rs => operators%diamagnetic_path_rs
 
    END SUBROUTINE ecd_periodic_gth_operators_get
 
@@ -313,6 +340,10 @@ CONTAINS
       IF (ASSOCIATED(operators%current_path_rs)) THEN
          CALL dbcsr_deallocate_matrix_set(operators%current_path_rs)
          NULLIFY (operators%current_path_rs)
+      END IF
+      IF (ASSOCIATED(operators%diamagnetic_path_rs)) THEN
+         CALL dbcsr_deallocate_matrix_set(operators%diamagnetic_path_rs)
+         NULLIFY (operators%diamagnetic_path_rs)
       END IF
       operators%max_order = -1
 

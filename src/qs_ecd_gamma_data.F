@@ -83,6 +83,8 @@ MODULE qs_ecd_gamma_data
                                                                   current_taylor_real => NULL()
       TYPE(dbcsr_p_type), DIMENSION(:, :), POINTER            :: gth_current_taylor_imag => NULL(), &
                                                                   gth_current_taylor_real => NULL()
+      TYPE(dbcsr_p_type), DIMENSION(:, :, :), POINTER         :: gth_diamagnetic_taylor_imag => NULL(), &
+                                                                  gth_diamagnetic_taylor_real => NULL()
       TYPE(dbcsr_p_type), DIMENSION(:, :), POINTER            :: length_taylor_imag => NULL(), &
                                                                   length_taylor_real => NULL()
       TYPE(dbcsr_p_type), DIMENSION(:), POINTER               :: ks_first_imag => NULL(), ks_first_real => NULL(), &
@@ -444,6 +446,14 @@ CONTAINS
       IF (ASSOCIATED(context%gth_current_taylor_real)) THEN
          CALL dbcsr_deallocate_matrix_set(context%gth_current_taylor_real)
          NULLIFY (context%gth_current_taylor_real)
+      END IF
+      IF (ASSOCIATED(context%gth_diamagnetic_taylor_imag)) THEN
+         CALL dbcsr_deallocate_matrix_set(context%gth_diamagnetic_taylor_imag)
+         NULLIFY (context%gth_diamagnetic_taylor_imag)
+      END IF
+      IF (ASSOCIATED(context%gth_diamagnetic_taylor_real)) THEN
+         CALL dbcsr_deallocate_matrix_set(context%gth_diamagnetic_taylor_real)
+         NULLIFY (context%gth_diamagnetic_taylor_real)
       END IF
       IF (ASSOCIATED(context%length_taylor_imag)) THEN
          CALL dbcsr_deallocate_matrix_set(context%length_taylor_imag)
