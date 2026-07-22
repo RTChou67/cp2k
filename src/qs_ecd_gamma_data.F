@@ -85,8 +85,6 @@ MODULE qs_ecd_gamma_data
                                                                   gth_current_taylor_real => NULL()
       TYPE(dbcsr_p_type), DIMENSION(:, :, :), POINTER         :: gth_diamagnetic_taylor_imag => NULL(), &
                                                                   gth_diamagnetic_taylor_real => NULL()
-      TYPE(dbcsr_p_type), DIMENSION(:, :), POINTER            :: length_taylor_imag => NULL(), &
-                                                                  length_taylor_real => NULL()
       TYPE(dbcsr_p_type), DIMENSION(:), POINTER               :: ks_first_imag => NULL(), ks_first_real => NULL(), &
                                                                   overlap_first_imag => NULL(), overlap_first_real => NULL()
       TYPE(dft_control_type), POINTER                         :: dft_control => NULL()
@@ -129,8 +127,7 @@ CONTAINS
 
       NULLIFY (context%core_images, context%current_taylor_imag, context%current_taylor_real, &
                context%gth_current_taylor_imag, context%gth_current_taylor_real, &
-               context%ks_first_imag, context%ks_first_real, context%length_taylor_imag, &
-               context%length_taylor_real, context%local_potential_images, &
+               context%ks_first_imag, context%ks_first_real, context%local_potential_images, &
                context%overlap_first_imag, context%overlap_first_real, &
                context%translation_layout%external_kpoints, context%translation_layout%cell_to_index, &
                context%overlap_images)
@@ -454,14 +451,6 @@ CONTAINS
       IF (ASSOCIATED(context%gth_diamagnetic_taylor_real)) THEN
          CALL dbcsr_deallocate_matrix_set(context%gth_diamagnetic_taylor_real)
          NULLIFY (context%gth_diamagnetic_taylor_real)
-      END IF
-      IF (ASSOCIATED(context%length_taylor_imag)) THEN
-         CALL dbcsr_deallocate_matrix_set(context%length_taylor_imag)
-         NULLIFY (context%length_taylor_imag)
-      END IF
-      IF (ASSOCIATED(context%length_taylor_real)) THEN
-         CALL dbcsr_deallocate_matrix_set(context%length_taylor_real)
-         NULLIFY (context%length_taylor_real)
       END IF
       IF (ASSOCIATED(context%ks_first_real)) THEN
          CALL dbcsr_deallocate_matrix_set(context%ks_first_real)

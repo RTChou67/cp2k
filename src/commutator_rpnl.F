@@ -439,7 +439,8 @@ CONTAINS
 !> \param ref_point ...
 ! **************************************************************************************************
    SUBROUTINE build_com_mom_nl(qs_kind_set, sab_all, sap_ppnl, eps_ppnl, particle_set, cell, matrix_rv, matrix_rxrv, &
-                    matrix_rrv, matrix_rvr, matrix_rrv_vrr, matrix_r_rxvr, matrix_rxvr_r, matrix_r_doublecom, pseudoatom, ref_point)
+                    matrix_rrv, matrix_rvr, matrix_rrv_vrr, matrix_r_rxvr, matrix_rxvr_r, matrix_r_doublecom, pseudoatom, &
+                    ref_point)
 
       TYPE(qs_kind_type), DIMENSION(:), INTENT(IN), &
          POINTER                                         :: qs_kind_set
@@ -536,7 +537,7 @@ CONTAINS
          IF (.NOT. periodic) THEN
             rf = ref_point
             my_ref = .TRUE.
-         ELSE ! use my_ref = False in periodic case, corresponds to distributed ref point
+         ELSE
             IF (order > 1) THEN
                CPWARN("Not clear how to define reference point for order > 1 in periodic cells.")
             END IF

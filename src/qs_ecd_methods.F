@@ -43,6 +43,8 @@ MODULE qs_ecd_methods
    USE input_constants,                 ONLY: no_sf_tddfpt,&
                                               tddfpt_kernel_full,&
                                               tddfpt_kernel_none,&
+                                              use_mom_ref_coac,&
+                                              use_mom_ref_com,&
                                               use_mom_ref_user
    USE input_section_types,             ONLY: section_vals_get,&
                                               section_vals_get_subs_vals,&
@@ -118,6 +120,7 @@ CONTAINS
       REAL(KIND=dp), DIMENSION(:), POINTER               :: ref_point
       TYPE(cell_type), POINTER                           :: cell
       TYPE(cp_logger_type), POINTER                      :: logger
+      TYPE(particle_type), DIMENSION(:), POINTER         :: particle_set
       TYPE(section_vals_type), POINTER                   :: hfx_section, ipa_section, &
                                                             lr_tddft_section, tddfpt_section
 
@@ -125,6 +128,7 @@ CONTAINS
 
       NULLIFY (cell, hfx_section, logger, ipa_section, lr_tddft_section, ref_point, &
                tddfpt_section, transition_band_range_ptr)
+      NULLIFY (particle_set)
       logger => cp_get_default_logger()
       iounit = cp_logger_get_default_io_unit(logger)
 
@@ -175,6 +179,11 @@ CONTAINS
          CPABORT("ECD| Unknown BROADENING")
       END SELECT
 
+      CALL get_qs_env(qs_env, cell=cell, particle_set=particle_set)
+      CPASSERT(ASSOCIATED(cell))
+      CPASSERT(ASSOCIATED(particle_set))
+      is_periodic = ANY(cell%perd /= 0)
+
       IF (reference == use_mom_ref_user) THEN
          IF (.NOT. ref_point_explicit) THEN
             CPABORT("ECD| REFERENCE USER_DEFINED requires REF_POINT")
@@ -190,12 +199,12 @@ CONTAINS
          IF (ref_point_explicit) THEN
             CPWARN("ECD| REF_POINT is used only with REFERENCE USER_DEFINED")
          END IF
-         CALL get_reference_point(rcc, qs_env=qs_env, reference=reference)
+         IF (is_periodic .AND. (reference == use_mom_ref_com .OR. reference == use_mom_ref_coac)) THEN
+            CALL get_reference_point(rcc, qs_env=qs_env, reference=reference, ifirst=1, ilast=SIZE(particle_set))
+         ELSE
+            CALL get_reference_point(rcc, qs_env=qs_env, reference=reference)
+         END IF
       END IF
-
-      CALL get_qs_env(qs_env, cell=cell)
-      CPASSERT(ASSOCIATED(cell))
-      is_periodic = ANY(cell%perd /= 0)
 
       IF (iounit > 0 .AND. .NOT. do_lr_tddft) THEN
          WRITE (iounit, '(/,T2,A)') "ECD| Electronic circular dichroism spectra"
