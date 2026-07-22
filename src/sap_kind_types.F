@@ -277,8 +277,10 @@ CONTAINS
 !> \param particle_set needed if refpoint is present
 !> \param cell needed if refpoint is present
 !> \param pseudoatom If we want to constrain the calculations to katom == pseudoatom
+!> \param image_reference Retain the projector image associated with each AO-projector pair.
 ! **************************************************************************************************
-   SUBROUTINE build_sap_ints(sap_int, sap_ppnl, qs_kind_set, nder, moment_mode, refpoint, particle_set, cell, pseudoatom)
+   SUBROUTINE build_sap_ints(sap_int, sap_ppnl, qs_kind_set, nder, moment_mode, refpoint, particle_set, cell, &
+                             pseudoatom, image_reference)
       TYPE(sap_int_type), DIMENSION(:), INTENT(INOUT), &
          POINTER                                         :: sap_int
       TYPE(neighbor_list_set_p_type), DIMENSION(:), &
@@ -292,6 +294,7 @@ CONTAINS
          OPTIONAL, POINTER                               :: particle_set
       TYPE(cell_type), INTENT(IN), OPTIONAL, POINTER     :: cell
       INTEGER, OPTIONAL                                  :: pseudoatom
+      LOGICAL, INTENT(IN), OPTIONAL                      :: image_reference
 
       CHARACTER(LEN=*), PARAMETER                        :: routineN = 'build_sap_ints'
 
@@ -303,7 +306,7 @@ CONTAINS
       INTEGER, DIMENSION(:), POINTER                     :: la_max, la_min, npgfa, nprj_ppnl, &
                                                             nsgf_seta
       INTEGER, DIMENSION(:, :), POINTER                  :: first_sgfa
-      LOGICAL                                            :: dogth, my_momentmode, my_ref
+      LOGICAL                                            :: dogth, image_reference_mode, my_momentmode, my_ref
       LOGICAL, DIMENSION(0:9)                            :: is_nonlocal
       REAL(KIND=dp)                                      :: dac, ppnl_radius
       REAL(KIND=dp), ALLOCATABLE, DIMENSION(:)           :: radp
@@ -340,6 +343,11 @@ CONTAINS
          CPASSERT((PRESENT(cell) .AND. PRESENT(particle_set))) ! need these as well if refpoint is provided
          rf = refpoint
          my_ref = .TRUE.
+      END IF
+      image_reference_mode = .FALSE.
+      IF (PRESENT(image_reference)) image_reference_mode = image_reference
+      IF (image_reference_mode) THEN
+         CPASSERT(my_ref .AND. my_momentmode)
       END IF
 
       CALL get_qs_kind_set(qs_kind_set, &
@@ -422,7 +430,7 @@ CONTAINS
 !$OMP PARALLEL &
 !$OMP DEFAULT (NONE) &
 !$OMP SHARED  (basis_set, gpotential, spotential, maxder, ncoset, my_momentmode, ldai_nl, &
-!$OMP          sap_ppnl, sap_int, nkind, ldsab, ldai, nder, nco, my_ref, cell, particle_set, rf, pseudoatom) &
+!$OMP          sap_ppnl, sap_int, nkind, ldsab, ldai, nder, nco, my_ref, image_reference_mode, cell, particle_set, rf, pseudoatom) &
 !$OMP PRIVATE (ikind, kkind, iatom, katom, nlist, ilist, nneighbor, jneighbor, &
 !$OMP          cell_c, rac, iac, first_sgfa, la_max, la_min, npgfa, nseta, nsgfa, nsgf_seta, &
 !$OMP          slot, sphi_a, zeta, cprj, hprj, lppnl, nppnl, nprj_ppnl, &
@@ -504,7 +512,11 @@ CONTAINS
 
          IF (my_ref) THEN
             ra(:) = pbc(particle_set(iatom)%r(:) - rf, cell) + rf
-            rc(:) = pbc(particle_set(katom)%r(:) - rf, cell) + rf
+            IF (image_reference_mode) THEN
+               rc(:) = ra(:) + rac(:)
+            ELSE
+               rc(:) = pbc(particle_set(katom)%r(:) - rf, cell) + rf
+            END IF
             raf(:) = ra(:) - rf(:)
             rcf(:) = rc(:) - rf(:)
          ELSE

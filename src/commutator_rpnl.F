@@ -1566,7 +1566,7 @@ CONTAINS
                                                             kbc, kkind, na, nb, nkind, np, slot
       INTEGER, DIMENSION(3)                              :: cell_b
       LOGICAL                                            :: found, ppnl_present
-      REAL(KIND=dp), DIMENSION(3)                        :: projector_position
+      REAL(KIND=dp), DIMENSION(3)                        :: left_projector_position, right_projector_position
       REAL(KIND=dp), DIMENSION(:, :), POINTER            :: block
       REAL(KIND=dp), DIMENSION(:, :, :), POINTER         :: achint, acint, bcint
       TYPE(alist_type), POINTER                          :: alist_ac, alist_bc
@@ -1603,7 +1603,7 @@ CONTAINS
          sap_int(i)%nalist = 0
       END DO
       CALL build_sap_ints(sap_int, sap_ppnl, qs_kind_set, nder=max_order + 1, moment_mode=.TRUE., &
-                          refpoint=ref_point, particle_set=particle_set, cell=cell)
+                          refpoint=ref_point, particle_set=particle_set, cell=cell, image_reference=.TRUE.)
       CALL sap_sort(sap_int)
 
       DO slot = 1, sab_all(1)%nl_size
@@ -1636,8 +1636,9 @@ CONTAINS
                   np = SIZE(acint, 2)
                   nb = SIZE(bcint, 1)
 
-                  projector_position = ref_point + &
-                                       pbc(particle_set(alist_ac%clist(kac)%catom)%r - ref_point, cell)
+                  CALL ecd_projector_image_positions(left_projector_position, right_projector_position, &
+                                                     particle_set, cell, ref_point, iatom, jatom, &
+                                                     alist_ac%clist(kac), alist_bc%clist(kbc))
                   DO iorder = 0, max_order
                      DO component = 1, 3
                         NULLIFY (block)
@@ -1645,7 +1646,8 @@ CONTAINS
                                                block, found)
                         CPASSERT(found .AND. ASSOCIATED(block))
                         CALL ecd_add_gth_path_moment(block, acint, achint, bcint, direction, &
-                                                     projector_position, ref_point, component, iorder, na, nb, np)
+                                                     left_projector_position, right_projector_position, ref_point, &
+                                                     component, iorder, na, nb, np)
                         NULLIFY (block)
                      END DO
                   END DO
@@ -1682,7 +1684,7 @@ CONTAINS
       INTEGER :: ia, ib, i, iac, iatom, ibc, ic, ikind, jatom, jkind, kac, kbc, kkind, na, nb, nkind, np, slot, handle
       INTEGER, DIMENSION(3) :: cell_b
       LOGICAL :: found, ppnl_present
-      REAL(KIND=dp), DIMENSION(3) :: projector_position
+      REAL(KIND=dp), DIMENSION(3) :: left_projector_position, right_projector_position
       REAL(KIND=dp), DIMENSION(:, :), POINTER :: first_block, zero_block
       REAL(KIND=dp), DIMENSION(:, :, :), POINTER :: achint, acint, bcint
       TYPE(alist_type), POINTER :: alist_ac, alist_bc
@@ -1714,7 +1716,7 @@ CONTAINS
          sap_int(i)%nalist = 0
       END DO
       CALL build_sap_ints(sap_int, sap_ppnl, qs_kind_set, nder=2, moment_mode=.TRUE., &
-                          refpoint=ref_point, particle_set=particle_set, cell=cell)
+                          refpoint=ref_point, particle_set=particle_set, cell=cell, image_reference=.TRUE.)
       CALL sap_sort(sap_int)
       DO slot = 1, sab_all(1)%nl_size
          ikind = sab_all(1)%nlist_task(slot)%ikind
@@ -1742,7 +1744,9 @@ CONTAINS
                   na = SIZE(acint, 1)
                   np = SIZE(acint, 2)
                   nb = SIZE(bcint, 1)
-                  projector_position = ref_point + pbc(particle_set(alist_ac%clist(kac)%catom)%r - ref_point, cell)
+                  CALL ecd_projector_image_positions(left_projector_position, right_projector_position, &
+                                                     particle_set, cell, ref_point, iatom, jatom, &
+                                                     alist_ac%clist(kac), alist_bc%clist(kbc))
                   DO ia = 1, 3
                      DO ib = 1, 3
                         NULLIFY (zero_block, first_block)
@@ -1751,7 +1755,7 @@ CONTAINS
                         CALL dbcsr_get_block_p(matrix_d_nl_rs(ia, ib, 2, ic)%matrix, iatom, jatom, first_block, found)
                         CPASSERT(found .AND. ASSOCIATED(first_block))
                         CALL ecd_add_gth_diamagnetic_path_moments(zero_block, first_block, acint, achint, bcint, &
-                           direction, projector_position, ref_point, ia, ib, na, nb, np)
+                           direction, left_projector_position, right_projector_position, ref_point, ia, ib, na, nb, np)
                         NULLIFY (zero_block, first_block)
                      END DO
                   END DO
@@ -1765,44 +1769,71 @@ CONTAINS
    END SUBROUTINE build_com_diamagnetic_nl_path
 
 ! **************************************************************************************************
+!> \brief Return the two projector images associated with one AO-pair factorization.
+! **************************************************************************************************
+   SUBROUTINE ecd_projector_image_positions(left_projector_position, right_projector_position, particle_set, cell, &
+                                             ref_point, iatom, jatom, left_clist, right_clist)
+      REAL(KIND=dp), DIMENSION(3), INTENT(OUT)           :: left_projector_position, right_projector_position
+      TYPE(particle_type), DIMENSION(:), POINTER         :: particle_set
+      TYPE(cell_type), POINTER                           :: cell
+      REAL(KIND=dp), DIMENSION(3), INTENT(IN)            :: ref_point
+      INTEGER, INTENT(IN)                                :: iatom, jatom
+      TYPE(clist_type), INTENT(IN)                       :: left_clist, right_clist
+
+      IF (iatom < 1 .OR. iatom > SIZE(particle_set) .OR. jatom < 1 .OR. jatom > SIZE(particle_set) .OR. &
+          left_clist%catom < 1 .OR. left_clist%catom > SIZE(particle_set) .OR. right_clist%catom < 1 .OR. &
+          right_clist%catom > SIZE(particle_set)) THEN
+         CPABORT('ECD| GTH path projector image has an invalid atom index')
+      END IF
+      left_projector_position = ref_point + pbc(particle_set(iatom)%r - ref_point, cell) + left_clist%rac
+      right_projector_position = ref_point + pbc(particle_set(jatom)%r - ref_point, cell) + right_clist%rac
+
+   END SUBROUTINE ecd_projector_image_positions
+
+! **************************************************************************************************
 !> \brief Add one Pickard--Mauri two-field curvature block through first spatial order.
 ! **************************************************************************************************
    SUBROUTINE ecd_add_gth_diamagnetic_path_moments(zero_block, first_block, acint, achint, bcint, direction, &
-                                                    projector_position, ref_point, ia, ib, na, nb, np)
+                                                    left_projector_position, right_projector_position, ref_point, &
+                                                    ia, ib, na, nb, np)
       REAL(KIND=dp), DIMENSION(:, :), POINTER :: zero_block, first_block
       REAL(KIND=dp), DIMENSION(:, :, :), POINTER :: acint, achint, bcint
-      REAL(KIND=dp), DIMENSION(3), INTENT(IN) :: direction, projector_position, ref_point
+      REAL(KIND=dp), DIMENSION(3), INTENT(IN) :: direction, left_projector_position, &
+                                                  right_projector_position, ref_point
       INTEGER, INTENT(IN) :: ia, ib, na, nb, np
 
       INTEGER :: idir, jdir
-      REAL(KIND=dp), DIMENSION(3) :: projector_shift
+      REAL(KIND=dp), DIMENSION(3) :: left_projector_shift, path_projector_shift, right_projector_shift
       REAL(KIND=dp), ALLOCATABLE, DIMENSION(:, :, :) :: left_zero, left_first, right_zero, right_first
       REAL(KIND=dp), ALLOCATABLE, DIMENSION(:, :, :, :) :: left_pair, right_pair
 
-      projector_shift = projector_position - ref_point
+      left_projector_shift = left_projector_position - ref_point
+      right_projector_shift = right_projector_position - ref_point
+      path_projector_shift = left_projector_shift
       ALLOCATE (left_zero(na, np, 3), left_first(na, np, 3), right_zero(nb, np, 3), right_first(nb, np, 3), &
                 left_pair(na, np, 3, 3), right_pair(nb, np, 3, 3))
       DO idir = 1, 3
          left_zero(:, :, idir) = achint(1:na, 1:np, ecd_gth_path_moment_index(idir)) - &
-                                  projector_shift(idir)*achint(1:na, 1:np, 1)
+                                  left_projector_shift(idir)*achint(1:na, 1:np, 1)
          right_zero(:, :, idir) = bcint(1:nb, 1:np, ecd_gth_path_moment_index(idir)) - &
-                                   projector_shift(idir)*bcint(1:nb, 1:np, 1)
+                                   right_projector_shift(idir)*bcint(1:nb, 1:np, 1)
       END DO
       DO idir = 1, 3
          DO jdir = 1, 3
             left_pair(:, :, idir, jdir) = achint(1:na, 1:np, ecd_gth_path_pair_index(idir, jdir)) - &
-               projector_shift(idir)*achint(1:na, 1:np, ecd_gth_path_moment_index(jdir)) - &
-               projector_shift(jdir)*achint(1:na, 1:np, ecd_gth_path_moment_index(idir)) + &
-               projector_shift(idir)*projector_shift(jdir)*achint(1:na, 1:np, 1)
+               left_projector_shift(idir)*achint(1:na, 1:np, ecd_gth_path_moment_index(jdir)) - &
+               left_projector_shift(jdir)*achint(1:na, 1:np, ecd_gth_path_moment_index(idir)) + &
+               left_projector_shift(idir)*left_projector_shift(jdir)*achint(1:na, 1:np, 1)
             right_pair(:, :, idir, jdir) = bcint(1:nb, 1:np, ecd_gth_path_pair_index(idir, jdir)) - &
-               projector_shift(idir)*bcint(1:nb, 1:np, ecd_gth_path_moment_index(jdir)) - &
-               projector_shift(jdir)*bcint(1:nb, 1:np, ecd_gth_path_moment_index(idir)) + &
-               projector_shift(idir)*projector_shift(jdir)*bcint(1:nb, 1:np, 1)
+               right_projector_shift(idir)*bcint(1:nb, 1:np, ecd_gth_path_moment_index(jdir)) - &
+               right_projector_shift(jdir)*bcint(1:nb, 1:np, ecd_gth_path_moment_index(idir)) + &
+               right_projector_shift(idir)*right_projector_shift(jdir)*bcint(1:nb, 1:np, 1)
          END DO
       END DO
       DO idir = 1, 3
-         left_first(:, :, idir) = DOT_PRODUCT(direction, projector_shift)*left_zero(:, :, idir)
-         right_first(:, :, idir) = DOT_PRODUCT(direction, projector_shift)*right_zero(:, :, idir)
+         ! Both segment phases are referenced to the physical left projector image.
+         left_first(:, :, idir) = DOT_PRODUCT(direction, path_projector_shift)*left_zero(:, :, idir)
+         right_first(:, :, idir) = DOT_PRODUCT(direction, path_projector_shift)*right_zero(:, :, idir)
          DO jdir = 1, 3
             left_first(:, :, idir) = left_first(:, :, idir) + 0.5_dp*direction(jdir)*left_pair(:, :, idir, jdir)
             right_first(:, :, idir) = right_first(:, :, idir) + 0.5_dp*direction(jdir)*right_pair(:, :, idir, jdir)
@@ -1854,24 +1885,28 @@ CONTAINS
 ! **************************************************************************************************
 !> \brief Add one real Pickard--Mauri path polynomial to an AO matrix block.
 ! **************************************************************************************************
-   SUBROUTINE ecd_add_gth_path_moment(block, acint, achint, bcint, direction, projector_position, &
-                                      ref_point, component, order, na, nb, np)
+   SUBROUTINE ecd_add_gth_path_moment(block, acint, achint, bcint, direction, left_projector_position, &
+                                      right_projector_position, ref_point, component, order, na, nb, np)
 
       REAL(KIND=dp), DIMENSION(:, :), POINTER            :: block
       REAL(KIND=dp), DIMENSION(:, :, :), POINTER         :: acint, achint, bcint
-      REAL(KIND=dp), DIMENSION(3), INTENT(IN)            :: direction, projector_position, ref_point
+      REAL(KIND=dp), DIMENSION(3), INTENT(IN)            :: direction, left_projector_position, &
+                                                            right_projector_position, ref_point
       INTEGER, INTENT(IN)                                :: component, order, na, nb, np
 
-      INTEGER                                            :: ix, iy, iz, m, moment_index, &
-                                                            shifted_moment_index
+      INTEGER                                            :: ix, iy, iz, m
       REAL(KIND=dp)                                      :: directional_factor, path_factor, &
                                                             projector_coordinate
-      REAL(KIND=dp), ALLOCATABLE, DIMENSION(:, :)        :: left_path, right_path
+      REAL(KIND=dp), DIMENSION(3)                        :: left_projector_shift, right_projector_shift
+      REAL(KIND=dp), ALLOCATABLE, DIMENSION(:, :)        :: left_centered_moment, left_path, &
+                                                            right_centered_moment, right_path
 
-      ALLOCATE (left_path(na, np), right_path(nb, np))
+      left_projector_shift = left_projector_position - ref_point
+      right_projector_shift = right_projector_position - ref_point
+      ALLOCATE (left_centered_moment(na, np), left_path(na, np), right_centered_moment(nb, np), right_path(nb, np))
       left_path = 0.0_dp
       right_path = 0.0_dp
-      projector_coordinate = DOT_PRODUCT(direction, projector_position - ref_point)
+      projector_coordinate = DOT_PRODUCT(direction, left_projector_shift)
 
       DO m = 0, order
          ! Normalized coefficient of the Pickard--Mauri segment integral:
@@ -1881,36 +1916,80 @@ CONTAINS
          DO ix = 0, m
             DO iy = 0, m - ix
                iz = m - ix - iy
-               moment_index = coset(ix, iy, iz)
-               SELECT CASE (component)
-               CASE (1)
-                  shifted_moment_index = coset(ix + 1, iy, iz)
-               CASE (2)
-                  shifted_moment_index = coset(ix, iy + 1, iz)
-               CASE (3)
-                  shifted_moment_index = coset(ix, iy, iz + 1)
-               CASE DEFAULT
-                  CPABORT("ECD| Invalid Cartesian component in GTH path moment")
-               END SELECT
                directional_factor = ecd_integer_factorial(m)/ &
                                     (ecd_integer_factorial(ix)*ecd_integer_factorial(iy)*ecd_integer_factorial(iz))
                IF (ix > 0) directional_factor = directional_factor*direction(1)**ix
                IF (iy > 0) directional_factor = directional_factor*direction(2)**iy
                IF (iz > 0) directional_factor = directional_factor*direction(3)**iz
                directional_factor = directional_factor*path_factor
-               left_path = left_path + directional_factor*(achint(1:na, 1:np, shifted_moment_index) - &
-                                            (projector_position(component) - ref_point(component))*achint(1:na, 1:np, moment_index))
-               right_path = right_path + directional_factor*(bcint(1:nb, 1:np, shifted_moment_index) - &
-                                             (projector_position(component) - ref_point(component))*bcint(1:nb, 1:np, moment_index))
+               CALL ecd_projector_centered_moment(left_centered_moment, achint, left_projector_shift, component, &
+                                                   ix, iy, iz)
+               CALL ecd_projector_centered_moment(right_centered_moment, bcint, right_projector_shift, component, &
+                                                   ix, iy, iz)
+               left_path = left_path + directional_factor*left_centered_moment
+               right_path = right_path + directional_factor*right_centered_moment
             END DO
          END DO
       END DO
 
       block(1:na, 1:nb) = block(1:na, 1:nb) + MATMUL(left_path, TRANSPOSE(bcint(1:nb, 1:np, 1))) - &
                           MATMUL(achint(1:na, 1:np, 1), TRANSPOSE(right_path))
-      DEALLOCATE (left_path, right_path)
+      DEALLOCATE (left_centered_moment, left_path, right_centered_moment, right_path)
 
    END SUBROUTINE ecd_add_gth_path_moment
+
+! **************************************************************************************************
+!> \brief Form <a|(r_a-R_a)(r-R)^n|p> from reference-point multipole overlaps.
+!>
+!> build_sap_ints stores powers of r-R0. Pickard--Mauri line segments require
+!> projector-centred powers r-R, so every factor is shifted before the path
+!> polynomial is assembled.
+! **************************************************************************************************
+   SUBROUTINE ecd_projector_centered_moment(centered_moment, integrals, projector_shift, component, ix, iy, iz)
+
+      REAL(KIND=dp), DIMENSION(:, :), INTENT(OUT)        :: centered_moment
+      REAL(KIND=dp), DIMENSION(:, :, :), POINTER         :: integrals
+      REAL(KIND=dp), DIMENSION(3), INTENT(IN)            :: projector_shift
+      INTEGER, INTENT(IN)                                :: component, ix, iy, iz
+
+      INTEGER                                            :: jx, jy, jz, moment_index, shifted_moment_index
+      REAL(KIND=dp)                                      :: coefficient
+
+      IF (component < 1 .OR. component > 3 .OR. ix < 0 .OR. iy < 0 .OR. iz < 0) THEN
+         CPABORT('ECD| Invalid projector-centred GTH moment request')
+      END IF
+      IF (SIZE(centered_moment, 1) > SIZE(integrals, 1) .OR. SIZE(centered_moment, 2) > SIZE(integrals, 2)) THEN
+         CPABORT('ECD| Projector-centred GTH moment received incompatible overlap storage')
+      END IF
+
+      centered_moment = 0.0_dp
+      DO jx = 0, ix
+         DO jy = 0, iy
+            DO jz = 0, iz
+               moment_index = coset(jx, jy, jz)
+               SELECT CASE (component)
+               CASE (1)
+                  shifted_moment_index = coset(jx + 1, jy, jz)
+               CASE (2)
+                  shifted_moment_index = coset(jx, jy + 1, jz)
+               CASE DEFAULT
+                  shifted_moment_index = coset(jx, jy, jz + 1)
+               END SELECT
+               IF (moment_index > SIZE(integrals, 3) .OR. shifted_moment_index > SIZE(integrals, 3)) THEN
+                  CPABORT('ECD| Projector-centred GTH moment exceeds available overlap order')
+               END IF
+               coefficient = ecd_integer_factorial(ix)/(ecd_integer_factorial(jx)*ecd_integer_factorial(ix - jx))* &
+                             ecd_integer_factorial(iy)/(ecd_integer_factorial(jy)*ecd_integer_factorial(iy - jy))* &
+                             ecd_integer_factorial(iz)/(ecd_integer_factorial(jz)*ecd_integer_factorial(iz - jz))* &
+                             (-projector_shift(1))**(ix - jx)*(-projector_shift(2))**(iy - jy)* &
+                             (-projector_shift(3))**(iz - jz)
+               centered_moment = centered_moment + coefficient*(integrals(:, :, shifted_moment_index) - &
+                                  projector_shift(component)*integrals(:, :, moment_index))
+            END DO
+         END DO
+      END DO
+
+   END SUBROUTINE ecd_projector_centered_moment
 
 ! **************************************************************************************************
 !> \brief Return n! as a real scalar for a non-negative integer n.
