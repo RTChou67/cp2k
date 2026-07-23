@@ -1469,7 +1469,8 @@ CONTAINS
 
       INTEGER                                            :: idir
       LOGICAL                                            :: gth_available, gth_enabled
-      REAL(KIND=dp)                                      :: complete_norm_sq, first_imag_norm_sq, first_norm_sq, gth_norm_sq, &
+      REAL(KIND=dp)                                      :: complete_norm_sq, first_imag_norm_sq, first_norm_sq, gth_imag_norm_sq, &
+                                                            gth_norm_sq, gth_path_norm_sq, gth_real_residual_norm_sq, &
                                                             gth_reference_norm_sq, gth_relative_residual, gth_residual_norm_sq, &
                                                             local_norm_sq, local_reference_norm_sq, local_relative_residual, &
                                                             local_residual_norm_sq, residual_norm_sq, zero_norm_sq, &
@@ -1552,6 +1553,9 @@ CONTAINS
          local_relative_residual = 2.0_dp*SQRT(ABS(local_residual_norm_sq))/ &
                                    MAX(SQRT(TINY(1.0_dp)), SQRT(ABS(local_norm_sq)) + SQRT(ABS(local_reference_norm_sq)))
          gth_norm_sq = 0.0_dp
+         gth_imag_norm_sq = 0.0_dp
+         gth_path_norm_sq = 0.0_dp
+         gth_real_residual_norm_sq = 0.0_dp
          gth_reference_norm_sq = 0.0_dp
          gth_residual_norm_sq = 0.0_dp
          gth_relative_residual = 0.0_dp
@@ -1559,11 +1563,16 @@ CONTAINS
             CALL dbcsr_set(current_residual(idir)%matrix, 0.0_dp)
             CALL dbcsr_add(current_residual(idir)%matrix, gth_current_taylor_real(idir, 1)%matrix, 0.0_dp, 1.0_dp)
             CALL dbcsr_dot(current_residual(idir)%matrix, current_residual(idir)%matrix, gth_norm_sq)
+            CALL dbcsr_dot(gth_current_taylor_imag(idir, 1)%matrix, &
+                           gth_current_taylor_imag(idir, 1)%matrix, gth_imag_norm_sq)
             CALL dbcsr_dot(gth_current(idir)%matrix, gth_current(idir)%matrix, gth_reference_norm_sq)
             CALL dbcsr_add(current_residual(idir)%matrix, gth_current(idir)%matrix, 1.0_dp, -1.0_dp)
-            CALL dbcsr_dot(current_residual(idir)%matrix, current_residual(idir)%matrix, gth_residual_norm_sq)
+            CALL dbcsr_dot(current_residual(idir)%matrix, current_residual(idir)%matrix, &
+                           gth_real_residual_norm_sq)
+            gth_path_norm_sq = gth_norm_sq + gth_imag_norm_sq
+            gth_residual_norm_sq = gth_real_residual_norm_sq + gth_imag_norm_sq
             gth_relative_residual = 2.0_dp*SQRT(ABS(gth_residual_norm_sq))/ &
-                                    MAX(SQRT(TINY(1.0_dp)), SQRT(ABS(gth_norm_sq)) + &
+                                    MAX(SQRT(TINY(1.0_dp)), SQRT(ABS(gth_path_norm_sq)) + &
                                         SQRT(ABS(gth_reference_norm_sq)))
          END IF
          IF (cp_logger_get_default_io_unit(logger) > 0) THEN
@@ -1579,9 +1588,15 @@ CONTAINS
                'ECD| Stage G4 local current zeroth relative residual component', idir, local_relative_residual
             IF (gth_enabled) THEN
                WRITE (cp_logger_get_default_io_unit(logger), '(T2,A,I1,T55,ES14.6)') &
-                  'ECD| Stage G4 GTH current zeroth residual component', idir, SQRT(ABS(gth_residual_norm_sq))
+                  'ECD| Stage G4 GTH q=0 path norm component', idir, SQRT(ABS(gth_path_norm_sq))
                WRITE (cp_logger_get_default_io_unit(logger), '(T2,A,I1,T55,ES14.6)') &
-                  'ECD| Stage G4 GTH current zeroth relative residual component', idir, gth_relative_residual
+                  'ECD| Stage G4 GTH q=0 built-in norm component', idir, SQRT(ABS(gth_reference_norm_sq))
+               WRITE (cp_logger_get_default_io_unit(logger), '(T2,A,I1,T55,ES14.6)') &
+                  'ECD| Stage G4 GTH q=0 path imaginary norm component', idir, SQRT(ABS(gth_imag_norm_sq))
+               WRITE (cp_logger_get_default_io_unit(logger), '(T2,A,I1,T55,ES14.6)') &
+                  'ECD| Stage G4 GTH q=0 full residual component', idir, SQRT(ABS(gth_residual_norm_sq))
+               WRITE (cp_logger_get_default_io_unit(logger), '(T2,A,I1,T55,ES14.6)') &
+                  'ECD| Stage G4 GTH q=0 full relative residual component', idir, gth_relative_residual
             END IF
             WRITE (cp_logger_get_default_io_unit(logger), '(T2,A,I1,T55,ES14.6)') &
                'ECD| Stage G4 current first real norm component', idir, SQRT(ABS(first_norm_sq))
