@@ -1562,6 +1562,11 @@ CONTAINS
          END IF
       END DO
 
+      IF (gth_enabled) THEN
+         CALL ecd_periodic_gth_current_oracle_g4(qs_env, context, gth_current_taylor_real, &
+                                                  gth_current_taylor_imag)
+      END IF
+
       CALL dbcsr_deallocate_matrix_set(current_residual)
       context%current_taylor_imag => current_taylor_imag
       context%current_taylor_real => current_taylor_real
@@ -1575,6 +1580,146 @@ CONTAINS
       CALL ecd_periodic_local_operators_release(local_operators)
 
    END SUBROUTINE ecd_periodic_implicit_gamma_current_g4
+
+! **************************************************************************************************
+!> \brief Validate the first GTH current coefficient from an independent finite-q PM reconstruction.
+!>
+!> The reconstruction folds raw Pickard--Mauri path coefficients through fifth order at the exact
+!> midpoint wave vectors +/-q/2. The production current-Taylor convolution remains separate.
+! **************************************************************************************************
+   SUBROUTINE ecd_periodic_gth_current_oracle_g4(qs_env, context, analytic_real, analytic_imag)
+      TYPE(qs_environment_type), POINTER                 :: qs_env
+      TYPE(ecd_gamma_context_type), INTENT(IN), TARGET   :: context
+      TYPE(dbcsr_p_type), DIMENSION(:, :), POINTER       :: analytic_imag, analytic_real
+
+      INTEGER, PARAMETER                                  :: oracle_order = 5
+      REAL(KIND=dp), PARAMETER                            :: fd_step = 1.0E-4_dp
+
+      COMPLEX(KIND=dp)                                    :: scale_minus, scale_plus
+      INTEGER                                             :: idir, iorder
+      REAL(KIND=dp)                                       :: analytic_norm, oracle_norm, relative_residual, residual_norm
+      REAL(KIND=dp)                                       :: analytic_norm_sq, oracle_norm_sq, residual_norm_sq
+      REAL(KIND=dp), DIMENSION(3)                         :: xkp_minus, xkp_plus, xkp_step
+      TYPE(cp_logger_type), POINTER                       :: logger
+      TYPE(dbcsr_p_type), DIMENSION(:), POINTER           :: fd_imag, fd_real, minus_imag, minus_real, &
+                                                             plus_imag, plus_real, residual_imag, residual_real, &
+                                                             work_imag, work_real
+      TYPE(dbcsr_p_type), DIMENSION(:, :, :), POINTER     :: path_rs
+      TYPE(ecd_periodic_gth_operators_type)               :: oracle_operators
+      INTEGER, DIMENSION(:, :, :), POINTER                :: cell_to_index
+      TYPE(dbcsr_p_type), DIMENSION(:, :), POINTER        :: source_rs
+
+      NULLIFY (cell_to_index, fd_imag, fd_real, logger, minus_imag, minus_real, path_rs, plus_imag, plus_real, &
+               residual_imag, residual_real, source_rs, work_imag, work_real)
+      IF (SIZE(analytic_real, 1) /= ncart .OR. SIZE(analytic_imag, 1) /= ncart .OR. &
+          SIZE(analytic_real, 2) < 2 .OR. SIZE(analytic_imag, 2) < 2) THEN
+         CPABORT('ECD| Stage G4 GTH finite-q oracle received incompatible analytic current coefficients')
+      END IF
+
+      CALL ecd_periodic_gth_operators_build(oracle_operators, qs_env, context%direction, context%ref_point, oracle_order)
+      CALL ecd_periodic_gth_operators_get(oracle_operators, cell_to_index, path_rs)
+      IF (SIZE(path_rs, 1) /= ncart .OR. SIZE(path_rs, 2) /= oracle_order + 1) THEN
+         CPABORT('ECD| Stage G4 GTH finite-q oracle received incompatible PM path coefficients')
+      END IF
+
+      xkp_step = fd_step*MATMUL(TRANSPOSE(context%cell%hmat), context%direction)/twopi
+      xkp_plus = -0.5_dp*xkp_step
+      xkp_minus = -xkp_plus
+      CALL ecd_periodic_ao_vector_create(plus_real, context%matrix_s(1)%matrix, context%sab_all, &
+                                         'ECD G4 GTH oracle positive real', dbcsr_type_no_symmetry)
+      CALL ecd_periodic_ao_vector_create(plus_imag, context%matrix_s(1)%matrix, context%sab_all, &
+                                         'ECD G4 GTH oracle positive imag', dbcsr_type_no_symmetry)
+      CALL ecd_periodic_ao_vector_create(minus_real, context%matrix_s(1)%matrix, context%sab_all, &
+                                         'ECD G4 GTH oracle negative real', dbcsr_type_no_symmetry)
+      CALL ecd_periodic_ao_vector_create(minus_imag, context%matrix_s(1)%matrix, context%sab_all, &
+                                         'ECD G4 GTH oracle negative imag', dbcsr_type_no_symmetry)
+      CALL ecd_periodic_ao_vector_create(fd_real, context%matrix_s(1)%matrix, context%sab_all, &
+                                         'ECD G4 GTH oracle derivative real', dbcsr_type_no_symmetry)
+      CALL ecd_periodic_ao_vector_create(fd_imag, context%matrix_s(1)%matrix, context%sab_all, &
+                                         'ECD G4 GTH oracle derivative imag', dbcsr_type_no_symmetry)
+      CALL ecd_periodic_ao_vector_create(residual_real, context%matrix_s(1)%matrix, context%sab_all, &
+                                         'ECD G4 GTH oracle residual real', dbcsr_type_no_symmetry)
+      CALL ecd_periodic_ao_vector_create(residual_imag, context%matrix_s(1)%matrix, context%sab_all, &
+                                         'ECD G4 GTH oracle residual imag', dbcsr_type_no_symmetry)
+      CALL ecd_periodic_ao_set_create(work_real, 1, context%matrix_s(1)%matrix, context%sab_all, &
+                                      'ECD G4 GTH oracle work real', dbcsr_type_no_symmetry)
+      CALL ecd_periodic_ao_set_create(work_imag, 1, context%matrix_s(1)%matrix, context%sab_all, &
+                                      'ECD G4 GTH oracle work imag', dbcsr_type_no_symmetry)
+
+      DO iorder = 0, oracle_order
+         scale_plus = ecd_periodic_i_power(iorder)*fd_step**iorder
+         scale_minus = ecd_periodic_i_power(iorder)*(-fd_step)**iorder
+         DO idir = 1, ncart
+            source_rs => path_rs(idir:idir, iorder + 1, :)
+            CALL dbcsr_set(work_real(1)%matrix, 0.0_dp)
+            CALL dbcsr_set(work_imag(1)%matrix, 0.0_dp)
+            CALL rskp_transform(work_real(1)%matrix, work_imag(1)%matrix, source_rs, 1, xkp_plus, &
+                                cell_to_index, context%sab_all)
+            CALL ecd_periodic_ao_add_complex_scaled(plus_real(idir), plus_imag(idir), work_real(1), work_imag(1), &
+                                                    scale_plus)
+            CALL dbcsr_set(work_real(1)%matrix, 0.0_dp)
+            CALL dbcsr_set(work_imag(1)%matrix, 0.0_dp)
+            CALL rskp_transform(work_real(1)%matrix, work_imag(1)%matrix, source_rs, 1, xkp_minus, &
+                                cell_to_index, context%sab_all)
+            CALL ecd_periodic_ao_add_complex_scaled(minus_real(idir), minus_imag(idir), work_real(1), work_imag(1), &
+                                                    scale_minus)
+            NULLIFY (source_rs)
+         END DO
+      END DO
+
+      logger => cp_get_default_logger()
+      DO idir = 1, ncart
+         CALL dbcsr_set(fd_real(idir)%matrix, 0.0_dp)
+         CALL dbcsr_set(fd_imag(idir)%matrix, 0.0_dp)
+         CALL dbcsr_add(fd_real(idir)%matrix, plus_real(idir)%matrix, 0.0_dp, 0.5_dp/fd_step)
+         CALL dbcsr_add(fd_real(idir)%matrix, minus_real(idir)%matrix, 1.0_dp, -0.5_dp/fd_step)
+         CALL dbcsr_add(fd_imag(idir)%matrix, plus_imag(idir)%matrix, 0.0_dp, 0.5_dp/fd_step)
+         CALL dbcsr_add(fd_imag(idir)%matrix, minus_imag(idir)%matrix, 1.0_dp, -0.5_dp/fd_step)
+         CALL dbcsr_set(residual_real(idir)%matrix, 0.0_dp)
+         CALL dbcsr_set(residual_imag(idir)%matrix, 0.0_dp)
+         CALL dbcsr_add(residual_real(idir)%matrix, fd_real(idir)%matrix, 0.0_dp, 1.0_dp)
+         CALL dbcsr_add(residual_real(idir)%matrix, analytic_real(idir, 2)%matrix, 1.0_dp, -1.0_dp)
+         CALL dbcsr_add(residual_imag(idir)%matrix, fd_imag(idir)%matrix, 0.0_dp, 1.0_dp)
+         CALL dbcsr_add(residual_imag(idir)%matrix, analytic_imag(idir, 2)%matrix, 1.0_dp, -1.0_dp)
+         CALL dbcsr_dot(fd_real(idir)%matrix, fd_real(idir)%matrix, oracle_norm_sq)
+         CALL dbcsr_dot(fd_imag(idir)%matrix, fd_imag(idir)%matrix, residual_norm_sq)
+         oracle_norm = SQRT(ABS(oracle_norm_sq) + ABS(residual_norm_sq))
+         CALL dbcsr_dot(analytic_real(idir, 2)%matrix, analytic_real(idir, 2)%matrix, analytic_norm_sq)
+         CALL dbcsr_dot(analytic_imag(idir, 2)%matrix, analytic_imag(idir, 2)%matrix, residual_norm_sq)
+         analytic_norm = SQRT(ABS(analytic_norm_sq) + ABS(residual_norm_sq))
+         CALL dbcsr_dot(residual_real(idir)%matrix, residual_real(idir)%matrix, residual_norm_sq)
+         CALL dbcsr_dot(residual_imag(idir)%matrix, residual_imag(idir)%matrix, analytic_norm_sq)
+         residual_norm = SQRT(ABS(residual_norm_sq) + ABS(analytic_norm_sq))
+         relative_residual = 2.0_dp*residual_norm/MAX(SQRT(TINY(1.0_dp)), oracle_norm + analytic_norm)
+         IF (cp_logger_get_default_io_unit(logger) > 0) THEN
+            WRITE (cp_logger_get_default_io_unit(logger), '(T2,A,I1,T55,ES14.6)') &
+               'ECD| Stage G4 GTH finite-q oracle norm component', idir, oracle_norm
+            WRITE (cp_logger_get_default_io_unit(logger), '(T2,A,I1,T55,ES14.6)') &
+               'ECD| Stage G4 GTH finite-q oracle residual component', idir, residual_norm
+            WRITE (cp_logger_get_default_io_unit(logger), '(T2,A,I1,T55,ES14.6)') &
+               'ECD| Stage G4 GTH finite-q oracle relative residual component', idir, relative_residual
+         END IF
+      END DO
+      IF (cp_logger_get_default_io_unit(logger) > 0) THEN
+         WRITE (cp_logger_get_default_io_unit(logger), '(T2,A,T55,I8)') &
+            'ECD| Stage G4 GTH finite-q oracle path order', oracle_order
+         WRITE (cp_logger_get_default_io_unit(logger), '(T2,A,T55,ES14.6)') &
+            'ECD| Stage G4 GTH finite-q oracle step [bohr^-1]', fd_step
+      END IF
+
+      CALL dbcsr_deallocate_matrix_set(work_imag)
+      CALL dbcsr_deallocate_matrix_set(work_real)
+      CALL dbcsr_deallocate_matrix_set(residual_imag)
+      CALL dbcsr_deallocate_matrix_set(residual_real)
+      CALL dbcsr_deallocate_matrix_set(fd_imag)
+      CALL dbcsr_deallocate_matrix_set(fd_real)
+      CALL dbcsr_deallocate_matrix_set(minus_imag)
+      CALL dbcsr_deallocate_matrix_set(minus_real)
+      CALL dbcsr_deallocate_matrix_set(plus_imag)
+      CALL dbcsr_deallocate_matrix_set(plus_real)
+      CALL ecd_periodic_gth_operators_release(oracle_operators)
+
+   END SUBROUTINE ecd_periodic_gth_current_oracle_g4
 
 ! **************************************************************************************************
 !> \brief Assemble the first-order velocity-gauge causal response from retained Gamma providers.
@@ -2881,8 +3026,8 @@ CONTAINS
                   CALL rskp_directional_taylor_transform(work_real(1)%matrix, work_imag(1)%matrix, source_rs, &
                                                          1, xkp, source_cell_to_index, sab_nl, hmat, direction, &
                                                          lattice_order, shift_scale=-0.5_dp)
-                  ! Match the finite-q Fourier convention used by the local current vertex.
-                  scale = CONJG(ecd_periodic_i_power(operator_order))
+                  ! Pickard--Mauri path coefficients use the local positive-q Fourier convention.
+                  scale = ecd_periodic_i_power(operator_order)
                   CALL ecd_periodic_ao_add_complex_scaled(current_real(idir, total_order + 1), &
                                                           current_imag(idir, total_order + 1), work_real(1), &
                                                           work_imag(1), scale)
@@ -2904,8 +3049,8 @@ CONTAINS
 ! **************************************************************************************************
 !> \brief Fold Pickard--Mauri two-field path coefficients into the implicit-Gamma AO basis.
 !>
-!> The raw first path coefficient is real.  Its physical Hamiltonian
-!> coefficient carries the explicit imaginary Taylor factor.
+!> The raw first path coefficient is real.  The Pickard--Mauri Fourier
+!> convention gives the physical coefficient +i times this path matrix.
 ! **************************************************************************************************
    SUBROUTINE ecd_periodic_gth_diamagnetic_taylor_build(diamagnetic_real, diamagnetic_imag, path_rs, xkp_zero, &
                                                          cell_to_index, sab_nl)
@@ -2944,7 +3089,7 @@ CONTAINS
                                    cell_to_index, sab_nl)
                IF (iorder == 2) THEN
                   CALL dbcsr_add(diamagnetic_imag(ia, ib, iorder)%matrix, &
-                                 diamagnetic_real(ia, ib, iorder)%matrix, 0.0_dp, -1.0_dp)
+                                 diamagnetic_real(ia, ib, iorder)%matrix, 0.0_dp, 1.0_dp)
                   CALL dbcsr_set(diamagnetic_real(ia, ib, iorder)%matrix, 0.0_dp)
                END IF
                NULLIFY (source_rs)
