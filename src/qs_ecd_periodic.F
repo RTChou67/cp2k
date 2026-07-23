@@ -18,7 +18,6 @@ MODULE qs_ecd_periodic
                                               cp_cfm_type,&
                                               cp_fm_to_cfm
    USE cp_dbcsr_api,                    ONLY: dbcsr_add,&
-                                              dbcsr_copy,&
                                               dbcsr_create,&
                                               dbcsr_init_p,&
                                               dbcsr_p_type,&
@@ -85,7 +84,6 @@ MODULE qs_ecd_periodic
    USE qs_integrate_potential,          ONLY: integrate_v_rspace
    USE qs_kind_types,                   ONLY: qs_kind_type
    USE qs_ks_types,                     ONLY: qs_ks_env_type
-   USE qs_moments,                      ONLY: build_berry_moment_matrix
    USE qs_neighbor_list_types,          ONLY: neighbor_list_set_p_type
    USE qs_rho_types,                    ONLY: qs_rho_type
    USE qs_vxc,                          ONLY: qs_vxc_create
@@ -147,13 +145,10 @@ CONTAINS
       INTEGER, INTENT(IN)                                :: broadening
       REAL(KIND=dp), INTENT(IN)                          :: fwhm
 
-      COMPLEX(KIND=dp), ALLOCATABLE, DIMENSION(:, :, :)  :: bloch_response_zero, velocity_first_direction, &
-                                                            velocity_response_zero, &
+      COMPLEX(KIND=dp), ALLOCATABLE, DIMENSION(:, :, :)  :: velocity_first_direction, velocity_response_zero, &
                                                             velocity_response_zero_direction, velocity_transition_direction
       COMPLEX(KIND=dp), ALLOCATABLE, DIMENSION(:, :, :, :) :: velocity_first_cartesian, velocity_transition_cartesian
-      COMPLEX(KIND=dp), ALLOCATABLE, DIMENSION(:)        :: bloch_transition_direction
-      COMPLEX(KIND=dp), ALLOCATABLE, DIMENSION(:, :)     :: bloch_transition, direct_position_transition, &
-                                                            static_magnetic_transition_direction
+      COMPLEX(KIND=dp), ALLOCATABLE, DIMENSION(:, :)     :: direct_position_transition, static_magnetic_transition_direction
       COMPLEX(KIND=dp), ALLOCATABLE, DIMENSION(:, :, :)  :: velocity_complete_first_direction, &
                                                             velocity_complete_zero, velocity_complete_zero_direction, &
                                                             velocity_cross_first_direction, velocity_cross_zero, &
@@ -259,7 +254,6 @@ CONTAINS
                                                       transition_band_range, eps_degeneracy)
          IF (idir == 1) THEN
             ALLOCATE (gap_first_cartesian(transition_selection%selected_count, ncart), &
-                      bloch_transition(ncart, transition_selection%selected_count), &
                       selected_iocc(transition_selection%selected_count), &
                       selected_ispin(transition_selection%selected_count), &
                       selected_ivirt(transition_selection%selected_count), &
@@ -284,11 +278,6 @@ CONTAINS
                CPABORT('ECD| Cartesian Gamma directions selected inconsistent occupied-empty transitions')
             END IF
          END IF
-         CALL ecd_periodic_implicit_gamma_bloch_transition_direction_g13(qs_env, gamma_context, &
-                                                                           transition_selection, &
-                                                                           bloch_transition_direction)
-         bloch_transition(idir, :) = bloch_transition_direction
-         DEALLOCATE (bloch_transition_direction)
          DO itransition = 1, transition_selection%selected_count
             gap_first_cartesian(itransition, idir) = 0.5_dp*( &
                gamma_context%spin(transition_selection%ispin(itransition))% &
@@ -376,14 +365,8 @@ CONTAINS
       END DO
       CALL ecd_periodic_implicit_gamma_direct_position_transitions(gamma_context, gamma_operators, &
                                                                     transition_selection, direct_position_transition)
-      CALL ecd_periodic_implicit_gamma_bloch_response_g13(gamma_context, transition_selection, &
-                                                           bloch_transition, energy_range, npoints, fwhm, &
-                                                           bloch_response_zero)
-      CALL ecd_periodic_implicit_gamma_bloch_hypervirial_g14(transition_selection, &
-                                                              velocity_transition_cartesian, &
-                                                              bloch_transition)
       CALL ecd_periodic_print_cartesian_response(ecd_section, energy_range, velocity_response_zero, &
-                                                 velocity_first_cartesian, bloch_response_zero, gamma_context, gth_available, &
+                                                 velocity_first_cartesian, gamma_context, gth_available, &
                                                  pseudopotential_commutator, fwhm, &
                                                  transition_selection)
       CALL ecd_periodic_print_cartesian_transition_matrix_elements(ecd_section, gamma_context, transition_selection, &
@@ -393,16 +376,13 @@ CONTAINS
                                                                     velocity_gth_transition_cartesian, &
                                                                     direct_position_transition, &
                                                                     static_magnetic_transition_cartesian)
-      CALL ecd_periodic_print_cartesian_gauge_diagnostics(ecd_section, gamma_context, gth_available, fwhm, &
-                                                           transition_selection, energy_range, velocity_complete_zero, &
-                                                           bloch_response_zero)
       CALL ecd_periodic_print_cartesian_velocity_decomposition(ecd_section, energy_range, velocity_local_zero, &
                                                                 velocity_local_first_cartesian, velocity_cross_zero, &
                                                                 velocity_cross_first_cartesian, velocity_nonlocal_zero, &
                                                                 velocity_nonlocal_first_cartesian, velocity_complete_zero, &
                                                                 velocity_complete_first_cartesian, gamma_context, &
                                                                 gth_available, fwhm, transition_selection)
-      DEALLOCATE (bloch_response_zero, bloch_transition, direct_position_transition, gap_first_cartesian, &
+      DEALLOCATE (direct_position_transition, gap_first_cartesian, &
                   selected_iocc, selected_ispin, selected_ivirt, velocity_first_cartesian, &
                   velocity_response_zero, velocity_transition_cartesian, velocity_complete_first_cartesian, &
                   velocity_complete_zero, velocity_cross_first_cartesian, velocity_cross_zero, &
@@ -2115,233 +2095,6 @@ CONTAINS
    END SUBROUTINE ecd_periodic_implicit_gamma_direct_position_transitions
 
 ! **************************************************************************************************
-!> \brief Build one directional covariant Bloch connection in the q -> 0 limit.
-! **************************************************************************************************
-   SUBROUTINE ecd_periodic_implicit_gamma_bloch_transition_direction_g13(qs_env, context, transition_selection, &
-                                                                           transition_output)
-      TYPE(qs_environment_type), POINTER                 :: qs_env
-      TYPE(ecd_gamma_context_type), INTENT(IN), TARGET   :: context
-      TYPE(ecd_periodic_transition_selection_type), INTENT(IN) :: transition_selection
-      COMPLEX(KIND=dp), ALLOCATABLE, DIMENSION(:), INTENT(OUT) :: transition_output
-
-      REAL(KIND=dp), PARAMETER                           :: berry_step = 1.0E-5_dp
-
-      COMPLEX(KIND=dp), ALLOCATABLE, DIMENSION(:, :)     :: berry_sin_rotated, overlap_first_rotated
-      INTEGER                                            :: iband, ispin, itransition, ivirt, nmo, ntransitions, &
-                                                            ntransitions_total
-      REAL(KIND=dp), ALLOCATABLE, DIMENSION(:, :)        :: berry_sin_buffer, overlap_first_buffer
-      REAL(KIND=dp), DIMENSION(ncart)                    :: qvec
-      TYPE(cp_fm_type)                                   :: berry_sin_mo, overlap_first_mo
-      TYPE(dbcsr_p_type), DIMENSION(:), POINTER          :: berry_cossin
-
-      NULLIFY (berry_cossin)
-      IF (.NOT. ASSOCIATED(context%matrix_s) .OR. .NOT. ASSOCIATED(context%overlap_first_imag)) THEN
-         CPABORT('ECD| Stage G13 requires the Gamma overlap and its directional Taylor coefficient')
-      END IF
-      IF (SIZE(context%overlap_first_imag) /= 1) THEN
-         CPABORT('ECD| Stage G13 overlap Taylor storage is inconsistent')
-      END IF
-      ALLOCATE (transition_output(transition_selection%selected_count))
-      transition_output = CMPLX(0.0_dp, 0.0_dp, KIND=dp)
-      CALL dbcsr_allocate_matrix_set(berry_cossin, 2)
-      DO iband = 1, 2
-         CALL dbcsr_init_p(berry_cossin(iband)%matrix)
-         CALL dbcsr_copy(berry_cossin(iband)%matrix, context%matrix_s(1)%matrix)
-      END DO
-      qvec = berry_step*context%direction
-      CALL build_berry_moment_matrix(qs_env, berry_cossin(1)%matrix, berry_cossin(2)%matrix, qvec)
-
-      ntransitions_total = 0
-      DO ispin = 1, context%nspin
-         nmo = context%spin(ispin)%nmo
-         IF (nmo < 1 .OR. .NOT. ASSOCIATED(context%spin(ispin)%mo_coeff) .OR. &
-             .NOT. ALLOCATED(context%spin(ispin)%band_rotation) .OR. &
-             .NOT. ALLOCATED(context%spin(ispin)%coefficient_first)) THEN
-            CPABORT('ECD| Stage G13 Bloch state data are incomplete')
-         END IF
-         IF (SIZE(context%spin(ispin)%band_rotation, 1) /= nmo .OR. &
-             SIZE(context%spin(ispin)%band_rotation, 2) /= nmo .OR. &
-             SIZE(context%spin(ispin)%coefficient_first, 1) /= nmo .OR. &
-             SIZE(context%spin(ispin)%coefficient_first, 2) /= nmo) THEN
-            CPABORT('ECD| Stage G13 Bloch state dimensions are inconsistent')
-         END IF
-         CALL ecd_project_real_operator_to_mo(berry_cossin(2), context%spin(ispin)%mo_coeff, &
-                                              context%spin(ispin)%nao, nmo, berry_sin_mo)
-         CALL ecd_project_real_operator_to_mo(context%overlap_first_imag(1), context%spin(ispin)%mo_coeff, &
-                                              context%spin(ispin)%nao, nmo, overlap_first_mo)
-         ALLOCATE (berry_sin_buffer(nmo, nmo), berry_sin_rotated(nmo, nmo), &
-                   overlap_first_buffer(nmo, nmo), overlap_first_rotated(nmo, nmo))
-         CALL cp_fm_get_submatrix(berry_sin_mo, berry_sin_buffer)
-         CALL cp_fm_get_submatrix(overlap_first_mo, overlap_first_buffer)
-         berry_sin_rotated = MATMUL(CONJG(TRANSPOSE(context%spin(ispin)%band_rotation)), &
-                                    MATMUL(CMPLX(berry_sin_buffer, 0.0_dp, KIND=dp), &
-                                           context%spin(ispin)%band_rotation))
-         overlap_first_rotated = MATMUL(CONJG(TRANSPOSE(context%spin(ispin)%band_rotation)), &
-                                        MATMUL(CMPLX(overlap_first_buffer, 0.0_dp, KIND=dp), &
-                                               context%spin(ispin)%band_rotation))
-
-         ntransitions = 0
-         DO itransition = 1, transition_selection%selected_count
-            IF (transition_selection%ispin(itransition) /= ispin) CYCLE
-            iband = transition_selection%iocc(itransition)
-            ivirt = transition_selection%ivirt(itransition)
-            IF (iband < 1 .OR. ivirt < 1 .OR. iband > nmo .OR. ivirt > nmo) THEN
-               CPABORT('ECD| Stage G13 transition is incompatible with the Gamma band space')
-            END IF
-            ! i d/dq <u_v(0)|exp(i q.R) exp(-i q.r)|u_o(q)> at q = 0.
-            transition_output(itransition) = berry_sin_rotated(ivirt, iband)/berry_step - &
-                                            overlap_first_rotated(ivirt, iband) + &
-                                            CMPLX(0.0_dp, 1.0_dp, KIND=dp)* &
-                                            context%spin(ispin)%coefficient_first(ivirt, iband)
-            ntransitions = ntransitions + 1
-         END DO
-         ntransitions_total = ntransitions_total + ntransitions
-         DEALLOCATE (berry_sin_buffer, berry_sin_rotated, overlap_first_buffer, overlap_first_rotated)
-         CALL cp_fm_release(berry_sin_mo)
-         CALL cp_fm_release(overlap_first_mo)
-      END DO
-      CALL dbcsr_deallocate_matrix_set(berry_cossin)
-      IF (ntransitions_total /= transition_selection%selected_count) THEN
-         CPABORT('ECD| Stage G13 transition selection is inconsistent with the Gamma spin space')
-      END IF
-
-   END SUBROUTINE ecd_periodic_implicit_gamma_bloch_transition_direction_g13
-
-! **************************************************************************************************
-!> \brief Assemble the q=0 Bloch-gauge polarization response from covariant transitions.
-! **************************************************************************************************
-   SUBROUTINE ecd_periodic_implicit_gamma_bloch_response_g13(context, transition_selection, bloch_transition, &
-                                                              energy_range, npoints, fwhm, response_zero_output)
-      TYPE(ecd_gamma_context_type), INTENT(IN), TARGET   :: context
-      TYPE(ecd_periodic_transition_selection_type), INTENT(IN) :: transition_selection
-      COMPLEX(KIND=dp), DIMENSION(:, :), INTENT(IN)      :: bloch_transition
-      REAL(KIND=dp), DIMENSION(2), INTENT(IN)            :: energy_range
-      INTEGER, INTENT(IN)                                :: npoints
-      REAL(KIND=dp), INTENT(IN)                          :: fwhm
-      COMPLEX(KIND=dp), ALLOCATABLE, DIMENSION(:, :, :), INTENT(OUT) :: response_zero_output
-
-      COMPLEX(KIND=dp), ALLOCATABLE, DIMENSION(:, :, :)  :: response_counter, response_resonant
-      COMPLEX(KIND=dp), DIMENSION(ncart, 0:1)            :: transition_taylor
-      COMPLEX(KIND=dp), DIMENSION(ncart, ncart, 0:1)     :: counter_taylor, resonant_taylor
-      INTEGER                                            :: ipoint, itransition
-      REAL(KIND=dp)                                      :: cell_volume, photon_energy, response_counter_norm, &
-                                                            response_norm, response_resonant_norm
-      REAL(KIND=dp), DIMENSION(0:1)                      :: gap_taylor
-      TYPE(cp_logger_type), POINTER                      :: logger
-
-      IF (SIZE(bloch_transition, 1) /= ncart .OR. &
-          SIZE(bloch_transition, 2) /= transition_selection%selected_count) THEN
-         CPABORT('ECD| Stage G13 Bloch-gauge transition dimensions are inconsistent')
-      END IF
-      IF (fwhm <= 0.0_dp) THEN
-         CPABORT('ECD| Stage G13 requires a positive FWHM')
-      END IF
-      cell_volume = ABS(context%cell%deth)
-      IF (cell_volume <= 0.0_dp) THEN
-         CPABORT('ECD| Stage G13 requires a positive cell volume')
-      END IF
-      ALLOCATE (response_counter(ncart, ncart, npoints), response_resonant(ncart, ncart, npoints))
-      response_counter = CMPLX(0.0_dp, 0.0_dp, KIND=dp)
-      response_resonant = CMPLX(0.0_dp, 0.0_dp, KIND=dp)
-
-      DO itransition = 1, transition_selection%selected_count
-         gap_taylor(0) = transition_selection%gap(itransition)
-         gap_taylor(1) = 0.0_dp
-         transition_taylor(:, 0) = bloch_transition(:, itransition)
-         transition_taylor(:, 1) = CMPLX(0.0_dp, 0.0_dp, KIND=dp)
-         CALL ecd_periodic_length_response_add_transition(transition_taylor, gap_taylor, &
-                                                           transition_selection%occupation_difference(itransition), &
-                                                           cell_volume, energy_range, fwhm, response_resonant, &
-                                                           response_counter, resonant_taylor, counter_taylor)
-      END DO
-
-      ipoint = (npoints + 1)/2
-      photon_energy = energy_range(1) + REAL(ipoint - 1, KIND=dp)* &
-                      (energy_range(2) - energy_range(1))/REAL(npoints - 1, KIND=dp)
-      response_resonant_norm = SQRT(SUM(ABS(response_resonant(:, :, ipoint))**2))
-      response_counter_norm = SQRT(SUM(ABS(response_counter(:, :, ipoint))**2))
-      response_norm = SQRT(SUM(ABS(response_resonant(:, :, ipoint) + response_counter(:, :, ipoint))**2))
-      logger => cp_get_default_logger()
-      IF (cp_logger_get_default_io_unit(logger) > 0) THEN
-         WRITE (cp_logger_get_default_io_unit(logger), '(T2,A,T55,I10)') &
-            'ECD| Stage G13 q=0 Bloch-gauge response grid points', npoints
-         WRITE (cp_logger_get_default_io_unit(logger), '(T2,A,T55,ES14.6)') &
-            'ECD| Stage G13 midpoint photon energy [hartree]', photon_energy
-         WRITE (cp_logger_get_default_io_unit(logger), '(T2,A,T55,ES14.6)') &
-            'ECD| Stage G13 midpoint resonant zeroth-order norm', response_resonant_norm
-         WRITE (cp_logger_get_default_io_unit(logger), '(T2,A,T55,ES14.6)') &
-            'ECD| Stage G13 midpoint counter zeroth-order norm', response_counter_norm
-         WRITE (cp_logger_get_default_io_unit(logger), '(T2,A,T55,ES14.6)') &
-            'ECD| Stage G13 midpoint full zeroth-order norm', response_norm
-      END IF
-      ALLOCATE (response_zero_output(ncart, ncart, npoints))
-      response_zero_output = response_resonant + response_counter
-      DEALLOCATE (response_counter, response_resonant)
-
-   END SUBROUTINE ecd_periodic_implicit_gamma_bloch_response_g13
-
-! **************************************************************************************************
-!> \brief Validate complete-current transitions against covariant Bloch-gauge transitions.
-! **************************************************************************************************
-   SUBROUTINE ecd_periodic_implicit_gamma_bloch_hypervirial_g14(transition_selection, velocity_transition, &
-                                                                 bloch_transition)
-      TYPE(ecd_periodic_transition_selection_type), INTENT(IN) :: transition_selection
-      COMPLEX(KIND=dp), DIMENSION(:, 0:, :, :), INTENT(IN) :: velocity_transition
-      COMPLEX(KIND=dp), DIMENSION(:, :), INTENT(IN)      :: bloch_transition
-
-      COMPLEX(KIND=dp), ALLOCATABLE, DIMENSION(:, :)     :: current_zero, current_reference, residual
-      INTEGER                                            :: idir, itransition
-      REAL(KIND=dp)                                      :: current_direction_residual, current_norm, &
-                                                            current_reference_norm, residual_norm, relative_residual
-      TYPE(cp_logger_type), POINTER                      :: logger
-
-      IF (SIZE(velocity_transition, 1) /= ncart .OR. LBOUND(velocity_transition, 2) /= 0 .OR. &
-          UBOUND(velocity_transition, 2) < 0 .OR. &
-          SIZE(velocity_transition, 3) /= transition_selection%selected_count .OR. &
-          SIZE(velocity_transition, 4) /= ncart .OR. SIZE(bloch_transition, 1) /= ncart .OR. &
-          SIZE(bloch_transition, 2) /= transition_selection%selected_count) THEN
-         CPABORT('ECD| Stage G14 Bloch hypervirial transition dimensions are inconsistent')
-      END IF
-
-      ALLOCATE (current_zero(ncart, transition_selection%selected_count), &
-                current_reference(ncart, transition_selection%selected_count), &
-                residual(ncart, transition_selection%selected_count))
-      current_zero = velocity_transition(:, 0, :, 1)
-      current_direction_residual = 0.0_dp
-      DO idir = 2, ncart
-         current_direction_residual = current_direction_residual + &
-                                      SUM(ABS(velocity_transition(:, 0, :, idir) - current_zero)**2)
-      END DO
-      current_reference = -bloch_transition
-      DO itransition = 1, transition_selection%selected_count
-         current_reference(:, itransition) = transition_selection%gap(itransition)*current_reference(:, itransition)
-      END DO
-      residual = current_zero - current_reference
-      current_norm = SQRT(SUM(ABS(current_zero)**2))
-      current_reference_norm = SQRT(SUM(ABS(current_reference)**2))
-      residual_norm = SQRT(SUM(ABS(residual)**2))
-      relative_residual = 2.0_dp*residual_norm/MAX(SQRT(TINY(1.0_dp)), current_norm + current_reference_norm)
-
-      logger => cp_get_default_logger()
-      IF (cp_logger_get_default_io_unit(logger) > 0) THEN
-         WRITE (cp_logger_get_default_io_unit(logger), '(T2,A,T55,I10)') &
-            'ECD| Stage G14 Bloch hypervirial transitions', transition_selection%selected_count
-         WRITE (cp_logger_get_default_io_unit(logger), '(T2,A,T55,ES14.6)') &
-            'ECD| Stage G14 complete-current norm', current_norm
-         WRITE (cp_logger_get_default_io_unit(logger), '(T2,A,T55,ES14.6)') &
-            'ECD| Stage G14 Bloch current-equivalent norm', current_reference_norm
-         WRITE (cp_logger_get_default_io_unit(logger), '(T2,A,T55,ES14.6)') &
-            'ECD| Stage G14 Bloch hypervirial residual', residual_norm
-         WRITE (cp_logger_get_default_io_unit(logger), '(T2,A,T55,ES14.6)') &
-            'ECD| Stage G14 Bloch hypervirial relative residual', relative_residual
-         WRITE (cp_logger_get_default_io_unit(logger), '(T2,A,T55,ES14.6)') &
-            'ECD| Stage G14 q=0 current direction residual', SQRT(current_direction_residual)
-      END IF
-      DEALLOCATE (current_zero, current_reference, residual)
-
-   END SUBROUTINE ecd_periodic_implicit_gamma_bloch_hypervirial_g14
-
-! **************************************************************************************************
 !> \brief Add one transition Taylor series to a first-order retarded response grid.
 ! **************************************************************************************************
    SUBROUTINE ecd_periodic_response_add_transition(transition_taylor, gap_taylor, occupation_difference, &
@@ -2463,58 +2216,6 @@ CONTAINS
       END DO
 
    END SUBROUTINE ecd_periodic_response_add_transition_pair
-
-! **************************************************************************************************
-!> \brief Add one q=0 direct length-polarization transition to a retarded dielectric grid.
-! **************************************************************************************************
-   SUBROUTINE ecd_periodic_length_response_add_transition(transition_taylor, gap_taylor, occupation_difference, &
-                                                           cell_volume, energy_range, fwhm, response_resonant, &
-                                                           response_counter, resonant_taylor, counter_taylor)
-      COMPLEX(KIND=dp), DIMENSION(:, 0:), INTENT(IN)     :: transition_taylor
-      COMPLEX(KIND=dp), DIMENSION(:, :, :), INTENT(INOUT) :: response_counter, response_resonant
-      COMPLEX(KIND=dp), DIMENSION(:, :, 0:), INTENT(OUT) :: counter_taylor, resonant_taylor
-      INTEGER                                            :: ipoint, ncart_local, npoints
-      REAL(KIND=dp), DIMENSION(0:), INTENT(IN)           :: gap_taylor
-      REAL(KIND=dp), INTENT(IN)                          :: cell_volume, fwhm, occupation_difference
-      REAL(KIND=dp), DIMENSION(2), INTENT(IN)            :: energy_range
-      REAL(KIND=dp)                                      :: photon_energy, prefactor
-
-      ncart_local = SIZE(transition_taylor, 1)
-      npoints = SIZE(response_resonant, 3)
-      IF (ncart_local /= ncart .OR. LBOUND(transition_taylor, 2) /= 0 .OR. &
-          UBOUND(transition_taylor, 2) /= 1 .OR. LBOUND(gap_taylor, 1) /= 0 .OR. &
-          UBOUND(gap_taylor, 1) /= 1) THEN
-         CPABORT('ECD| Direct length response requires first-order transition and gap Taylor coefficients')
-      END IF
-      IF (npoints < 2 .OR. cell_volume <= 0.0_dp .OR. fwhm <= 0.0_dp .OR. &
-          energy_range(1) <= 0.0_dp .OR. energy_range(1) >= energy_range(2)) THEN
-         CPABORT('ECD| Direct length response received an invalid response grid')
-      END IF
-      IF (SIZE(response_resonant, 1) /= ncart .OR. SIZE(response_resonant, 2) /= ncart .OR. &
-          SIZE(response_counter, 1) /= ncart .OR. SIZE(response_counter, 2) /= ncart .OR. &
-          SIZE(response_counter, 3) /= npoints) THEN
-         CPABORT('ECD| Direct length response received incompatible response tensors')
-      END IF
-      IF (SIZE(resonant_taylor, 1) /= ncart .OR. SIZE(resonant_taylor, 2) /= ncart .OR. &
-          SIZE(counter_taylor, 1) /= ncart .OR. SIZE(counter_taylor, 2) /= ncart .OR. &
-          LBOUND(resonant_taylor, 3) /= 0 .OR. UBOUND(resonant_taylor, 3) /= 1 .OR. &
-          LBOUND(counter_taylor, 3) /= 0 .OR. UBOUND(counter_taylor, 3) /= 1) THEN
-         CPABORT('ECD| Direct length response received incompatible Taylor work tensors')
-      END IF
-
-      prefactor = -2.0_dp*twopi/cell_volume
-      DO ipoint = 1, npoints
-         photon_energy = energy_range(1) + REAL(ipoint - 1, KIND=dp)* &
-                         (energy_range(2) - energy_range(1))/REAL(npoints - 1, KIND=dp)
-         CALL ecd_taylor_retarded_response(transition_taylor, gap_taylor, photon_energy, 0.5_dp*fwhm, &
-                                            resonant_taylor, counter_taylor)
-         response_resonant(:, :, ipoint) = response_resonant(:, :, ipoint) + &
-                                            prefactor*occupation_difference*resonant_taylor(:, :, 0)
-         response_counter(:, :, ipoint) = response_counter(:, :, ipoint) + &
-                                           prefactor*occupation_difference*counter_taylor(:, :, 0)
-      END DO
-
-   END SUBROUTINE ecd_periodic_length_response_add_transition
 
 ! **************************************************************************************************
 !> \brief Validate that the q=0 response is independent of the Cartesian q-derivative direction.
@@ -2698,11 +2399,11 @@ CONTAINS
 !> \brief Write complete Cartesian first-order periodic IPA response tensors.
 ! **************************************************************************************************
    SUBROUTINE ecd_periodic_print_cartesian_response(ecd_section, energy_range, velocity_zero, velocity_first, &
-                                                    bloch_zero, context, gth_available, &
+                                                    context, gth_available, &
                                                     pseudopotential_commutator, fwhm, selection)
       TYPE(section_vals_type), POINTER                   :: ecd_section
       REAL(KIND=dp), DIMENSION(2), INTENT(IN)            :: energy_range
-      COMPLEX(KIND=dp), DIMENSION(:, :, :), INTENT(IN)   :: bloch_zero, velocity_zero
+      COMPLEX(KIND=dp), DIMENSION(:, :, :), INTENT(IN)   :: velocity_zero
       COMPLEX(KIND=dp), DIMENSION(:, :, :, :), INTENT(IN) :: velocity_first
       TYPE(ecd_gamma_context_type), INTENT(IN)           :: context
       LOGICAL, INTENT(IN)                                :: gth_available
@@ -2720,8 +2421,7 @@ CONTAINS
       TYPE(section_vals_type), POINTER                   :: tensor_print_key
 
       IF (SIZE(velocity_zero, 1) /= ncart .OR. SIZE(velocity_zero, 2) /= ncart .OR. &
-          SIZE(bloch_zero, 1) /= ncart .OR. SIZE(bloch_zero, 2) /= ncart .OR. &
-          SIZE(velocity_zero, 3) < 2 .OR. SIZE(bloch_zero, 3) /= SIZE(velocity_zero, 3) .OR. &
+          SIZE(velocity_zero, 3) < 2 .OR. &
           SIZE(velocity_first, 1) /= ncart .OR. SIZE(velocity_first, 2) /= ncart .OR. &
           SIZE(velocity_first, 3) /= ncart .OR. SIZE(velocity_first, 4) /= SIZE(velocity_zero, 3)) THEN
          CPABORT('ECD| Cartesian periodic response output received incompatible tensor dimensions')
@@ -2738,9 +2438,9 @@ CONTAINS
       IF (response_unit <= 0) RETURN
 
       WRITE (response_unit, '(A)') '# CP2K periodic ECD Cartesian dielectric response'
-      WRITE (response_unit, '(A)') '# Format_version 8'
+      WRITE (response_unit, '(A)') '# Format_version 9'
       WRITE (response_unit, '(A)') '# Gamma_layout IMPLICIT'
-      WRITE (response_unit, '(A)') '# Electric_representations VELOCITY BLOCH'
+      WRITE (response_unit, '(A)') '# Electric_representation COMPLETE_CURRENT_VELOCITY'
       WRITE (response_unit, '(A,1X,L1)') '# GTH_current_available', gth_available
       WRITE (response_unit, '(A,1X,ES18.10E3)') '# FWHM_hartree', fwhm
       WRITE (response_unit, '(A,3(1X,ES18.10E3))') '# Reference_point_bohr', context%ref_point
@@ -2756,8 +2456,6 @@ CONTAINS
       ELSE
          WRITE (response_unit, '(A)') '# Velocity epsilon uses the local-current ablation plus local diamagnetic kernel.'
       END IF
-      WRITE (response_unit, '(A)') '# Bloch epsilon0 uses covariant q=0 Bloch-gauge transitions without a diamagnetic kernel.'
-      WRITE (response_unit, '(A)') '# ECD assembly uses velocity epsilon1; Bloch epsilon0 is retained as a q=0 convergence check.'
       WRITE (response_unit, '(A)') '# epsilon1_abq stores the q_x, q_y, q_z Cartesian derivative components.'
       IF (pseudopotential_commutator) THEN
          WRITE (response_unit, '(A)') '# Velocity epsilon1 includes the GTH finite-q two-field diamagnetic coefficient.'
@@ -2771,14 +2469,6 @@ CONTAINS
             WRITE (column_label, '(A,I0,A,I0,A)') 'velocity_epsilon0_', ia, '_', ib, '_re'
             WRITE (response_unit, '(1X,A)', ADVANCE='NO') TRIM(column_label)
             WRITE (column_label, '(A,I0,A,I0,A)') 'velocity_epsilon0_', ia, '_', ib, '_im'
-            WRITE (response_unit, '(1X,A)', ADVANCE='NO') TRIM(column_label)
-         END DO
-      END DO
-      DO ia = 1, ncart
-         DO ib = 1, ncart
-            WRITE (column_label, '(A,I0,A,I0,A)') 'bloch_epsilon0_', ia, '_', ib, '_re'
-            WRITE (response_unit, '(1X,A)', ADVANCE='NO') TRIM(column_label)
-            WRITE (column_label, '(A,I0,A,I0,A)') 'bloch_epsilon0_', ia, '_', ib, '_im'
             WRITE (response_unit, '(1X,A)', ADVANCE='NO') TRIM(column_label)
          END DO
       END DO
@@ -2802,14 +2492,6 @@ CONTAINS
          DO ia = 1, ncart
             DO ib = 1, ncart
                response_value = velocity_zero(ia, ib, ipoint)
-               IF (ia == ib) response_value = response_value + CMPLX(1.0_dp, 0.0_dp, KIND=dp)
-               WRITE (response_unit, '(2(1X,ES18.10E3))', ADVANCE='NO') &
-                  REAL(response_value, KIND=dp), AIMAG(response_value)
-            END DO
-         END DO
-         DO ia = 1, ncart
-            DO ib = 1, ncart
-               response_value = bloch_zero(ia, ib, ipoint)
                IF (ia == ib) response_value = response_value + CMPLX(1.0_dp, 0.0_dp, KIND=dp)
                WRITE (response_unit, '(2(1X,ES18.10E3))', ADVANCE='NO') &
                   REAL(response_value, KIND=dp), AIMAG(response_value)
@@ -3075,125 +2757,6 @@ CONTAINS
       CALL cp_print_key_finished_output(matrix_unit, logger, ecd_section, 'PRINT%MATRIX_ELEMENTS')
 
    END SUBROUTINE ecd_periodic_print_cartesian_transition_matrix_elements
-
-! **************************************************************************************************
-!> \brief Write q=0 Cartesian Bloch--velocity diagnostics for periodic IPA response tensors.
-! **************************************************************************************************
-   SUBROUTINE ecd_periodic_print_cartesian_gauge_diagnostics(ecd_section, context, gth_available, fwhm, selection, &
-                                                              energy_range, velocity_zero, bloch_zero)
-      TYPE(section_vals_type), POINTER                   :: ecd_section
-      TYPE(ecd_gamma_context_type), INTENT(IN)           :: context
-      LOGICAL, INTENT(IN)                                :: gth_available
-      REAL(KIND=dp), INTENT(IN)                          :: fwhm
-      TYPE(ecd_periodic_transition_selection_type), INTENT(IN) :: selection
-      REAL(KIND=dp), DIMENSION(2), INTENT(IN)            :: energy_range
-      COMPLEX(KIND=dp), DIMENSION(:, :, :), INTENT(IN)   :: bloch_zero, velocity_zero
-
-      CHARACTER(LEN=default_path_length)                 :: diagnostics_filename
-      INTEGER                                            :: diagnostics_unit, ipoint, midpoint
-      REAL(KIND=dp)                                      :: absolute_zero, bloch_zero_norm, energy, relative_zero, &
-                                                            velocity_zero_norm
-      REAL(KIND=dp)                                      :: maximum_zero_relative, midpoint_zero_relative
-      TYPE(cp_logger_type), POINTER                      :: logger
-      TYPE(section_vals_type), POINTER                   :: tensor_print_key
-
-      IF (SIZE(velocity_zero, 1) /= ncart .OR. SIZE(velocity_zero, 2) /= ncart .OR. &
-          SIZE(bloch_zero, 1) /= ncart .OR. SIZE(bloch_zero, 2) /= ncart .OR. &
-          SIZE(velocity_zero, 3) < 2 .OR. SIZE(bloch_zero, 3) /= SIZE(velocity_zero, 3)) THEN
-         CPABORT('ECD| Cartesian gauge diagnostics received incompatible response tensors')
-      END IF
-
-      NULLIFY (logger, tensor_print_key)
-      logger => cp_get_default_logger()
-      tensor_print_key => section_vals_get_subs_vals(ecd_section, 'PRINT%RESPONSE_TENSOR')
-      diagnostics_filename = cp_print_key_generate_filename(logger, tensor_print_key, &
-                                                            extension='.ecd_gauge', my_local=.FALSE.)
-      diagnostics_unit = cp_print_key_unit_nr(logger, ecd_section, 'PRINT%RESPONSE_TENSOR', &
-                                               extension='.ecd_gauge', file_position='REWIND', &
-                                               file_action='WRITE', file_form='FORMATTED')
-      IF (diagnostics_unit <= 0) RETURN
-
-      WRITE (diagnostics_unit, '(A)') '# CP2K periodic ECD Cartesian gauge diagnostics'
-      WRITE (diagnostics_unit, '(A)') '# Format_version 7'
-      WRITE (diagnostics_unit, '(A)') '# Gamma_layout IMPLICIT'
-      WRITE (diagnostics_unit, '(A)') '# Electric_representations VELOCITY BLOCH'
-      WRITE (diagnostics_unit, '(A)') '# Velocity tensor uses the complete current for both selector values.'
-      WRITE (diagnostics_unit, '(A)') '# This file reports only the q=0 Bloch--velocity convergence check.'
-      WRITE (diagnostics_unit, '(A,1X,L1)') '# GTH_current_available', gth_available
-      WRITE (diagnostics_unit, '(A,1X,ES18.10E3)') '# FWHM_hartree', fwhm
-      WRITE (diagnostics_unit, '(A,3(1X,ES18.10E3))') '# Reference_point_bohr', context%ref_point
-      WRITE (diagnostics_unit, '(A,2(1X,I0))') '# Transition_band_range', selection%band_range
-      WRITE (diagnostics_unit, '(A,1X,I0)') '# Requested_occupied_empty_pairs', selection%requested_count
-      WRITE (diagnostics_unit, '(A,1X,I0)') '# Candidate_occupied_empty_pairs', selection%candidate_count
-      WRITE (diagnostics_unit, '(A,1X,I0)') '# Selected_occupied_empty_pairs', selection%selected_count
-      WRITE (diagnostics_unit, '(A,1X,ES18.10E3)') '# Transition_cutoff_gap_hartree', selection%cutoff_gap
-      WRITE (diagnostics_unit, '(A,2(1X,ES18.10E3))') '# Energy_range_hartree', energy_range
-      WRITE (diagnostics_unit, '(A,1X,I0)') '# NPOINTS', SIZE(velocity_zero, 3)
-      WRITE (diagnostics_unit, '(A)') '# Relative residual: 2*norm(velocity-Bloch)/(norm(velocity)+norm(Bloch)).'
-      WRITE (diagnostics_unit, '(A)') '# Columns: Energy_hartree Energy_eV velocity0_norm bloch0_norm '// &
-                                      'absolute0_residual relative0_residual'
-
-      maximum_zero_relative = 0.0_dp
-      midpoint = (SIZE(velocity_zero, 3) + 1)/2
-      midpoint_zero_relative = 0.0_dp
-      DO ipoint = 1, SIZE(velocity_zero, 3)
-         energy = energy_range(1) + REAL(ipoint - 1, KIND=dp)* &
-                  (energy_range(2) - energy_range(1))/REAL(SIZE(velocity_zero, 3) - 1, KIND=dp)
-         velocity_zero_norm = SQRT(SUM(ABS(velocity_zero(:, :, ipoint))**2))
-         bloch_zero_norm = SQRT(SUM(ABS(bloch_zero(:, :, ipoint))**2))
-         absolute_zero = SQRT(SUM(ABS(velocity_zero(:, :, ipoint) - bloch_zero(:, :, ipoint))**2))
-         relative_zero = 2.0_dp*absolute_zero/MAX(SQRT(TINY(1.0_dp)), velocity_zero_norm + bloch_zero_norm)
-         maximum_zero_relative = MAX(maximum_zero_relative, relative_zero)
-         IF (ipoint == midpoint) THEN
-            midpoint_zero_relative = relative_zero
-         END IF
-         WRITE (diagnostics_unit, '(6(1X,ES18.10E3))') energy, energy*evolt, velocity_zero_norm, &
-            bloch_zero_norm, absolute_zero, relative_zero
-      END DO
-      CALL cp_print_key_finished_output(diagnostics_unit, logger, ecd_section, 'PRINT%RESPONSE_TENSOR')
-
-      IF (cp_logger_get_default_io_unit(logger) > 0) THEN
-         WRITE (cp_logger_get_default_io_unit(logger), '(T2,A,1X,A)') &
-            'ECD| Periodic Cartesian gauge diagnostics file', TRIM(diagnostics_filename)
-      END IF
-      CALL ecd_periodic_print_cartesian_output_summary(context, gth_available, selection, midpoint_zero_relative, &
-                                                       maximum_zero_relative)
-
-   END SUBROUTINE ecd_periodic_print_cartesian_gauge_diagnostics
-
-! **************************************************************************************************
-!> \brief Print compact q=0 Cartesian Bloch--velocity response diagnostics.
-! **************************************************************************************************
-   SUBROUTINE ecd_periodic_print_cartesian_output_summary(context, gth_available, selection, &
-                                                          midpoint_zero_relative, maximum_zero_relative)
-      TYPE(ecd_gamma_context_type), INTENT(IN)           :: context
-      LOGICAL, INTENT(IN)                                :: gth_available
-      TYPE(ecd_periodic_transition_selection_type), INTENT(IN) :: selection
-      REAL(KIND=dp), INTENT(IN)                          :: midpoint_zero_relative, maximum_zero_relative
-      TYPE(cp_logger_type), POINTER                      :: logger
-
-      NULLIFY (logger)
-      logger => cp_get_default_logger()
-      IF (cp_logger_get_default_io_unit(logger) <= 0) RETURN
-      WRITE (cp_logger_get_default_io_unit(logger), '(T2,A)') 'ECD| Periodic Cartesian output summary'
-      WRITE (cp_logger_get_default_io_unit(logger), '(T2,A,T55,L1)') &
-         'ECD| GTH current available', gth_available
-      WRITE (cp_logger_get_default_io_unit(logger), '(T2,A,T55,I10)') &
-         'ECD| Requested occupied-empty pairs', selection%requested_count
-      WRITE (cp_logger_get_default_io_unit(logger), '(T2,A,T55,I10)') &
-         'ECD| Candidate occupied-empty pairs', selection%candidate_count
-      WRITE (cp_logger_get_default_io_unit(logger), '(T2,A,T55,I10)') &
-         'ECD| Selected occupied-empty pairs', selection%selected_count
-      WRITE (cp_logger_get_default_io_unit(logger), '(T2,A,T55,ES14.6)') &
-         'ECD| Transition cutoff gap [hartree]', selection%cutoff_gap
-      WRITE (cp_logger_get_default_io_unit(logger), '(T2,A,T55,ES14.6)') &
-         'ECD| Midpoint zero-order gauge relative residual', midpoint_zero_relative
-      WRITE (cp_logger_get_default_io_unit(logger), '(T2,A,T55,ES14.6)') &
-         'ECD| Maximum zero-order gauge relative residual', maximum_zero_relative
-      WRITE (cp_logger_get_default_io_unit(logger), '(T2,A,T55,3F12.6)') &
-         'ECD| Reference point [bohr]', context%ref_point
-
-   END SUBROUTINE ecd_periodic_print_cartesian_output_summary
 
 ! **************************************************************************************************
 !> \brief Allocate a Cartesian vector of real AO matrices on an explicit-Gamma neighbour list.
