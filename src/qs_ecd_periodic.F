@@ -148,9 +148,9 @@ CONTAINS
                                                             velocity_response_zero_direction, velocity_transition_direction
       COMPLEX(KIND=dp), ALLOCATABLE, DIMENSION(:, :, :, :) :: velocity_first_cartesian, velocity_transition_cartesian
       COMPLEX(KIND=dp), ALLOCATABLE, DIMENSION(:, :)     :: direct_position_transition, &
-                                                            static_magnetic_local_current_transition_direction, &
-                                                            static_magnetic_gth_transition_direction, &
-                                                            static_magnetic_transition_direction
+                                                            pm_vertex_current_direction, pm_vertex_gth_direction, &
+                                                            pm_vertex_magnetic_transition, &
+                                                            pm_vertex_magnetic_gth_transition
       COMPLEX(KIND=dp), ALLOCATABLE, DIMENSION(:, :, :)  :: velocity_complete_first_direction, &
                                                             velocity_complete_zero, velocity_complete_zero_direction, &
                                                             velocity_cross_first_direction, velocity_cross_zero, &
@@ -161,9 +161,8 @@ CONTAINS
       COMPLEX(KIND=dp), ALLOCATABLE, DIMENSION(:, :, :, :) :: velocity_complete_first_cartesian, &
                                                             velocity_cross_first_cartesian, velocity_gth_transition_cartesian, &
                                                             velocity_local_first_cartesian, velocity_nonlocal_first_cartesian
-      COMPLEX(KIND=dp), ALLOCATABLE, DIMENSION(:, :, :)  :: static_magnetic_local_current_transition_cartesian, &
-                                                            static_magnetic_gth_transition_cartesian, &
-                                                            static_magnetic_transition_cartesian
+      COMPLEX(KIND=dp), ALLOCATABLE, DIMENSION(:, :, :)  :: pm_vertex_current_cartesian, &
+                                                            pm_vertex_gth_cartesian
       INTEGER                                            :: idir, itransition, npoints, spatial_order
       INTEGER, ALLOCATABLE, DIMENSION(:)                 :: selected_iocc, selected_ispin, selected_ivirt
       LOGICAL                                            :: do_kpoints, energy_range_explicit, gth_available
@@ -266,9 +265,8 @@ CONTAINS
                       velocity_local_first_cartesian(ncart, ncart, ncart, npoints), &
                       velocity_nonlocal_first_cartesian(ncart, ncart, ncart, npoints), &
                       velocity_transition_cartesian(ncart, 0:1, transition_selection%selected_count, ncart), &
-                      static_magnetic_transition_cartesian(ncart, transition_selection%selected_count, ncart), &
-                      static_magnetic_local_current_transition_cartesian(ncart, transition_selection%selected_count, ncart), &
-                      static_magnetic_gth_transition_cartesian(ncart, transition_selection%selected_count, ncart))
+                      pm_vertex_current_cartesian(ncart, transition_selection%selected_count, ncart), &
+                      pm_vertex_gth_cartesian(ncart, transition_selection%selected_count, ncart))
             selected_iocc = transition_selection%iocc
             selected_ispin = transition_selection%ispin
             selected_ivirt = transition_selection%ivirt
@@ -290,7 +288,7 @@ CONTAINS
                   eigenvalue_first(transition_selection%iocc(itransition)))
          END DO
          IF (idir == 1) THEN
-            CALL ecd_periodic_implicit_gamma_velocity_response_g10(gamma_context, gamma_operators, &
+            CALL ecd_periodic_implicit_gamma_velocity_response_g10(gamma_context, &
                                                                     transition_selection, pseudopotential_commutator, &
                                                                     energy_range, npoints, fwhm, &
                                                                     velocity_response_zero_direction, velocity_first_direction, &
@@ -302,12 +300,10 @@ CONTAINS
                                                                     velocity_nonlocal_first_direction, &
                                                                     velocity_transition_direction, &
                                                                     velocity_gth_transition_direction, &
-                                                                    static_magnetic_transition_direction, &
-                                                                    static_magnetic_local_current_transition_direction, &
-                                                                    static_magnetic_gth_transition_direction, &
+                                                                    pm_vertex_current_direction, pm_vertex_gth_direction, &
                                                                     gth_available)
          ELSE
-            CALL ecd_periodic_implicit_gamma_velocity_response_g10(gamma_context, gamma_operators, &
+            CALL ecd_periodic_implicit_gamma_velocity_response_g10(gamma_context, &
                                                                     transition_selection, pseudopotential_commutator, &
                                                                     energy_range, npoints, fwhm, &
                                                                     velocity_response_zero_direction, velocity_first_direction, &
@@ -319,9 +315,7 @@ CONTAINS
                                                                     velocity_nonlocal_first_direction, &
                                                                     velocity_transition_direction, &
                                                                     velocity_gth_transition_direction, &
-                                                                    static_magnetic_transition_direction, &
-                                                                    static_magnetic_local_current_transition_direction, &
-                                                                    static_magnetic_gth_transition_direction, &
+                                                                    pm_vertex_current_direction, pm_vertex_gth_direction, &
                                                                     gth_available)
          END IF
          IF (idir == 1) THEN
@@ -354,15 +348,13 @@ CONTAINS
          velocity_nonlocal_first_cartesian(:, :, idir, :) = velocity_nonlocal_first_direction
          velocity_transition_cartesian(:, :, :, idir) = velocity_transition_direction
          velocity_gth_transition_cartesian(:, :, :, idir) = velocity_gth_transition_direction
-         static_magnetic_transition_cartesian(:, :, idir) = static_magnetic_transition_direction
-         static_magnetic_local_current_transition_cartesian(:, :, idir) = static_magnetic_local_current_transition_direction
-         static_magnetic_gth_transition_cartesian(:, :, idir) = static_magnetic_gth_transition_direction
+         pm_vertex_current_cartesian(:, :, idir) = pm_vertex_current_direction
+         pm_vertex_gth_cartesian(:, :, idir) = pm_vertex_gth_direction
          DEALLOCATE (velocity_first_direction, &
                      velocity_complete_first_direction, velocity_cross_first_direction, &
                      velocity_gth_transition_direction, velocity_local_first_direction, &
                      velocity_nonlocal_first_direction, velocity_transition_direction, &
-                     static_magnetic_local_current_transition_direction, static_magnetic_gth_transition_direction, &
-                     static_magnetic_transition_direction)
+                     pm_vertex_current_direction, pm_vertex_gth_direction)
          IF (idir < ncart) THEN
             CALL ecd_periodic_transition_selection_release(transition_selection)
             CALL ecd_gamma_zero_order_operators_release(gamma_operators)
@@ -371,6 +363,8 @@ CONTAINS
       END DO
       CALL ecd_periodic_implicit_gamma_direct_position_transitions(gamma_context, gamma_operators, &
                                                                     transition_selection, direct_position_transition)
+      CALL ecd_periodic_pm_vertex_magnetic_build(pm_vertex_current_cartesian, pm_vertex_gth_cartesian, &
+                                                 pm_vertex_magnetic_transition, pm_vertex_magnetic_gth_transition)
       CALL ecd_periodic_print_cartesian_response(ecd_section, energy_range, velocity_response_zero, &
                                                  velocity_first_cartesian, gamma_context, gth_available, &
                                                  pseudopotential_commutator, fwhm, &
@@ -381,9 +375,8 @@ CONTAINS
                                                                     velocity_transition_cartesian, &
                                                                     velocity_gth_transition_cartesian, &
                                                                     direct_position_transition, &
-                                                                    static_magnetic_transition_cartesian, &
-                                                                    static_magnetic_local_current_transition_cartesian, &
-                                                                    static_magnetic_gth_transition_cartesian)
+                                                                    pm_vertex_magnetic_transition, &
+                                                                    pm_vertex_magnetic_gth_transition)
       CALL ecd_periodic_print_cartesian_velocity_decomposition(ecd_section, energy_range, velocity_local_zero, &
                                                                 velocity_local_first_cartesian, velocity_cross_zero, &
                                                                 velocity_cross_first_cartesian, velocity_nonlocal_zero, &
@@ -397,8 +390,8 @@ CONTAINS
                   velocity_gth_transition_cartesian, &
                   velocity_local_first_cartesian, velocity_local_zero, &
                   velocity_nonlocal_first_cartesian, velocity_nonlocal_zero, &
-                  static_magnetic_local_current_transition_cartesian, static_magnetic_gth_transition_cartesian, &
-                  static_magnetic_transition_cartesian)
+                  pm_vertex_current_cartesian, pm_vertex_gth_cartesian, &
+                  pm_vertex_magnetic_transition, pm_vertex_magnetic_gth_transition)
       CALL ecd_periodic_transition_selection_release(transition_selection)
       CALL ecd_gamma_zero_order_operators_release(gamma_operators)
       CALL ecd_gamma_context_release(gamma_context)
@@ -1724,7 +1717,7 @@ CONTAINS
 ! **************************************************************************************************
 !> \brief Assemble the first-order velocity-gauge causal response from retained Gamma providers.
 ! **************************************************************************************************
-   SUBROUTINE ecd_periodic_implicit_gamma_velocity_response_g10(context, operators, transition_selection, &
+   SUBROUTINE ecd_periodic_implicit_gamma_velocity_response_g10(context, transition_selection, &
                                                                  pseudopotential_commutator, energy_range, npoints, fwhm, &
                                                                  response_zero_output, response_first_output, &
                                                                  complete_zero_output, complete_first_output, &
@@ -1733,12 +1726,9 @@ CONTAINS
                                                                  nonlocal_zero_output, nonlocal_first_output, &
                                                                  transition_output, &
                                                                  gth_transition_output, &
-                                                                 static_magnetic_transition_output, &
-                                                                 static_magnetic_local_current_transition_output, &
-                                                                 static_magnetic_gth_transition_output, &
+                                                                 pm_vertex_current_output, pm_vertex_gth_output, &
                                                                  gth_available_output)
       TYPE(ecd_gamma_context_type), INTENT(IN), TARGET   :: context
-      TYPE(ecd_gamma_zero_order_operators_type), INTENT(IN), TARGET :: operators
       TYPE(ecd_periodic_transition_selection_type), INTENT(IN) :: transition_selection
       LOGICAL, INTENT(IN)                                :: pseudopotential_commutator
       REAL(KIND=dp), DIMENSION(2), INTENT(IN)            :: energy_range
@@ -1751,26 +1741,22 @@ CONTAINS
                                                                           nonlocal_first_output, nonlocal_zero_output
       COMPLEX(KIND=dp), ALLOCATABLE, DIMENSION(:, :, :), INTENT(OUT) :: transition_output
       COMPLEX(KIND=dp), ALLOCATABLE, DIMENSION(:, :, :), INTENT(OUT) :: gth_transition_output
-      COMPLEX(KIND=dp), ALLOCATABLE, DIMENSION(:, :), INTENT(OUT) :: static_magnetic_transition_output
-      COMPLEX(KIND=dp), ALLOCATABLE, DIMENSION(:, :), INTENT(OUT) :: static_magnetic_local_current_transition_output
-      COMPLEX(KIND=dp), ALLOCATABLE, DIMENSION(:, :), INTENT(OUT) :: static_magnetic_gth_transition_output
+      COMPLEX(KIND=dp), ALLOCATABLE, DIMENSION(:, :), INTENT(OUT) :: pm_vertex_current_output, pm_vertex_gth_output
       LOGICAL, INTENT(OUT)                               :: gth_available_output
 
       COMPLEX(KIND=dp), ALLOCATABLE, DIMENSION(:, :)     :: current_first_mo, current_first_rotated, &
                                                             current_zero_mo, current_zero_rotated, &
                                                             gth_first_mo, gth_first_rotated, gth_zero_mo, &
                                                             gth_zero_rotated, state_first, &
-                                                            static_magnetic_local_current_rotated, &
-                                                            static_magnetic_gth_rotated, static_magnetic_rotated, transition_first
+                                                            transition_first
       COMPLEX(KIND=dp), ALLOCATABLE, DIMENSION(:, :, :)  :: current_first_components, current_zero_components, &
                                                             cross_counter, cross_first_counter, cross_first_resonant, &
                                                             cross_resonant, local_counter, local_first_counter, &
                                                             local_first_resonant, local_resonant, nonlocal_counter, &
                                                             nonlocal_first_counter, nonlocal_first_resonant, &
-                                                            nonlocal_resonant, gth_first_components, &
-                                                            gth_zero_components, static_magnetic_components, &
-                                                            static_magnetic_local_current_components, &
-                                                            static_magnetic_gth_components
+                                                            nonlocal_resonant, current_vertex_first_components, &
+                                                            gth_first_components, gth_vertex_first_components, &
+                                                            gth_zero_components
       COMPLEX(KIND=dp), ALLOCATABLE, DIMENSION(:, :)     :: gth_transition_taylor, local_transition_taylor, &
                                                             transition_taylor
       COMPLEX(KIND=dp), DIMENSION(ncart, ncart, 0:1)     :: counter_taylor, resonant_taylor
@@ -1787,16 +1773,7 @@ CONTAINS
       REAL(KIND=dp), DIMENSION(ncart, ncart)             :: diamagnetic_kernel
       COMPLEX(KIND=dp), DIMENSION(ncart, ncart)          :: gth_diamagnetic_first
       TYPE(cp_logger_type), POINTER                      :: logger
-      TYPE(cp_fm_type)                                   :: static_magnetic_gth_mo, static_magnetic_local_current_mo, &
-                                                            static_magnetic_mo
-      REAL(KIND=dp), ALLOCATABLE, DIMENSION(:, :)        :: static_magnetic_gth_buffer, &
-                                                            static_magnetic_local_current_buffer, static_magnetic_buffer
-      TYPE(dbcsr_p_type), DIMENSION(:), POINTER          :: static_magnetic_diagnostic, &
-                                                            static_magnetic_gth_diagnostic, &
-                                                            static_magnetic_local_current_diagnostic
-
-      NULLIFY (logger, static_magnetic_diagnostic, static_magnetic_gth_diagnostic, &
-               static_magnetic_local_current_diagnostic)
+      NULLIFY (logger)
       IF (.NOT. ASSOCIATED(context%current_taylor_real) .OR. .NOT. ASSOCIATED(context%current_taylor_imag) .OR. &
           .NOT. ASSOCIATED(context%gth_current_taylor_real) .OR. &
           .NOT. ASSOCIATED(context%gth_current_taylor_imag)) THEN
@@ -1816,10 +1793,6 @@ CONTAINS
       IF (cell_volume <= 0.0_dp) THEN
          CPABORT("ECD| Stage G10 requires a positive cell volume")
       END IF
-      CALL ecd_gamma_zero_order_operators_get(operators, static_magnetic_diagnostic=static_magnetic_diagnostic, &
-                                               static_magnetic_local_current_diagnostic= &
-                                               static_magnetic_local_current_diagnostic, &
-                                               static_magnetic_gth_diagnostic=static_magnetic_gth_diagnostic)
       gth_available = ASSOCIATED(context%sap_ppnl)
       gth_available_output = gth_available
 
@@ -1845,12 +1818,10 @@ CONTAINS
       transition_output = CMPLX(0.0_dp, 0.0_dp, KIND=dp)
       ALLOCATE (gth_transition_output(ncart, 0:1, transition_selection%selected_count))
       gth_transition_output = CMPLX(0.0_dp, 0.0_dp, KIND=dp)
-      ALLOCATE (static_magnetic_transition_output(ncart, transition_selection%selected_count))
-      static_magnetic_transition_output = CMPLX(0.0_dp, 0.0_dp, KIND=dp)
-      ALLOCATE (static_magnetic_local_current_transition_output(ncart, transition_selection%selected_count))
-      static_magnetic_local_current_transition_output = CMPLX(0.0_dp, 0.0_dp, KIND=dp)
-      ALLOCATE (static_magnetic_gth_transition_output(ncart, transition_selection%selected_count))
-      static_magnetic_gth_transition_output = CMPLX(0.0_dp, 0.0_dp, KIND=dp)
+      ALLOCATE (pm_vertex_current_output(ncart, transition_selection%selected_count), &
+                pm_vertex_gth_output(ncart, transition_selection%selected_count))
+      pm_vertex_current_output = CMPLX(0.0_dp, 0.0_dp, KIND=dp)
+      pm_vertex_gth_output = CMPLX(0.0_dp, 0.0_dp, KIND=dp)
       logger => cp_get_default_logger()
       ntransitions_total = 0
       DO ispin = 1, context%nspin
@@ -1871,11 +1842,9 @@ CONTAINS
              SIZE(context%spin(ispin)%coefficient_first, 2) /= nmo) THEN
             CPABORT("ECD| Stage G10 retained state-response dimensions are inconsistent")
          END IF
-         ALLOCATE (current_first_components(nmo, nmo, ncart), current_zero_components(nmo, nmo, ncart), &
-                   gth_first_components(nmo, nmo, ncart), gth_zero_components(nmo, nmo, ncart), &
-                   static_magnetic_components(nmo, nmo, ncart), &
-                   static_magnetic_local_current_components(nmo, nmo, ncart), &
-                   static_magnetic_gth_components(nmo, nmo, ncart))
+         ALLOCATE (current_first_components(nmo, nmo, ncart), current_vertex_first_components(nmo, nmo, ncart), &
+                   current_zero_components(nmo, nmo, ncart), gth_first_components(nmo, nmo, ncart), &
+                   gth_vertex_first_components(nmo, nmo, ncart), gth_zero_components(nmo, nmo, ncart))
          DO idir = 1, ncart
             CALL ecd_project_complex_operator_to_mo(context%current_taylor_real(idir, 1), &
                                                     context%current_taylor_imag(idir, 1), &
@@ -1910,43 +1879,13 @@ CONTAINS
             transition_first = current_first_rotated + state_first
             current_zero_components(:, :, idir) = current_zero_rotated
             current_first_components(:, :, idir) = transition_first
+            current_vertex_first_components(:, :, idir) = current_first_rotated
             state_first = 0.5_dp*(MATMUL(CONJG(TRANSPOSE(context%spin(ispin)%coefficient_first)), &
                                          gth_zero_rotated) - &
                                    MATMUL(gth_zero_rotated, context%spin(ispin)%coefficient_first))
             gth_first_components(:, :, idir) = gth_first_rotated + state_first
+            gth_vertex_first_components(:, :, idir) = gth_first_rotated
             gth_zero_components(:, :, idir) = gth_zero_rotated
-            CALL ecd_project_real_operator_to_mo(static_magnetic_diagnostic(idir), context%spin(ispin)%mo_coeff, &
-                                                 context%spin(ispin)%nao, nmo, static_magnetic_mo)
-            ALLOCATE (static_magnetic_buffer(nmo, nmo), static_magnetic_rotated(nmo, nmo))
-            CALL cp_fm_get_submatrix(static_magnetic_mo, static_magnetic_buffer)
-            static_magnetic_rotated = MATMUL(CONJG(TRANSPOSE(context%spin(ispin)%band_rotation)), &
-                                               MATMUL(CMPLX(static_magnetic_buffer, 0.0_dp, KIND=dp), &
-                                                      context%spin(ispin)%band_rotation))
-            static_magnetic_components(:, :, idir) = static_magnetic_rotated
-            DEALLOCATE (static_magnetic_buffer, static_magnetic_rotated)
-            CALL cp_fm_release(static_magnetic_mo)
-            CALL ecd_project_real_operator_to_mo(static_magnetic_local_current_diagnostic(idir), &
-                                                 context%spin(ispin)%mo_coeff, context%spin(ispin)%nao, nmo, &
-                                                 static_magnetic_local_current_mo)
-            ALLOCATE (static_magnetic_local_current_buffer(nmo, nmo), &
-                      static_magnetic_local_current_rotated(nmo, nmo))
-            CALL cp_fm_get_submatrix(static_magnetic_local_current_mo, static_magnetic_local_current_buffer)
-            static_magnetic_local_current_rotated = MATMUL(CONJG(TRANSPOSE(context%spin(ispin)%band_rotation)), &
-                                                             MATMUL(CMPLX(static_magnetic_local_current_buffer, 0.0_dp, KIND=dp), &
-                                                                    context%spin(ispin)%band_rotation))
-            static_magnetic_local_current_components(:, :, idir) = static_magnetic_local_current_rotated
-            DEALLOCATE (static_magnetic_local_current_buffer, static_magnetic_local_current_rotated)
-            CALL cp_fm_release(static_magnetic_local_current_mo)
-            CALL ecd_project_real_operator_to_mo(static_magnetic_gth_diagnostic(idir), context%spin(ispin)%mo_coeff, &
-                                                 context%spin(ispin)%nao, nmo, static_magnetic_gth_mo)
-            ALLOCATE (static_magnetic_gth_buffer(nmo, nmo), static_magnetic_gth_rotated(nmo, nmo))
-            CALL cp_fm_get_submatrix(static_magnetic_gth_mo, static_magnetic_gth_buffer)
-            static_magnetic_gth_rotated = MATMUL(CONJG(TRANSPOSE(context%spin(ispin)%band_rotation)), &
-                                                   MATMUL(CMPLX(static_magnetic_gth_buffer, 0.0_dp, KIND=dp), &
-                                                          context%spin(ispin)%band_rotation))
-            static_magnetic_gth_components(:, :, idir) = static_magnetic_gth_rotated
-            DEALLOCATE (static_magnetic_gth_buffer, static_magnetic_gth_rotated)
-            CALL cp_fm_release(static_magnetic_gth_mo)
             DEALLOCATE (current_first_mo, current_first_rotated, current_zero_mo, current_zero_rotated, &
                         gth_first_mo, gth_first_rotated, gth_zero_mo, gth_zero_rotated, state_first, &
                         transition_first)
@@ -1973,12 +1912,8 @@ CONTAINS
             local_transition_taylor = transition_taylor - gth_transition_taylor
             transition_output(:, :, itransition) = transition_taylor
             gth_transition_output(:, :, itransition) = gth_transition_taylor
-            static_magnetic_transition_output(:, itransition) = &
-               0.5_dp*static_magnetic_components(ivirt, iband, :)
-            static_magnetic_local_current_transition_output(:, itransition) = &
-               static_magnetic_local_current_components(ivirt, iband, :)
-            static_magnetic_gth_transition_output(:, itransition) = &
-               0.5_dp*static_magnetic_gth_components(ivirt, iband, :)
+            pm_vertex_current_output(:, itransition) = current_vertex_first_components(ivirt, iband, :)
+            pm_vertex_gth_output(:, itransition) = gth_vertex_first_components(ivirt, iband, :)
             ntransitions = ntransitions + 1
             CALL ecd_periodic_response_add_transition_pair(local_transition_taylor, local_transition_taylor, &
                                                             gap_taylor, occupation_difference, cell_volume, &
@@ -2002,10 +1937,9 @@ CONTAINS
                                                             resonant_taylor, counter_taylor)
          END DO
          ntransitions_total = ntransitions_total + ntransitions
-         DEALLOCATE (current_first_components, current_zero_components, gth_first_components, &
-                     gth_zero_components, static_magnetic_components, &
-                     static_magnetic_local_current_components, static_magnetic_gth_components, &
-                     gap_taylor, gth_transition_taylor, local_transition_taylor, transition_taylor)
+         DEALLOCATE (current_first_components, current_vertex_first_components, current_zero_components, &
+                     gth_first_components, gth_vertex_first_components, gth_zero_components, gap_taylor, &
+                     gth_transition_taylor, local_transition_taylor, transition_taylor)
       END DO
       IF (ntransitions_total /= transition_selection%selected_count) THEN
          CPABORT('ECD| Stage G10 transition selection is inconsistent with the Gamma spin space')
@@ -2103,6 +2037,41 @@ CONTAINS
                   nonlocal_first_counter, nonlocal_first_resonant, nonlocal_resonant)
 
    END SUBROUTINE ecd_periodic_implicit_gamma_velocity_response_g10
+
+! **************************************************************************************************
+!> \brief Form a vertex-only PM magnetic diagnostic from Cartesian raw-current first coefficients.
+! **************************************************************************************************
+   SUBROUTINE ecd_periodic_pm_vertex_magnetic_build(current_vertex_first, gth_vertex_first, &
+                                                    pm_vertex_magnetic, pm_vertex_magnetic_gth)
+      COMPLEX(KIND=dp), DIMENSION(:, :, :), INTENT(IN)   :: current_vertex_first, gth_vertex_first
+      COMPLEX(KIND=dp), ALLOCATABLE, DIMENSION(:, :), INTENT(OUT) :: pm_vertex_magnetic, pm_vertex_magnetic_gth
+
+      INTEGER                                            :: ntransitions
+      COMPLEX(KIND=dp), PARAMETER                        :: imaginary_unit = CMPLX(0.0_dp, 1.0_dp, KIND=dp)
+
+      IF (SIZE(current_vertex_first, 1) /= ncart .OR. SIZE(gth_vertex_first, 1) /= ncart .OR. &
+          SIZE(current_vertex_first, 3) /= ncart .OR. SIZE(gth_vertex_first, 3) /= ncart .OR. &
+          SIZE(current_vertex_first, 2) /= SIZE(gth_vertex_first, 2)) THEN
+         CPABORT('ECD| PM vertex magnetic diagnostic received incompatible current Taylor coefficients')
+      END IF
+      ntransitions = SIZE(current_vertex_first, 2)
+      ALLOCATE (pm_vertex_magnetic(ncart, ntransitions), pm_vertex_magnetic_gth(ncart, ntransitions))
+
+      ! C_a=i J_a, so mbar_c=(i/2) epsilon_cab dC_a/dq_b for the PM vertex alone.
+      pm_vertex_magnetic(1, :) = 0.5_dp*imaginary_unit*(current_vertex_first(2, :, 3) - &
+                                                          current_vertex_first(3, :, 2))
+      pm_vertex_magnetic(2, :) = 0.5_dp*imaginary_unit*(current_vertex_first(3, :, 1) - &
+                                                          current_vertex_first(1, :, 3))
+      pm_vertex_magnetic(3, :) = 0.5_dp*imaginary_unit*(current_vertex_first(1, :, 2) - &
+                                                          current_vertex_first(2, :, 1))
+      pm_vertex_magnetic_gth(1, :) = 0.5_dp*imaginary_unit*(gth_vertex_first(2, :, 3) - &
+                                                              gth_vertex_first(3, :, 2))
+      pm_vertex_magnetic_gth(2, :) = 0.5_dp*imaginary_unit*(gth_vertex_first(3, :, 1) - &
+                                                              gth_vertex_first(1, :, 3))
+      pm_vertex_magnetic_gth(3, :) = 0.5_dp*imaginary_unit*(gth_vertex_first(1, :, 2) - &
+                                                              gth_vertex_first(2, :, 1))
+
+   END SUBROUTINE ecd_periodic_pm_vertex_magnetic_build
 
 ! **************************************************************************************************
 !> \brief Diagnose the q=0 complete-current f-sum closure against the diamagnetic kernel.
@@ -2674,9 +2643,8 @@ CONTAINS
    SUBROUTINE ecd_periodic_print_cartesian_transition_matrix_elements(ecd_section, context, transition_selection, &
                                                                        gth_requested, gap_first, velocity_transition, &
                                                                        gth_transition, length_transition, &
-                                                                       static_magnetic_transition, &
-                                                                       static_magnetic_local_current_transition, &
-                                                                       static_magnetic_gth_transition)
+                                                                       pm_vertex_magnetic_transition, &
+                                                                       pm_vertex_magnetic_gth_transition)
       TYPE(section_vals_type), POINTER                   :: ecd_section
       TYPE(ecd_gamma_context_type), INTENT(IN)           :: context
       TYPE(ecd_periodic_transition_selection_type), INTENT(IN) :: transition_selection
@@ -2684,30 +2652,27 @@ CONTAINS
       REAL(KIND=dp), DIMENSION(:, :), INTENT(IN)          :: gap_first
       COMPLEX(KIND=dp), DIMENSION(:, 0:, :, :), INTENT(IN) :: gth_transition, velocity_transition
       COMPLEX(KIND=dp), DIMENSION(:, :), INTENT(IN)      :: length_transition
-      COMPLEX(KIND=dp), DIMENSION(:, :, :), INTENT(IN)   :: static_magnetic_gth_transition, &
-                                                            static_magnetic_local_current_transition, &
-                                                            static_magnetic_transition
+      COMPLEX(KIND=dp), DIMENSION(:, :), INTENT(IN)      :: pm_vertex_magnetic_transition, &
+                                                            pm_vertex_magnetic_gth_transition
 
       CHARACTER(LEN=default_path_length)                 :: matrix_filename
-      COMPLEX(KIND=dp)                                   :: static_magnetic_gth_value, static_magnetic_local_current_value, &
-                                                            static_magnetic_local_value, static_magnetic_value
+      COMPLEX(KIND=dp)                                   :: pm_vertex_magnetic_gth_value, pm_vertex_magnetic_local_value, &
+                                                            pm_vertex_magnetic_value
       INTEGER                                            :: idir, iocc, ispin, iq, itransition, ivirt, matrix_unit
       TYPE(cp_logger_type), POINTER                      :: logger
       TYPE(section_vals_type), POINTER                   :: matrix_print_key
 
       IF (SIZE(velocity_transition, 1) /= ncart .OR. SIZE(gth_transition, 1) /= ncart .OR. &
-          SIZE(length_transition, 1) /= ncart .OR. SIZE(static_magnetic_transition, 1) /= ncart .OR. &
+          SIZE(length_transition, 1) /= ncart .OR. SIZE(pm_vertex_magnetic_transition, 1) /= ncart .OR. &
           LBOUND(velocity_transition, 2) /= 0 .OR. &
           LBOUND(gth_transition, 2) /= 0 .OR. &
           UBOUND(velocity_transition, 2) < 1 .OR. UBOUND(gth_transition, 2) < 1 .OR. &
           SIZE(velocity_transition, 3) /= transition_selection%selected_count .OR. &
           SIZE(gth_transition, 3) /= transition_selection%selected_count .OR. &
           SIZE(length_transition, 2) /= transition_selection%selected_count .OR. &
-          SIZE(static_magnetic_transition, 2) /= transition_selection%selected_count .OR. &
-          ANY(SHAPE(static_magnetic_local_current_transition) /= SHAPE(static_magnetic_transition)) .OR. &
-          ANY(SHAPE(static_magnetic_gth_transition) /= SHAPE(static_magnetic_transition)) .OR. &
+          SIZE(pm_vertex_magnetic_transition, 2) /= transition_selection%selected_count .OR. &
+          ANY(SHAPE(pm_vertex_magnetic_gth_transition) /= SHAPE(pm_vertex_magnetic_transition)) .OR. &
           SIZE(velocity_transition, 4) /= ncart .OR. SIZE(gth_transition, 4) /= ncart .OR. &
-          SIZE(static_magnetic_transition, 3) /= ncart .OR. &
           SIZE(gap_first, 1) /= transition_selection%selected_count .OR. SIZE(gap_first, 2) /= ncart) THEN
          CPABORT('ECD| Periodic transition-matrix output received inconsistent transition coefficients')
       END IF
@@ -2726,7 +2691,7 @@ CONTAINS
       IF (matrix_unit <= 0) RETURN
 
       WRITE (matrix_unit, '(A)') '# CP2K periodic ECD IPA transition matrix elements'
-      WRITE (matrix_unit, '(A)') '# Format_version 9'
+      WRITE (matrix_unit, '(A)') '# Format_version 10'
       WRITE (matrix_unit, '(A)') '# Gamma_layout IMPLICIT'
       WRITE (matrix_unit, '(A,1X,L1)') '# Pseudopotential_commutator_selects_complete', gth_requested
       WRITE (matrix_unit, '(A)') '# GTH current columns are retained for both selector values.'
@@ -2744,22 +2709,19 @@ CONTAINS
                                   'gth_current1_re gth_current1_im direct_position0_re direct_position0_im'
       WRITE (matrix_unit, '(A)') '# Current coefficients define the periodic finite-q observable and its first derivative.'
       WRITE (matrix_unit, '(A)') '# Direct position0 is retained for isolated-molecule-limit diagnostics only.'
-      WRITE (matrix_unit, '(A)') '# Static magnetic diagnostic is not used for finite-q ECD assembly.'
-      WRITE (matrix_unit, '(A)') '# It supports molecular-limit rotatory-strength validation only.'
+      WRITE (matrix_unit, '(A)') '# PM magnetic diagnostic is vertex-only and does not enter finite-q ECD assembly.'
+      WRITE (matrix_unit, '(A)') '# It is mbar_PM,c=(i/2) epsilon_cab dC_a/dq_b from the raw PM current.'
       WRITE (matrix_unit, '(A)') '# Columns: Transition_index Q_derivative_component Spin Occupied_band '// &
                                   'Virtual_band Occupation_difference '// &
                                   'Gap0_hartree Gap1_hartree followed by X, Y, and Z component groups and '// &
-                                  'static_magnetic_x_re static_magnetic_x_im static_magnetic_y_re '// &
-                                  'static_magnetic_y_im static_magnetic_z_re static_magnetic_z_im followed by '// &
-                                  'static_magnetic_local_x_re static_magnetic_local_x_im '// &
-                                  'static_magnetic_local_y_re static_magnetic_local_y_im '// &
-                                  'static_magnetic_local_z_re static_magnetic_local_z_im '// &
-                                  'static_magnetic_gth_x_re static_magnetic_gth_x_im '// &
-                                  'static_magnetic_gth_y_re static_magnetic_gth_y_im '// &
-                                  'static_magnetic_gth_z_re static_magnetic_gth_z_im followed by '// &
-                                  'static_magnetic_local_current_x_re static_magnetic_local_current_x_im '// &
-                                  'static_magnetic_local_current_y_re static_magnetic_local_current_y_im '// &
-                                  'static_magnetic_local_current_z_re static_magnetic_local_current_z_im.'
+                                  'pm_vertex_magnetic_x_re pm_vertex_magnetic_x_im pm_vertex_magnetic_y_re '// &
+                                  'pm_vertex_magnetic_y_im pm_vertex_magnetic_z_re pm_vertex_magnetic_z_im followed by '// &
+                                  'pm_vertex_magnetic_local_x_re pm_vertex_magnetic_local_x_im '// &
+                                  'pm_vertex_magnetic_local_y_re pm_vertex_magnetic_local_y_im '// &
+                                  'pm_vertex_magnetic_local_z_re pm_vertex_magnetic_local_z_im followed by '// &
+                                  'pm_vertex_magnetic_gth_x_re pm_vertex_magnetic_gth_x_im '// &
+                                  'pm_vertex_magnetic_gth_y_re pm_vertex_magnetic_gth_y_im '// &
+                                  'pm_vertex_magnetic_gth_z_re pm_vertex_magnetic_gth_z_im.'
 
       DO itransition = 1, transition_selection%selected_count
          ispin = transition_selection%ispin(itransition)
@@ -2799,15 +2761,13 @@ CONTAINS
                   AIMAG(length_transition(idir, itransition))
             END DO
             DO idir = 1, ncart
-               static_magnetic_value = static_magnetic_transition(idir, itransition, iq)
-               static_magnetic_gth_value = static_magnetic_gth_transition(idir, itransition, iq)
-               static_magnetic_local_value = static_magnetic_value - static_magnetic_gth_value
-               static_magnetic_local_current_value = static_magnetic_local_current_transition(idir, itransition, iq)
-               WRITE (matrix_unit, '(8(ES18.10E3,1X))', ADVANCE='NO') &
-                  REAL(static_magnetic_value, KIND=dp), AIMAG(static_magnetic_value), &
-                  REAL(static_magnetic_local_value, KIND=dp), AIMAG(static_magnetic_local_value), &
-                  REAL(static_magnetic_gth_value, KIND=dp), AIMAG(static_magnetic_gth_value), &
-                  REAL(static_magnetic_local_current_value, KIND=dp), AIMAG(static_magnetic_local_current_value)
+               pm_vertex_magnetic_value = pm_vertex_magnetic_transition(idir, itransition)
+               pm_vertex_magnetic_gth_value = pm_vertex_magnetic_gth_transition(idir, itransition)
+               pm_vertex_magnetic_local_value = pm_vertex_magnetic_value - pm_vertex_magnetic_gth_value
+               WRITE (matrix_unit, '(6(ES18.10E3,1X))', ADVANCE='NO') &
+                  REAL(pm_vertex_magnetic_value, KIND=dp), AIMAG(pm_vertex_magnetic_value), &
+                  REAL(pm_vertex_magnetic_local_value, KIND=dp), AIMAG(pm_vertex_magnetic_local_value), &
+                  REAL(pm_vertex_magnetic_gth_value, KIND=dp), AIMAG(pm_vertex_magnetic_gth_value)
             END DO
             WRITE (matrix_unit, '()')
          END DO

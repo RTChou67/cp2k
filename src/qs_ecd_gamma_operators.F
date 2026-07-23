@@ -9,14 +9,11 @@
 !> \brief Folded implicit-Gamma zero-order operators for periodic ECD.
 ! **************************************************************************************************
 MODULE qs_ecd_gamma_operators
-   USE commutator_rpnl,                 ONLY: build_com_mom_nl
-   USE cp_dbcsr_api,                    ONLY: dbcsr_add,&
-                                              dbcsr_create,&
+   USE cp_dbcsr_api,                    ONLY: dbcsr_create,&
                                               dbcsr_init_p,&
                                               dbcsr_p_type,&
                                               dbcsr_set,&
                                               dbcsr_type,&
-                                              dbcsr_type_antisymmetric,&
                                               dbcsr_type_no_symmetry,&
                                               dbcsr_type_symmetric
    USE cp_dbcsr_cp2k_link,              ONLY: cp_dbcsr_alloc_block_from_nbl
@@ -25,8 +22,7 @@ MODULE qs_ecd_gamma_operators
    USE kinds,                           ONLY: dp
    USE qs_ecd_gamma_data,               ONLY: ecd_gamma_context_type
    USE qs_environment_types,            ONLY: qs_environment_type
-   USE qs_moments,                      ONLY: build_local_magmom_matrix,&
-                                              build_local_moment_matrix
+   USE qs_moments,                      ONLY: build_local_moment_matrix
    USE qs_neighbor_list_types,          ONLY: neighbor_list_set_p_type
    USE qs_operators_ao,                 ONLY: build_lin_mom_matrix
 #include "./base/base_uses.f90"
@@ -39,10 +35,7 @@ MODULE qs_ecd_gamma_operators
    INTEGER, PARAMETER, PRIVATE          :: ncart = 3
 
    TYPE, PUBLIC :: ecd_gamma_zero_order_operators_type
-      TYPE(dbcsr_p_type), DIMENSION(:), POINTER :: position => NULL(), local_current => NULL(), &
-                                                    static_magnetic_diagnostic => NULL(), &
-                                                    static_magnetic_local_current_diagnostic => NULL(), &
-                                                    static_magnetic_gth_diagnostic => NULL()
+      TYPE(dbcsr_p_type), DIMENSION(:), POINTER :: position => NULL(), local_current => NULL()
    END TYPE ecd_gamma_zero_order_operators_type
 
    PUBLIC :: ecd_gamma_zero_order_operators_build, &
@@ -52,21 +45,14 @@ MODULE qs_ecd_gamma_operators
 CONTAINS
 
 ! **************************************************************************************************
-!> \brief Build folded local and diagnostic matrices at implicit Gamma.
+!> \brief Build folded zero-order local matrices at implicit Gamma.
 ! **************************************************************************************************
    SUBROUTINE ecd_gamma_zero_order_operators_build(operators, qs_env, context)
       TYPE(ecd_gamma_zero_order_operators_type), INTENT(INOUT) :: operators
       TYPE(qs_environment_type), POINTER                 :: qs_env
       TYPE(ecd_gamma_context_type), INTENT(IN)           :: context
 
-      INTEGER                                            :: idir
-      REAL(KIND=dp), DIMENSION(ncart)                    :: static_magnetic_anchor
-      TYPE(dbcsr_p_type), DIMENSION(:), POINTER          :: gth_current_symmetric
-
-      IF (ASSOCIATED(operators%position) .OR. ASSOCIATED(operators%local_current) .OR. &
-          ASSOCIATED(operators%static_magnetic_diagnostic) .OR. &
-          ASSOCIATED(operators%static_magnetic_local_current_diagnostic) .OR. &
-          ASSOCIATED(operators%static_magnetic_gth_diagnostic)) THEN
+      IF (ASSOCIATED(operators%position) .OR. ASSOCIATED(operators%local_current)) THEN
          CPABORT("ECD| Implicit-Gamma zero-order operators are already allocated")
       END IF
       IF (.NOT. ASSOCIATED(context%matrix_s) .OR. .NOT. ASSOCIATED(context%sab_orb) .OR. &
@@ -74,77 +60,27 @@ CONTAINS
          CPABORT("ECD| Implicit-Gamma zero-order operator context is incomplete")
       END IF
 
-      NULLIFY (gth_current_symmetric)
       CALL ecd_gamma_ao_vector_create(operators%position, context%matrix_s(1)%matrix, context%sab_orb, &
                                       'ECD implicit Gamma position', dbcsr_type_symmetric)
       CALL ecd_gamma_ao_vector_create(operators%local_current, context%matrix_s(1)%matrix, context%sab_all, &
                                       'ECD implicit Gamma local current')
-      CALL ecd_gamma_ao_vector_create(operators%static_magnetic_diagnostic, context%matrix_s(1)%matrix, &
-                                      context%sab_orb, 'ECD implicit Gamma static magnetic diagnostic', &
-                                      dbcsr_type_antisymmetric)
-      CALL ecd_gamma_ao_vector_create(operators%static_magnetic_local_current_diagnostic, &
-                                      context%matrix_s(1)%matrix, context%sab_orb, &
-                                      'ECD implicit Gamma static magnetic local current diagnostic', &
-                                      dbcsr_type_antisymmetric)
-      CALL ecd_gamma_ao_vector_create(operators%static_magnetic_gth_diagnostic, context%matrix_s(1)%matrix, &
-                                      context%sab_orb, 'ECD implicit Gamma GTH static magnetic diagnostic', &
-                                      dbcsr_type_antisymmetric)
-
-      static_magnetic_anchor = 0.5_dp*SUM(context%cell%hmat, DIM=2)
       CALL build_local_moment_matrix(qs_env, operators%position, 1, ref_point=context%ref_point)
       CALL build_lin_mom_matrix(qs_env, operators%local_current)
-      CALL build_lin_mom_matrix(qs_env, operators%static_magnetic_local_current_diagnostic)
-      CALL build_local_magmom_matrix(qs_env, operators%static_magnetic_diagnostic, 1, &
-                                     ref_point=static_magnetic_anchor)
-      CALL ecd_gamma_static_magnetic_reference_translate(operators%static_magnetic_diagnostic, &
-                                                         operators%static_magnetic_local_current_diagnostic, &
-                                                         context%ref_point - static_magnetic_anchor)
-      IF (ASSOCIATED(context%sap_ppnl)) THEN
-         CALL ecd_gamma_ao_vector_create(gth_current_symmetric, context%matrix_s(1)%matrix, context%sab_orb, &
-                                         'ECD implicit Gamma GTH current symmetric', dbcsr_type_antisymmetric)
-         CALL build_com_mom_nl(context%qs_kind_set, context%sab_orb, context%sap_ppnl, &
-                               context%dft_control%qs_control%eps_ppnl, context%particle_set, context%cell, &
-                               matrix_rv=gth_current_symmetric, &
-                               matrix_rxrv=operators%static_magnetic_gth_diagnostic)
-         CALL ecd_gamma_static_magnetic_reference_translate(operators%static_magnetic_gth_diagnostic, &
-                                                            gth_current_symmetric, context%ref_point)
-         DO idir = 1, ncart
-            CALL dbcsr_add(operators%static_magnetic_diagnostic(idir)%matrix, &
-                           operators%static_magnetic_gth_diagnostic(idir)%matrix, &
-                           1.0_dp, 1.0_dp)
-         END DO
-         CALL dbcsr_deallocate_matrix_set(gth_current_symmetric)
-      END IF
 
    END SUBROUTINE ecd_gamma_zero_order_operators_build
 
 ! **************************************************************************************************
-!> \brief Borrow zero-order folded local and diagnostic matrices without transferring ownership.
+!> \brief Borrow zero-order folded local matrices without transferring ownership.
 ! **************************************************************************************************
-   SUBROUTINE ecd_gamma_zero_order_operators_get(operators, position, local_current, static_magnetic_diagnostic, &
-                                                  static_magnetic_local_current_diagnostic, &
-                                                  static_magnetic_gth_diagnostic)
+   SUBROUTINE ecd_gamma_zero_order_operators_get(operators, position, local_current)
       TYPE(ecd_gamma_zero_order_operators_type), INTENT(IN), TARGET :: operators
       TYPE(dbcsr_p_type), DIMENSION(:), POINTER, OPTIONAL :: position, local_current
-      TYPE(dbcsr_p_type), DIMENSION(:), POINTER, OPTIONAL :: static_magnetic_diagnostic
-      TYPE(dbcsr_p_type), DIMENSION(:), POINTER, OPTIONAL :: static_magnetic_local_current_diagnostic
-      TYPE(dbcsr_p_type), DIMENSION(:), POINTER, OPTIONAL :: static_magnetic_gth_diagnostic
 
-      IF (.NOT. ASSOCIATED(operators%position) .OR. .NOT. ASSOCIATED(operators%local_current) .OR. &
-          .NOT. ASSOCIATED(operators%static_magnetic_diagnostic) .OR. &
-          .NOT. ASSOCIATED(operators%static_magnetic_local_current_diagnostic) .OR. &
-          .NOT. ASSOCIATED(operators%static_magnetic_gth_diagnostic)) THEN
+      IF (.NOT. ASSOCIATED(operators%position) .OR. .NOT. ASSOCIATED(operators%local_current)) THEN
          CPABORT("ECD| Implicit-Gamma zero-order operators are unavailable")
       END IF
       IF (PRESENT(position)) position => operators%position
       IF (PRESENT(local_current)) local_current => operators%local_current
-      IF (PRESENT(static_magnetic_diagnostic)) static_magnetic_diagnostic => operators%static_magnetic_diagnostic
-      IF (PRESENT(static_magnetic_local_current_diagnostic)) THEN
-         static_magnetic_local_current_diagnostic => operators%static_magnetic_local_current_diagnostic
-      END IF
-      IF (PRESENT(static_magnetic_gth_diagnostic)) THEN
-         static_magnetic_gth_diagnostic => operators%static_magnetic_gth_diagnostic
-      END IF
 
    END SUBROUTINE ecd_gamma_zero_order_operators_get
 
@@ -162,38 +98,7 @@ CONTAINS
          CALL dbcsr_deallocate_matrix_set(operators%local_current)
          NULLIFY (operators%local_current)
       END IF
-      IF (ASSOCIATED(operators%static_magnetic_diagnostic)) THEN
-         CALL dbcsr_deallocate_matrix_set(operators%static_magnetic_diagnostic)
-         NULLIFY (operators%static_magnetic_diagnostic)
-      END IF
-      IF (ASSOCIATED(operators%static_magnetic_local_current_diagnostic)) THEN
-         CALL dbcsr_deallocate_matrix_set(operators%static_magnetic_local_current_diagnostic)
-         NULLIFY (operators%static_magnetic_local_current_diagnostic)
-      END IF
-      IF (ASSOCIATED(operators%static_magnetic_gth_diagnostic)) THEN
-         CALL dbcsr_deallocate_matrix_set(operators%static_magnetic_gth_diagnostic)
-         NULLIFY (operators%static_magnetic_gth_diagnostic)
-      END IF
    END SUBROUTINE ecd_gamma_zero_order_operators_release
-
-! **************************************************************************************************
-!> \brief Shift a static magnetic diagnostic from its current coordinate branch to a target reference point.
-! **************************************************************************************************
-   SUBROUTINE ecd_gamma_static_magnetic_reference_translate(magnetic, current, reference_shift)
-      TYPE(dbcsr_p_type), DIMENSION(:), POINTER          :: current, magnetic
-      REAL(KIND=dp), DIMENSION(ncart), INTENT(IN)        :: reference_shift
-
-      IF (SIZE(magnetic) /= ncart .OR. SIZE(current) /= ncart) THEN
-         CPABORT('ECD| Static magnetic reference translation received incompatible Cartesian storage')
-      END IF
-      CALL dbcsr_add(magnetic(1)%matrix, current(3)%matrix, 1.0_dp, -reference_shift(2))
-      CALL dbcsr_add(magnetic(1)%matrix, current(2)%matrix, 1.0_dp, reference_shift(3))
-      CALL dbcsr_add(magnetic(2)%matrix, current(1)%matrix, 1.0_dp, -reference_shift(3))
-      CALL dbcsr_add(magnetic(2)%matrix, current(3)%matrix, 1.0_dp, reference_shift(1))
-      CALL dbcsr_add(magnetic(3)%matrix, current(2)%matrix, 1.0_dp, -reference_shift(1))
-      CALL dbcsr_add(magnetic(3)%matrix, current(1)%matrix, 1.0_dp, reference_shift(2))
-
-   END SUBROUTINE ecd_gamma_static_magnetic_reference_translate
 
 ! **************************************************************************************************
 !> \brief Allocate a Cartesian folded AO vector owned by the implicit-Gamma provider.
