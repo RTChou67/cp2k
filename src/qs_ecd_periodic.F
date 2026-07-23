@@ -94,7 +94,6 @@ MODULE qs_ecd_periodic
                                               pw_copy
    USE pw_pool_types,                   ONLY: pw_pool_type
    USE pw_types,                        ONLY: pw_r3d_rs_type
-   USE rt_propagation_velocity_gauge,    ONLY: velocity_gauge_nl_term
    USE task_list_methods,               ONLY: generate_qs_task_list
    USE task_list_types,                 ONLY: allocate_task_list,&
                                               deallocate_task_list,&
@@ -162,13 +161,11 @@ CONTAINS
       COMPLEX(KIND=dp), ALLOCATABLE, DIMENSION(:, :, :)  :: static_magnetic_transition_cartesian
       INTEGER                                            :: idir, itransition, npoints, spatial_order
       INTEGER, ALLOCATABLE, DIMENSION(:)                 :: selected_iocc, selected_ispin, selected_ivirt
-      LOGICAL                                            :: do_kpoints, energy_range_explicit, gth_available, &
-                                                            gth_available_reference
+      LOGICAL                                            :: do_kpoints, energy_range_explicit, gth_available
       REAL(KIND=dp)                                      :: eps_degeneracy
       REAL(KIND=dp), ALLOCATABLE, DIMENSION(:, :)        :: gap_first_cartesian
       REAL(KIND=dp), DIMENSION(:), POINTER               :: energy_range
       REAL(KIND=dp), DIMENSION(ncart)                    :: direction
-      REAL(KIND=dp), DIMENSION(ncart, ncart)             :: diamagnetic_kernel, diamagnetic_kernel_direction
       TYPE(cell_type), POINTER                           :: cell
       TYPE(ecd_gamma_context_type)                       :: gamma_context
       TYPE(ecd_gamma_zero_order_operators_type)          :: gamma_operators
@@ -286,7 +283,7 @@ CONTAINS
                   eigenvalue_first(transition_selection%iocc(itransition)))
          END DO
          IF (idir == 1) THEN
-            CALL ecd_periodic_implicit_gamma_velocity_response_g10(qs_env, gamma_context, gamma_operators, &
+            CALL ecd_periodic_implicit_gamma_velocity_response_g10(gamma_context, gamma_operators, &
                                                                     transition_selection, pseudopotential_commutator, &
                                                                     energy_range, npoints, fwhm, &
                                                                     velocity_response_zero_direction, velocity_first_direction, &
@@ -296,14 +293,12 @@ CONTAINS
                                                                     velocity_cross_zero_direction, velocity_cross_first_direction, &
                                                                     velocity_nonlocal_zero_direction, &
                                                                     velocity_nonlocal_first_direction, &
-                                                                    diamagnetic_kernel_direction, velocity_transition_direction, &
+                                                                    velocity_transition_direction, &
                                                                     velocity_gth_transition_direction, &
                                                                     static_magnetic_transition_direction, &
                                                                     gth_available)
-            diamagnetic_kernel = diamagnetic_kernel_direction
-            gth_available_reference = gth_available
          ELSE
-            CALL ecd_periodic_implicit_gamma_velocity_response_g10(qs_env, gamma_context, gamma_operators, &
+            CALL ecd_periodic_implicit_gamma_velocity_response_g10(gamma_context, gamma_operators, &
                                                                     transition_selection, pseudopotential_commutator, &
                                                                     energy_range, npoints, fwhm, &
                                                                     velocity_response_zero_direction, velocity_first_direction, &
@@ -313,13 +308,10 @@ CONTAINS
                                                                     velocity_cross_zero_direction, velocity_cross_first_direction, &
                                                                     velocity_nonlocal_zero_direction, &
                                                                     velocity_nonlocal_first_direction, &
-                                                                    diamagnetic_kernel_direction, velocity_transition_direction, &
+                                                                    velocity_transition_direction, &
                                                                     velocity_gth_transition_direction, &
                                                                     static_magnetic_transition_direction, &
-                                                                    gth_available, diamagnetic_kernel)
-            IF (gth_available .NEQV. gth_available_reference) THEN
-               CPABORT('ECD| Cartesian Gamma directions reported inconsistent GTH-current availability')
-            END IF
+                                                                    gth_available)
          END IF
          IF (idir == 1) THEN
             CALL MOVE_ALLOC(velocity_response_zero_direction, velocity_response_zero)
@@ -1458,9 +1450,9 @@ CONTAINS
 ! **************************************************************************************************
 !> \brief Build implicit-Gamma current Taylor coefficients through first spatial order.
 !>
-!> The local and GTH image kernels are ECD-owned.  Their zeroth coefficient is
-!> checked against the folded complete current before the first coefficient is
-!> made available to the finite-q transition provider.
+!> The local and GTH image kernels are ECD-owned.  The local zero-order
+!> coefficient is checked before the first coefficient reaches the finite-q
+!> transition provider.
 ! **************************************************************************************************
    SUBROUTINE ecd_periodic_implicit_gamma_current_g4(qs_env, context, gamma_operators)
       TYPE(qs_environment_type), POINTER                 :: qs_env
@@ -1468,17 +1460,13 @@ CONTAINS
       TYPE(ecd_gamma_zero_order_operators_type), INTENT(IN), TARGET :: gamma_operators
 
       INTEGER                                            :: idir
-      LOGICAL                                            :: gth_available, gth_enabled
-      REAL(KIND=dp)                                      :: complete_norm_sq, first_imag_norm_sq, first_norm_sq, gth_imag_norm_sq, &
-                                                            gth_norm_sq, gth_path_norm_sq, gth_real_residual_norm_sq, &
-                                                            gth_reference_norm_sq, gth_relative_residual, gth_residual_norm_sq, &
-                                                            local_norm_sq, local_reference_norm_sq, local_relative_residual, &
-                                                            local_residual_norm_sq, residual_norm_sq, zero_norm_sq, &
-                                                            zero_relative_residual
+      LOGICAL                                            :: gth_enabled
+      REAL(KIND=dp)                                      :: first_imag_norm_sq, first_norm_sq, local_norm_sq, &
+                                                            local_reference_norm_sq, local_relative_residual, &
+                                                            local_residual_norm_sq, zero_norm_sq
       REAL(KIND=dp), DIMENSION(3)                        :: xkp_zero
       TYPE(cp_logger_type), POINTER                      :: logger
-      TYPE(dbcsr_p_type), DIMENSION(:), POINTER          :: complete_current, current_residual, &
-                                                            gth_current, local_current, position
+      TYPE(dbcsr_p_type), DIMENSION(:), POINTER          :: current_residual, local_current
       TYPE(dbcsr_p_type), DIMENSION(:, :), POINTER       :: current_taylor_imag, current_taylor_real, &
                                                             gth_current_taylor_imag, gth_current_taylor_real, &
                                                             local_moments_rs, local_momentum_rs, overlap_images
@@ -1491,24 +1479,23 @@ CONTAINS
       INTEGER, DIMENSION(:, :, :), POINTER               :: gth_cell_to_index, local_cell_to_index, &
                                                             translation_cell_to_index
 
-      NULLIFY (complete_current, current_residual, current_taylor_imag, current_taylor_real, &
-               gth_cell_to_index, gth_current, gth_current_path_rs, gth_current_taylor_imag, &
+      NULLIFY (current_residual, current_taylor_imag, current_taylor_real, gth_cell_to_index, &
+               gth_current_path_rs, gth_current_taylor_imag, &
                gth_current_taylor_real, gth_diamagnetic_path_rs, gth_diamagnetic_taylor_imag, &
                gth_diamagnetic_taylor_real, local_cell_to_index, local_current, local_moments_der_rs, &
-               local_moments_rs, local_momentum_rs, logger, translation_cell_to_index, overlap_images, position)
+               local_moments_rs, local_momentum_rs, logger, translation_cell_to_index, overlap_images)
       xkp_zero = 0.0_dp
       CALL ecd_gamma_context_overlap_images_get(context, overlap_images, translation_cell_to_index)
       IF (ASSOCIATED(context%current_taylor_real) .OR. ASSOCIATED(context%current_taylor_imag) .OR. &
           ASSOCIATED(context%gth_current_taylor_real) .OR. ASSOCIATED(context%gth_current_taylor_imag)) THEN
          CPABORT("ECD| Stage G4 current Taylor coefficients are already allocated")
       END IF
-      CALL ecd_gamma_zero_order_operators_get(gamma_operators, position, local_current, gth_current, complete_current, &
-                                               gth_available)
+      CALL ecd_gamma_zero_order_operators_get(gamma_operators, local_current=local_current)
 
       CALL ecd_periodic_local_operators_build(local_operators, qs_env, context%ref_point, 1)
       CALL ecd_periodic_local_operators_get(local_operators, local_cell_to_index, local_momentum_rs, &
                                             local_moments_der_rs, local_moments_rs)
-      gth_enabled = gth_available
+      gth_enabled = ASSOCIATED(context%sap_ppnl)
       IF (gth_enabled) THEN
           CALL ecd_periodic_gth_operators_build(gth_operators, qs_env, context%direction, context%ref_point, 1)
          CALL ecd_periodic_gth_operators_get(gth_operators, gth_cell_to_index, gth_current_path_rs, &
@@ -1531,18 +1518,10 @@ CONTAINS
 
       logger => cp_get_default_logger()
       DO idir = 1, ncart
-         ! Verify each production contribution separately so component errors cannot cancel in the total current.
-         CALL dbcsr_set(current_residual(idir)%matrix, 0.0_dp)
-         CALL dbcsr_add(current_residual(idir)%matrix, current_taylor_real(idir, 1)%matrix, 0.0_dp, 1.0_dp)
-         CALL dbcsr_add(current_residual(idir)%matrix, complete_current(idir)%matrix, 1.0_dp, -1.0_dp)
          CALL dbcsr_dot(current_taylor_real(idir, 1)%matrix, current_taylor_real(idir, 1)%matrix, zero_norm_sq)
-         CALL dbcsr_dot(complete_current(idir)%matrix, complete_current(idir)%matrix, complete_norm_sq)
          CALL dbcsr_dot(current_taylor_real(idir, 2)%matrix, current_taylor_real(idir, 2)%matrix, first_norm_sq)
          CALL dbcsr_dot(current_taylor_imag(idir, 2)%matrix, current_taylor_imag(idir, 2)%matrix, &
                         first_imag_norm_sq)
-         CALL dbcsr_dot(current_residual(idir)%matrix, current_residual(idir)%matrix, residual_norm_sq)
-         zero_relative_residual = 2.0_dp*SQRT(ABS(residual_norm_sq))/ &
-                                  MAX(SQRT(TINY(1.0_dp)), SQRT(ABS(zero_norm_sq)) + SQRT(ABS(complete_norm_sq)))
          CALL dbcsr_set(current_residual(idir)%matrix, 0.0_dp)
          CALL dbcsr_add(current_residual(idir)%matrix, current_taylor_real(idir, 1)%matrix, 0.0_dp, 1.0_dp)
          CALL dbcsr_add(current_residual(idir)%matrix, gth_current_taylor_real(idir, 1)%matrix, 1.0_dp, -1.0_dp)
@@ -1552,52 +1531,13 @@ CONTAINS
          CALL dbcsr_dot(current_residual(idir)%matrix, current_residual(idir)%matrix, local_residual_norm_sq)
          local_relative_residual = 2.0_dp*SQRT(ABS(local_residual_norm_sq))/ &
                                    MAX(SQRT(TINY(1.0_dp)), SQRT(ABS(local_norm_sq)) + SQRT(ABS(local_reference_norm_sq)))
-         gth_norm_sq = 0.0_dp
-         gth_imag_norm_sq = 0.0_dp
-         gth_path_norm_sq = 0.0_dp
-         gth_real_residual_norm_sq = 0.0_dp
-         gth_reference_norm_sq = 0.0_dp
-         gth_residual_norm_sq = 0.0_dp
-         gth_relative_residual = 0.0_dp
-         IF (gth_enabled) THEN
-            CALL dbcsr_set(current_residual(idir)%matrix, 0.0_dp)
-            CALL dbcsr_add(current_residual(idir)%matrix, gth_current_taylor_real(idir, 1)%matrix, 0.0_dp, 1.0_dp)
-            CALL dbcsr_dot(current_residual(idir)%matrix, current_residual(idir)%matrix, gth_norm_sq)
-            CALL dbcsr_dot(gth_current_taylor_imag(idir, 1)%matrix, &
-                           gth_current_taylor_imag(idir, 1)%matrix, gth_imag_norm_sq)
-            CALL dbcsr_dot(gth_current(idir)%matrix, gth_current(idir)%matrix, gth_reference_norm_sq)
-            CALL dbcsr_add(current_residual(idir)%matrix, gth_current(idir)%matrix, 1.0_dp, -1.0_dp)
-            CALL dbcsr_dot(current_residual(idir)%matrix, current_residual(idir)%matrix, &
-                           gth_real_residual_norm_sq)
-            gth_path_norm_sq = gth_norm_sq + gth_imag_norm_sq
-            gth_residual_norm_sq = gth_real_residual_norm_sq + gth_imag_norm_sq
-            gth_relative_residual = 2.0_dp*SQRT(ABS(gth_residual_norm_sq))/ &
-                                    MAX(SQRT(TINY(1.0_dp)), SQRT(ABS(gth_path_norm_sq)) + &
-                                        SQRT(ABS(gth_reference_norm_sq)))
-         END IF
          IF (cp_logger_get_default_io_unit(logger) > 0) THEN
             WRITE (cp_logger_get_default_io_unit(logger), '(T2,A,I1,T55,ES14.6)') &
                'ECD| Stage G4 current zeroth norm component', idir, SQRT(ABS(zero_norm_sq))
             WRITE (cp_logger_get_default_io_unit(logger), '(T2,A,I1,T55,ES14.6)') &
-               'ECD| Stage G4 current zeroth residual component', idir, SQRT(ABS(residual_norm_sq))
-            WRITE (cp_logger_get_default_io_unit(logger), '(T2,A,I1,T55,ES14.6)') &
-               'ECD| Stage G4 current zeroth relative residual component', idir, zero_relative_residual
-            WRITE (cp_logger_get_default_io_unit(logger), '(T2,A,I1,T55,ES14.6)') &
                'ECD| Stage G4 local current zeroth residual component', idir, SQRT(ABS(local_residual_norm_sq))
             WRITE (cp_logger_get_default_io_unit(logger), '(T2,A,I1,T55,ES14.6)') &
                'ECD| Stage G4 local current zeroth relative residual component', idir, local_relative_residual
-            IF (gth_enabled) THEN
-               WRITE (cp_logger_get_default_io_unit(logger), '(T2,A,I1,T55,ES14.6)') &
-                  'ECD| Stage G4 GTH q=0 path norm component', idir, SQRT(ABS(gth_path_norm_sq))
-               WRITE (cp_logger_get_default_io_unit(logger), '(T2,A,I1,T55,ES14.6)') &
-                  'ECD| Stage G4 GTH q=0 built-in norm component', idir, SQRT(ABS(gth_reference_norm_sq))
-               WRITE (cp_logger_get_default_io_unit(logger), '(T2,A,I1,T55,ES14.6)') &
-                  'ECD| Stage G4 GTH q=0 path imaginary norm component', idir, SQRT(ABS(gth_imag_norm_sq))
-               WRITE (cp_logger_get_default_io_unit(logger), '(T2,A,I1,T55,ES14.6)') &
-                  'ECD| Stage G4 GTH q=0 full residual component', idir, SQRT(ABS(gth_residual_norm_sq))
-               WRITE (cp_logger_get_default_io_unit(logger), '(T2,A,I1,T55,ES14.6)') &
-                  'ECD| Stage G4 GTH q=0 full relative residual component', idir, gth_relative_residual
-            END IF
             WRITE (cp_logger_get_default_io_unit(logger), '(T2,A,I1,T55,ES14.6)') &
                'ECD| Stage G4 current first real norm component', idir, SQRT(ABS(first_norm_sq))
             WRITE (cp_logger_get_default_io_unit(logger), '(T2,A,I1,T55,ES14.6)') &
@@ -1622,19 +1562,17 @@ CONTAINS
 ! **************************************************************************************************
 !> \brief Assemble the first-order velocity-gauge causal response from retained Gamma providers.
 ! **************************************************************************************************
-   SUBROUTINE ecd_periodic_implicit_gamma_velocity_response_g10(qs_env, context, operators, transition_selection, &
+   SUBROUTINE ecd_periodic_implicit_gamma_velocity_response_g10(context, operators, transition_selection, &
                                                                  pseudopotential_commutator, energy_range, npoints, fwhm, &
                                                                  response_zero_output, response_first_output, &
                                                                  complete_zero_output, complete_first_output, &
                                                                  local_zero_output, local_first_output, &
                                                                  cross_zero_output, cross_first_output, &
                                                                  nonlocal_zero_output, nonlocal_first_output, &
-                                                                 diamagnetic_kernel_output, transition_output, &
+                                                                 transition_output, &
                                                                  gth_transition_output, &
                                                                  static_magnetic_transition_output, &
-                                                                 gth_available_output, &
-                                                                 diamagnetic_kernel_reference)
-      TYPE(qs_environment_type), POINTER                 :: qs_env
+                                                                 gth_available_output)
       TYPE(ecd_gamma_context_type), INTENT(IN), TARGET   :: context
       TYPE(ecd_gamma_zero_order_operators_type), INTENT(IN), TARGET :: operators
       TYPE(ecd_periodic_transition_selection_type), INTENT(IN) :: transition_selection
@@ -1647,12 +1585,10 @@ CONTAINS
                                                                           cross_first_output, cross_zero_output, &
                                                                           local_first_output, local_zero_output, &
                                                                           nonlocal_first_output, nonlocal_zero_output
-      REAL(KIND=dp), DIMENSION(ncart, ncart), INTENT(OUT) :: diamagnetic_kernel_output
       COMPLEX(KIND=dp), ALLOCATABLE, DIMENSION(:, :, :), INTENT(OUT) :: transition_output
       COMPLEX(KIND=dp), ALLOCATABLE, DIMENSION(:, :, :), INTENT(OUT) :: gth_transition_output
       COMPLEX(KIND=dp), ALLOCATABLE, DIMENSION(:, :), INTENT(OUT) :: static_magnetic_transition_output
       LOGICAL, INTENT(OUT)                               :: gth_available_output
-      REAL(KIND=dp), DIMENSION(ncart, ncart), INTENT(IN), OPTIONAL :: diamagnetic_kernel_reference
 
       COMPLEX(KIND=dp), ALLOCATABLE, DIMENSION(:, :)     :: current_first_mo, current_first_rotated, &
                                                             current_zero_mo, current_zero_rotated, &
@@ -1676,19 +1612,17 @@ CONTAINS
                                                             occupation_difference, photon_energy, prefactor, &
                                                             response_counter_norm, response_first_counter_norm, &
                                                             response_first_norm, response_first_resonant_norm, &
-                                                            response_norm, gth_diamagnetic_zero_relative_residual, &
-                                                            gth_diamagnetic_zero_residual, response_resonant_norm
+                                                            response_norm, response_resonant_norm
       REAL(KIND=dp), ALLOCATABLE, DIMENSION(:)           :: gap_taylor
       REAL(KIND=dp), DIMENSION(ncart, ncart)             :: gth_diamagnetic_kernel, local_diamagnetic_kernel
+      REAL(KIND=dp), DIMENSION(ncart, ncart)             :: diamagnetic_kernel
       COMPLEX(KIND=dp), DIMENSION(ncart, ncart)          :: gth_diamagnetic_first
-      REAL(KIND=dp), DIMENSION(ncart, ncart)             :: gth_diamagnetic_path_zero
       TYPE(cp_logger_type), POINTER                      :: logger
       TYPE(cp_fm_type)                                   :: static_magnetic_mo
       REAL(KIND=dp), ALLOCATABLE, DIMENSION(:, :)        :: static_magnetic_buffer
-      TYPE(dbcsr_p_type), DIMENSION(:), POINTER          :: complete_current, gth_current, local_current, position, &
-                                                            static_magnetic_diagnostic
+      TYPE(dbcsr_p_type), DIMENSION(:), POINTER          :: static_magnetic_diagnostic
 
-      NULLIFY (complete_current, gth_current, local_current, logger, position, static_magnetic_diagnostic)
+      NULLIFY (logger, static_magnetic_diagnostic)
       IF (.NOT. ASSOCIATED(context%current_taylor_real) .OR. .NOT. ASSOCIATED(context%current_taylor_imag) .OR. &
           .NOT. ASSOCIATED(context%gth_current_taylor_real) .OR. &
           .NOT. ASSOCIATED(context%gth_current_taylor_imag)) THEN
@@ -1708,8 +1642,8 @@ CONTAINS
       IF (cell_volume <= 0.0_dp) THEN
          CPABORT("ECD| Stage G10 requires a positive cell volume")
       END IF
-      CALL ecd_gamma_zero_order_operators_get(operators, position, local_current, gth_current, complete_current, &
-                                               gth_available, static_magnetic_diagnostic)
+      CALL ecd_gamma_zero_order_operators_get(operators, static_magnetic_diagnostic=static_magnetic_diagnostic)
+      gth_available = ASSOCIATED(context%sap_ppnl)
       gth_available_output = gth_available
 
       ALLOCATE (cross_counter(ncart, ncart, npoints), cross_first_counter(ncart, ncart, npoints), &
@@ -1867,38 +1801,22 @@ CONTAINS
          CPABORT('ECD| Stage G10 transition selection is inconsistent with the Gamma spin space')
       END IF
 
-      IF (PRESENT(diamagnetic_kernel_reference)) THEN
-         diamagnetic_kernel_output = diamagnetic_kernel_reference
-         local_diamagnetic_kernel = 0.0_dp
-         DO ispin = 1, context%nspin
-            DO idir = 1, ncart
-               local_diamagnetic_kernel(idir, idir) = local_diamagnetic_kernel(idir, idir) - &
-                                                      SUM(context%spin(ispin)%occupations)
-            END DO
+      local_diamagnetic_kernel = 0.0_dp
+      DO ispin = 1, context%nspin
+         DO idir = 1, ncart
+            local_diamagnetic_kernel(idir, idir) = local_diamagnetic_kernel(idir, idir) - &
+                                                   SUM(context%spin(ispin)%occupations)
          END DO
-         gth_diamagnetic_kernel = diamagnetic_kernel_output - local_diamagnetic_kernel
-         IF (.NOT. gth_available .AND. MAXVAL(ABS(gth_diamagnetic_kernel)) > 100.0_dp*EPSILON(1.0_dp)) THEN
-            CPABORT('ECD| Cached diamagnetic kernel contains a GTH contribution without GTH current data')
-         END IF
-      ELSE
-         CALL ecd_periodic_implicit_gamma_diamagnetic_kernel(qs_env, context, gth_available, &
-                                                              local_diamagnetic_kernel, gth_diamagnetic_kernel, &
-                                                              diamagnetic_kernel_output)
-      END IF
+      END DO
+      gth_diamagnetic_kernel = 0.0_dp
       gth_diamagnetic_first = CMPLX(0.0_dp, 0.0_dp, KIND=dp)
-      gth_diamagnetic_path_zero = 0.0_dp
-      gth_diamagnetic_zero_residual = 0.0_dp
-      gth_diamagnetic_zero_relative_residual = 0.0_dp
       IF (gth_available) THEN
-         CALL ecd_periodic_implicit_gamma_gth_diamagnetic_taylor(context, gth_diamagnetic_path_zero, &
+         CALL ecd_periodic_implicit_gamma_gth_diamagnetic_taylor(context, gth_diamagnetic_kernel, &
                                                                    gth_diamagnetic_first)
-         gth_diamagnetic_zero_residual = SQRT(SUM((gth_diamagnetic_path_zero - gth_diamagnetic_kernel)**2))
-         gth_diamagnetic_zero_relative_residual = 2.0_dp*gth_diamagnetic_zero_residual/ &
-                                                   MAX(SQRT(TINY(1.0_dp)), SQRT(SUM(gth_diamagnetic_path_zero**2)) + &
-                                                       SQRT(SUM(gth_diamagnetic_kernel**2)))
       END IF
+      diamagnetic_kernel = local_diamagnetic_kernel + gth_diamagnetic_kernel
       CALL ecd_periodic_current_fsum_closure_g11(transition_selection, transition_output, &
-                                                  diamagnetic_kernel_output)
+                                                  diamagnetic_kernel)
       ALLOCATE (complete_zero_output(ncart, ncart, npoints), complete_first_output(ncart, ncart, npoints), &
                 local_zero_output(ncart, ncart, npoints), local_first_output(ncart, ncart, npoints), &
                 cross_zero_output(ncart, ncart, npoints), cross_first_output(ncart, ncart, npoints), &
@@ -1967,10 +1885,6 @@ CONTAINS
             'ECD| Stage G10 midpoint full first-order norm', response_first_norm
          WRITE (cp_logger_get_default_io_unit(logger), '(T2,A,T55,ES14.6)') &
             'ECD| Stage G10 midpoint antisymmetric first-order norm', antisymmetric_first_norm
-         WRITE (cp_logger_get_default_io_unit(logger), '(T2,A,T55,ES14.6)') &
-            'ECD| Stage G10 GTH diamagnetic zero-order residual', gth_diamagnetic_zero_residual
-         WRITE (cp_logger_get_default_io_unit(logger), '(T2,A,T55,ES14.6)') &
-            'ECD| Stage G10 GTH diamagnetic zero-order relative residual', gth_diamagnetic_zero_relative_residual
          WRITE (cp_logger_get_default_io_unit(logger), '(T2,A,T55,ES14.6)') &
             'ECD| Stage G10 GTH diamagnetic first-order norm', SQRT(SUM(ABS(gth_diamagnetic_first)**2))
       END IF
@@ -2060,9 +1974,9 @@ CONTAINS
                                                             ntransitions, ntransitions_total
       REAL(KIND=dp), ALLOCATABLE, DIMENSION(:, :)        :: position_buffer
       TYPE(cp_fm_type)                                   :: position_mo
-      TYPE(dbcsr_p_type), DIMENSION(:), POINTER          :: complete_current, gth_current, local_current, position
-      NULLIFY (complete_current, gth_current, local_current, position)
-      CALL ecd_gamma_zero_order_operators_get(operators, position, local_current, gth_current, complete_current)
+      TYPE(dbcsr_p_type), DIMENSION(:), POINTER          :: position
+      NULLIFY (position)
+      CALL ecd_gamma_zero_order_operators_get(operators, position=position)
       ALLOCATE (transition_output(ncart, transition_selection%selected_count))
       transition_output = CMPLX(0.0_dp, 0.0_dp, KIND=dp)
 
@@ -2257,105 +2171,6 @@ CONTAINS
       END IF
 
    END SUBROUTINE ecd_periodic_response_zero_check
-
-! **************************************************************************************************
-!> \brief Assemble the folded local plus GTH diamagnetic kernel at implicit Gamma.
-! **************************************************************************************************
-   SUBROUTINE ecd_periodic_implicit_gamma_diamagnetic_kernel(qs_env, context, gth_available, &
-                                                              local_kernel_output, gth_kernel_output, &
-                                                              diamagnetic_kernel)
-      TYPE(qs_environment_type), POINTER                 :: qs_env
-      TYPE(ecd_gamma_context_type), INTENT(IN)           :: context
-      LOGICAL, INTENT(IN)                                :: gth_available
-      REAL(KIND=dp), DIMENSION(ncart, ncart), INTENT(OUT) :: local_kernel_output, gth_kernel_output
-      REAL(KIND=dp), DIMENSION(ncart, ncart), INTENT(OUT) :: diamagnetic_kernel
-
-      REAL(KIND=dp), PARAMETER                           :: fd_step = 1.0E-4_dp
-
-      INTEGER                                            :: ia, ib, iband, ispin, nmo
-      REAL(KIND=dp)                                      :: gth_component
-      REAL(KIND=dp), DIMENSION(ncart, ncart)             :: gth_kernel, local_kernel
-      REAL(KIND=dp), DIMENSION(ncart)                    :: vector_potential
-      REAL(KIND=dp), ALLOCATABLE, DIMENSION(:, :)        :: curvature_buffer
-      TYPE(cp_fm_type)                                   :: curvature_mo
-      TYPE(cp_logger_type), POINTER                      :: logger
-      TYPE(dbcsr_p_type), DIMENSION(:), POINTER          :: curvature, nl_mm, nl_mp, nl_pm, nl_pp, nl_zero
-
-      NULLIFY (curvature, logger, nl_mm, nl_mp, nl_pm, nl_pp, nl_zero)
-      local_kernel = 0.0_dp
-      DO ispin = 1, context%nspin
-         DO ia = 1, ncart
-            local_kernel(ia, ia) = local_kernel(ia, ia) - SUM(context%spin(ispin)%occupations)
-         END DO
-      END DO
-      gth_kernel = 0.0_dp
-
-      IF (gth_available) THEN
-         CALL ecd_periodic_ao_vector_create(curvature, context%matrix_s(1)%matrix, context%sab_orb, &
-                                             'ECD implicit Gamma diamagnetic GTH curvature', dbcsr_type_symmetric)
-         CALL ecd_periodic_gauge_nl_pair_create(nl_zero, context%matrix_s(1)%matrix, context%sab_orb, &
-                                                'ECD implicit Gamma diamagnetic gauge zero')
-         CALL ecd_periodic_gauge_nl_pair_create(nl_pp, context%matrix_s(1)%matrix, context%sab_orb, &
-                                                'ECD implicit Gamma diamagnetic gauge pp')
-         CALL ecd_periodic_gauge_nl_pair_create(nl_pm, context%matrix_s(1)%matrix, context%sab_orb, &
-                                                'ECD implicit Gamma diamagnetic gauge pm')
-         CALL ecd_periodic_gauge_nl_pair_create(nl_mp, context%matrix_s(1)%matrix, context%sab_orb, &
-                                                'ECD implicit Gamma diamagnetic gauge mp')
-         CALL ecd_periodic_gauge_nl_pair_create(nl_mm, context%matrix_s(1)%matrix, context%sab_orb, &
-                                                'ECD implicit Gamma diamagnetic gauge mm')
-         CALL ecd_periodic_gauge_nl_pair_reset(nl_zero)
-         vector_potential = 0.0_dp
-         CALL velocity_gauge_nl_term(qs_env, nl_zero, vector_potential)
-
-         DO ia = 1, ncart
-            DO ib = ia, ncart
-               CALL ecd_periodic_gauge_nl_curvature_build(qs_env, nl_zero, nl_pp, nl_pm, nl_mp, nl_mm, &
-                                                           fd_step, ia, ib, curvature(1))
-               gth_component = 0.0_dp
-               DO ispin = 1, context%nspin
-                  nmo = context%spin(ispin)%nmo
-                  CALL ecd_project_real_operator_to_mo(curvature(1), context%spin(ispin)%mo_coeff, &
-                                                       context%spin(ispin)%nao, nmo, curvature_mo)
-                  ALLOCATE (curvature_buffer(nmo, nmo))
-                  CALL cp_fm_get_submatrix(curvature_mo, curvature_buffer)
-                  DO iband = 1, nmo
-                     gth_component = gth_component - context%spin(ispin)%occupations(iband)* &
-                                     curvature_buffer(iband, iband)
-                  END DO
-                  DEALLOCATE (curvature_buffer)
-                  CALL cp_fm_release(curvature_mo)
-               END DO
-               gth_kernel(ia, ib) = gth_component
-               gth_kernel(ib, ia) = gth_component
-            END DO
-         END DO
-
-         CALL dbcsr_deallocate_matrix_set(curvature)
-         CALL dbcsr_deallocate_matrix_set(nl_mm)
-         CALL dbcsr_deallocate_matrix_set(nl_mp)
-         CALL dbcsr_deallocate_matrix_set(nl_pm)
-         CALL dbcsr_deallocate_matrix_set(nl_pp)
-         CALL dbcsr_deallocate_matrix_set(nl_zero)
-      END IF
-
-      diamagnetic_kernel = local_kernel + gth_kernel
-      local_kernel_output = local_kernel
-      gth_kernel_output = gth_kernel
-      logger => cp_get_default_logger()
-      IF (cp_logger_get_default_io_unit(logger) > 0) THEN
-         DO ia = 1, ncart
-            WRITE (cp_logger_get_default_io_unit(logger), '(T2,A,I1,T55,ES14.6)') &
-               'ECD| Stage G2 local diamagnetic kernel component', ia, local_kernel(ia, ia)
-            DO ib = ia, ncart
-               WRITE (cp_logger_get_default_io_unit(logger), '(T2,A,I1,A,I1,T55,ES14.6)') &
-                  'ECD| Stage G2 GTH diamagnetic kernel component', ia, ' ', ib, gth_kernel(ia, ib)
-               WRITE (cp_logger_get_default_io_unit(logger), '(T2,A,I1,A,I1,T55,ES14.6)') &
-                  'ECD| Stage G2 total diamagnetic kernel component', ia, ' ', ib, diamagnetic_kernel(ia, ib)
-            END DO
-         END DO
-      END IF
-
-   END SUBROUTINE ecd_periodic_implicit_gamma_diamagnetic_kernel
 
 ! **************************************************************************************************
 !> \brief Contract folded GTH two-field Taylor matrices with the occupied Gamma density.
@@ -3105,98 +2920,6 @@ CONTAINS
       END DO
 
    END FUNCTION ecd_periodic_factorial
-
-! **************************************************************************************************
-!> \brief Allocate the real symmetric and imaginary antisymmetric parts of one GTH gauge term.
-! **************************************************************************************************
-   SUBROUTINE ecd_periodic_gauge_nl_pair_create(matrices, template, sab_nl, name)
-      TYPE(dbcsr_p_type), DIMENSION(:), POINTER          :: matrices
-      TYPE(dbcsr_type), POINTER                          :: template
-      TYPE(neighbor_list_set_p_type), DIMENSION(:), &
-         POINTER                                         :: sab_nl
-      CHARACTER(LEN=*), INTENT(IN)                       :: name
-
-      CALL dbcsr_allocate_matrix_set(matrices, 2)
-      CALL dbcsr_init_p(matrices(1)%matrix)
-      CALL dbcsr_create(matrices(1)%matrix, template=template, &
-                        matrix_type=dbcsr_type_symmetric, name=name//" real")
-      CALL cp_dbcsr_alloc_block_from_nbl(matrices(1)%matrix, sab_nl)
-      CALL dbcsr_set(matrices(1)%matrix, 0.0_dp)
-      CALL dbcsr_init_p(matrices(2)%matrix)
-      CALL dbcsr_create(matrices(2)%matrix, template=template, &
-                        matrix_type=dbcsr_type_antisymmetric, name=name//" imaginary")
-      CALL cp_dbcsr_alloc_block_from_nbl(matrices(2)%matrix, sab_nl)
-      CALL dbcsr_set(matrices(2)%matrix, 0.0_dp)
-
-   END SUBROUTINE ecd_periodic_gauge_nl_pair_create
-
-! **************************************************************************************************
-!> \brief Reset one GTH gauge-term pair before a fresh vector-potential evaluation.
-! **************************************************************************************************
-   SUBROUTINE ecd_periodic_gauge_nl_pair_reset(matrices)
-      TYPE(dbcsr_p_type), DIMENSION(:), POINTER          :: matrices
-
-      CPASSERT(SIZE(matrices) == 2)
-      CALL dbcsr_set(matrices(1)%matrix, 0.0_dp)
-      CALL dbcsr_set(matrices(2)%matrix, 0.0_dp)
-
-   END SUBROUTINE ecd_periodic_gauge_nl_pair_reset
-
-! **************************************************************************************************
-!> \brief Form one central finite-difference GTH uniform-gauge curvature matrix.
-! **************************************************************************************************
-   SUBROUTINE ecd_periodic_gauge_nl_curvature_build(qs_env, nl_zero, nl_pp, nl_pm, nl_mp, nl_mm, &
-                                                     step, ia, ib, curvature)
-      TYPE(qs_environment_type), POINTER                 :: qs_env
-      TYPE(dbcsr_p_type), DIMENSION(:), POINTER          :: nl_zero, nl_pp, nl_pm, nl_mp, nl_mm
-      REAL(KIND=dp), INTENT(IN)                          :: step
-      INTEGER, INTENT(IN)                                :: ia, ib
-      TYPE(dbcsr_p_type), INTENT(INOUT)                  :: curvature
-
-      REAL(KIND=dp), DIMENSION(ncart)                    :: vector_potential
-
-      CPASSERT(SIZE(nl_zero) == 2)
-      CPASSERT(SIZE(nl_pp) == 2)
-      CPASSERT(SIZE(nl_pm) == 2)
-      CPASSERT(SIZE(nl_mp) == 2)
-      CPASSERT(SIZE(nl_mm) == 2)
-      CPASSERT(ia >= 1 .AND. ia <= ncart)
-      CPASSERT(ib >= 1 .AND. ib <= ncart)
-      CPASSERT(step > 0.0_dp)
-
-      CALL dbcsr_set(curvature%matrix, 0.0_dp)
-      CALL ecd_periodic_gauge_nl_pair_reset(nl_pp)
-      CALL ecd_periodic_gauge_nl_pair_reset(nl_pm)
-      CALL ecd_periodic_gauge_nl_pair_reset(nl_mp)
-      CALL ecd_periodic_gauge_nl_pair_reset(nl_mm)
-      IF (ia == ib) THEN
-         vector_potential = 0.0_dp
-         vector_potential(ia) = step
-         CALL velocity_gauge_nl_term(qs_env, nl_pp, vector_potential)
-         vector_potential(ia) = -step
-         CALL velocity_gauge_nl_term(qs_env, nl_mm, vector_potential)
-         CALL dbcsr_add(curvature%matrix, nl_pp(1)%matrix, 0.0_dp, 1.0_dp/step**2)
-         CALL dbcsr_add(curvature%matrix, nl_mm(1)%matrix, 1.0_dp, 1.0_dp/step**2)
-         CALL dbcsr_add(curvature%matrix, nl_zero(1)%matrix, 1.0_dp, -2.0_dp/step**2)
-      ELSE
-         vector_potential = 0.0_dp
-         vector_potential(ia) = step
-         vector_potential(ib) = step
-         CALL velocity_gauge_nl_term(qs_env, nl_pp, vector_potential)
-         vector_potential(ib) = -step
-         CALL velocity_gauge_nl_term(qs_env, nl_pm, vector_potential)
-         vector_potential(ia) = -step
-         vector_potential(ib) = step
-         CALL velocity_gauge_nl_term(qs_env, nl_mp, vector_potential)
-         vector_potential(ib) = -step
-         CALL velocity_gauge_nl_term(qs_env, nl_mm, vector_potential)
-         CALL dbcsr_add(curvature%matrix, nl_pp(1)%matrix, 0.0_dp, 0.25_dp/step**2)
-         CALL dbcsr_add(curvature%matrix, nl_pm(1)%matrix, 1.0_dp, -0.25_dp/step**2)
-         CALL dbcsr_add(curvature%matrix, nl_mp(1)%matrix, 1.0_dp, -0.25_dp/step**2)
-         CALL dbcsr_add(curvature%matrix, nl_mm(1)%matrix, 1.0_dp, 0.25_dp/step**2)
-      END IF
-
-   END SUBROUTINE ecd_periodic_gauge_nl_curvature_build
 
 ! **************************************************************************************************
 !> \brief Project one complex AO operator, represented by real sparse components, to the MO basis.
