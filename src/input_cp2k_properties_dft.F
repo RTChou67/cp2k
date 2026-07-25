@@ -135,6 +135,10 @@ CONTAINS
       CALL section_add_subsection(section, subsection)
       CALL section_release(subsection)
 
+      CALL create_ecd_section(subsection)
+      CALL section_add_subsection(section, subsection)
+      CALL section_release(subsection)
+
       CALL create_rixs_section(subsection)
       CALL section_add_subsection(section, subsection)
       CALL section_release(subsection)
@@ -2186,6 +2190,58 @@ CONTAINS
       CALL section_release(subsection)
 
    END SUBROUTINE create_tddfpt2_section
+
+! **************************************************************************************************
+!> \brief creates the input section for electronic circular dichroism spectra
+!> \param section section to create
+! **************************************************************************************************
+   SUBROUTINE create_ecd_section(section)
+      TYPE(section_type), POINTER                        :: section
+
+      TYPE(keyword_type), POINTER                        :: keyword
+
+      CPASSERT(.NOT. ASSOCIATED(section))
+      CALL section_create(section, __LOCATION__, name="ECD", &
+                          description="Parameters needed to set up electronic circular dichroism spectra.", &
+                          n_keywords=4, n_subsections=0, repeats=.FALSE.)
+
+      NULLIFY (keyword)
+      CALL keyword_create(keyword, __LOCATION__, name="DO_ECD", &
+                          description="Controls the activation of the electronic circular dichroism calculation.", &
+                          usage="DO_ECD T", type_of_var=logical_t, &
+                          default_l_val=.FALSE., lone_keyword_l_val=.TRUE.)
+      CALL section_add_keyword(section, keyword)
+      CALL keyword_release(keyword)
+
+      CALL keyword_create(keyword, __LOCATION__, name="PSEUDOPOTENTIAL_COMMUTATOR", &
+                          description="Controls the GTH non-local contribution to the molecular magnetic operator.", &
+                          usage="PSEUDOPOTENTIAL_COMMUTATOR {logical}", &
+                          type_of_var=logical_t, default_l_val=.TRUE., lone_keyword_l_val=.TRUE.)
+      CALL section_add_keyword(section, keyword)
+      CALL keyword_release(keyword)
+
+      CALL keyword_create(keyword, __LOCATION__, name="REFERENCE", &
+                          description="Reference point used consistently by molecular ECD operators.", &
+                          usage="REFERENCE COAC", &
+                          enum_c_vals=s2a("COM", "COAC", "USER_DEFINED", "ZERO"), &
+                          enum_desc=s2a("Use Center of Mass", &
+                                        "Use Center of Atomic Charges", &
+                                        "Use User-defined Point (Keyword: REF_POINT)", &
+                                        "Use Origin of Coordinate System"), &
+                          enum_i_vals=[use_mom_ref_com, use_mom_ref_coac, &
+                                       use_mom_ref_user, use_mom_ref_zero], &
+                          default_i_val=use_mom_ref_coac)
+      CALL section_add_keyword(section, keyword)
+      CALL keyword_release(keyword)
+
+      CALL keyword_create(keyword, __LOCATION__, name="REF_POINT", &
+                          description="User-defined molecular ECD reference point.", &
+                          usage="REF_POINT x y z", repeats=.FALSE., n_var=3, &
+                          type_of_var=real_t, unit_str="angstrom")
+      CALL section_add_keyword(section, keyword)
+      CALL keyword_release(keyword)
+
+   END SUBROUTINE create_ecd_section
 
 ! **************************************************************************************************
 !> \brief creates the stda input section (simplified Tamm Dancoff Approximation)

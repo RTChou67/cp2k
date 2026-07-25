@@ -43,6 +43,7 @@ MODULE qs_energy_utils
    USE qs_core_matrices,                ONLY: core_matrices
    USE qs_dispersion_types,             ONLY: qs_dispersion_type
    USE qs_energy_types,                 ONLY: qs_energy_type
+   USE qs_ecd_methods,                  ONLY: ecd_spectra
    USE qs_environment_types,            ONLY: get_qs_env,&
                                               qs_environment_type
    USE qs_integrate_potential,          ONLY: integrate_v_core_rspace,&
@@ -201,6 +202,9 @@ CONTAINS
       IF (dft_control%tddfpt2_control%enabled) THEN
          CALL tddfpt(qs_env, calc_forces)
       END IF
+
+      ! Electronic circular dichroism spectra.
+      CALL ecd_spectra(qs_env)
 
       ! stand-alone RIXS, does not depend on previous xas_tdp and/or tddfpt2 calculations
       IF (qs_env%do_rixs) CALL rixs(qs_env)

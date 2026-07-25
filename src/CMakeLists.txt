@@ -573,6 +573,7 @@ list(
   qs_dispersion_cnum.F
   qs_dos.F
   qs_dos_utils.F
+  qs_ecd_methods.F
   qs_efield_berry.F
   qs_efield_local.F
   qs_elec_field.F
