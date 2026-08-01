@@ -12,6 +12,8 @@ MODULE qs_ecd_methods
    USE cell_types, ONLY: cell_type, &
                          use_perd_none
    USE commutator_rpnl, ONLY: build_com_mom_nl
+   USE cp_files, ONLY: close_file, &
+                       open_file
    USE cp_control_types, ONLY: dft_control_type
    USE cp_dbcsr_api, ONLY: dbcsr_add, &
                            dbcsr_create, &
@@ -25,14 +27,14 @@ MODULE qs_ecd_methods
                                   dbcsr_allocate_matrix_set, &
                                   dbcsr_deallocate_matrix_set
    USE cp_fm_basic_linalg, ONLY: cp_fm_trace
-   USE cp_fm_struct, ONLY: cp_fm_struct_create, &
-                           cp_fm_struct_type
+   USE cp_fm_struct, ONLY: cp_fm_struct_type
    USE cp_fm_types, ONLY: cp_fm_create, &
                           cp_fm_get_element, &
                           cp_fm_get_info, &
                           cp_fm_release, &
                           cp_fm_type
    USE cp_log_handling, ONLY: cp_get_default_logger, &
+                              cp_logger_generate_filename, &
                               cp_logger_get_default_io_unit, &
                               cp_logger_type
    USE input_section_types, ONLY: section_vals_get, &
@@ -43,12 +45,14 @@ MODULE qs_ecd_methods
                               tddfpt_kernel_full, &
                               tddfpt_kernel_none, &
                               use_mom_ref_user
-   USE kinds, ONLY: dp
+   USE kinds, ONLY: default_path_length, &
+                    dp
    USE moments_utils, ONLY: get_reference_point
-   USE parallel_gemm_api, ONLY: parallel_gemm
    USE physcon, ONLY: evolt
+   USE qs_ecd_operator_utils, ONLY: ecd_project_operator_to_mo
    USE qs_environment_types, ONLY: get_qs_env, &
                                    qs_environment_type
+   USE qs_ecd_spectra_xyz, ONLY: ecd_spectra_xyz
    USE qs_kind_types, ONLY: qs_kind_type
    USE qs_mo_types, ONLY: get_mo_set, &
                           mo_set_type
@@ -68,78 +72,195 @@ MODULE qs_ecd_methods
    CHARACTER(len=*), PARAMETER, PRIVATE :: moduleN = 'qs_ecd_methods'
    INTEGER, PARAMETER, PRIVATE          :: ncart = 3
 
-   PUBLIC :: ecd_spectra
+   PUBLIC :: ecd_post_scf, ecd_tddfpt
 
 CONTAINS
 
 ! **************************************************************************************************
-!> \brief Assemble molecular ECD sticks from direct transitions or TDDFPT response amplitudes.
-!> \param qs_env Quickstep environment
+!> \brief Dispatch direct post-SCF ECD according to the cell boundary condition.
 ! **************************************************************************************************
-   SUBROUTINE ecd_spectra(qs_env, evects, evals, gs_mos, tddfpt_kernel, mult, do_soc, spinflip)
+   SUBROUTINE ecd_post_scf(qs_env)
       TYPE(qs_environment_type), POINTER                 :: qs_env
-      TYPE(cp_fm_type), DIMENSION(:, :), OPTIONAL, INTENT(IN) :: evects
-      REAL(KIND=dp), DIMENSION(:), OPTIONAL, INTENT(IN)  :: evals
-      TYPE(tddfpt_ground_state_mos), DIMENSION(:), POINTER, OPTIONAL :: gs_mos
-      INTEGER, OPTIONAL, INTENT(IN)                      :: mult, spinflip, tddfpt_kernel
-      LOGICAL, OPTIONAL, INTENT(IN)                      :: do_soc
 
-      CHARACTER(LEN=*), PARAMETER                        :: routineN = 'ecd_spectra'
+      CHARACTER(LEN=*), PARAMETER                        :: routineN = 'ecd_post_scf'
 
-      INTEGER                                            :: handle, homo, idir, iocc, ispin, istate, itrans, ivirt, &
-                                                            nao, nactive, nmo, nspins, nstates, ntrans_total, reference
-      LOGICAL                                            :: do_ecd, do_hfx, pseudopotential_commutator, tddfpt_enabled, &
-                                                            use_direct_transitions
-      LOGICAL                                            :: ref_point_explicit
-      REAL(KIND=dp), DIMENSION(ncart)                    :: reference_point
-      REAL(KIND=dp), DIMENSION(ncart)                    :: transition_magnetic, transition_position
-      REAL(KIND=dp)                                      :: transition_weight
-      INTEGER, ALLOCATABLE, DIMENSION(:)                 :: transition_order
-      REAL(KIND=dp), DIMENSION(:, :, :), ALLOCATABLE     :: magnetic_spin, position_spin
-      REAL(KIND=dp), DIMENSION(:), ALLOCATABLE           :: rotatory_strength, transition_energy
-      REAL(KIND=dp), DIMENSION(:), POINTER               :: eigenvalues, occupation_numbers
-      REAL(KIND=dp), DIMENSION(:), POINTER               :: ref_point
-      TYPE(cp_fm_type), ALLOCATABLE, DIMENSION(:, :)     :: magnetic_active_action, position_active_action
-      TYPE(cp_fm_type), DIMENSION(ncart)                 :: magnetic_mo, position_mo
-      TYPE(cp_fm_type), POINTER                          :: mo_coeff
-      TYPE(dbcsr_p_type), DIMENSION(:), POINTER          :: magnetic_ao, position_ao
-      TYPE(mo_set_type), DIMENSION(:), POINTER           :: mos
-      TYPE(scf_control_type), POINTER                    :: scf_control
-      TYPE(section_vals_type), POINTER                   :: ecd_section, hfx_section, tddfpt_section
+      INTEGER                                            :: handle, poisson_periodic, spinflip, tddfpt_kernel
+      LOGICAL                                            :: do_ecd, do_hfx, do_kpoints, do_soc, pseudopotential_commutator, &
+                                                            tddfpt_enabled
+      TYPE(cell_type), POINTER                           :: cell
+      TYPE(section_vals_type), POINTER                   :: ecd_section, hfx_section, poisson_section, soc_section, &
+                                                            tddfpt_section
 
       CALL timeset(routineN, handle)
 
-      NULLIFY (ecd_section, eigenvalues, hfx_section, magnetic_ao, mo_coeff, mos, occupation_numbers, &
-               position_ao, ref_point, scf_control, tddfpt_section)
+      NULLIFY (cell, ecd_section, hfx_section, poisson_section, soc_section, tddfpt_section)
       ecd_section => section_vals_get_subs_vals(qs_env%input, "PROPERTIES%ECD")
-
       CALL section_vals_val_get(ecd_section, "DO_ECD", l_val=do_ecd)
       IF (.NOT. do_ecd) THEN
          CALL timestop(handle)
          RETURN
       END IF
+      hfx_section => section_vals_get_subs_vals(qs_env%input, "DFT%XC%HF")
+      CALL section_vals_get(hfx_section, explicit=do_hfx)
+      IF (do_hfx) THEN
+         CPABORT("ECD| Current ECD implementation does not support HFX")
+      END IF
+
+      CALL get_qs_env(qs_env, cell=cell, do_kpoints=do_kpoints)
+      CPASSERT(ASSOCIATED(cell))
+      IF (ALL(cell%perd == 0)) THEN
+         poisson_section => section_vals_get_subs_vals(qs_env%input, "DFT%POISSON")
+         CALL section_vals_val_get(poisson_section, "PERIODIC", i_val=poisson_periodic)
+         IF (poisson_periodic /= use_perd_none) THEN
+            CPABORT("ECD| PERIODIC NONE ECD requires POISSON%PERIODIC NONE")
+         END IF
+         IF (do_kpoints) THEN
+            CPABORT("ECD| PERIODIC NONE ECD requires a Gamma-only SCF layout")
+         END IF
+      ELSEIF (ALL(cell%perd == 1)) THEN
+         CALL section_vals_val_get(ecd_section, "PSEUDOPOTENTIAL_COMMUTATOR", &
+                                   l_val=pseudopotential_commutator)
+         IF (do_kpoints) THEN
+            CPABORT("ECD| PERIODIC XYZ ECD currently requires an implicit Gamma SCF layout")
+         END IF
+      ELSE
+         CPABORT("ECD| Current implementation requires CELL%PERIODIC NONE or XYZ")
+      END IF
+
+      tddfpt_section => section_vals_get_subs_vals(qs_env%input, "PROPERTIES%TDDFPT")
+      CALL section_vals_get(tddfpt_section, explicit=tddfpt_enabled)
+      IF (tddfpt_enabled) THEN
+         CALL section_vals_val_get(tddfpt_section, "KERNEL", i_val=tddfpt_kernel)
+         CALL section_vals_val_get(tddfpt_section, "SPINFLIP", i_val=spinflip)
+         soc_section => section_vals_get_subs_vals(tddfpt_section, "SOC")
+         CALL section_vals_get(soc_section, explicit=do_soc)
+         IF (do_soc) CPABORT("ECD| TDDFPT ECD does not support TDDFPT SOC")
+         IF (spinflip /= no_sf_tddfpt) CPABORT("ECD| TDDFPT ECD does not support spin-flip TDDFPT")
+         IF (tddfpt_kernel /= tddfpt_kernel_full .AND. tddfpt_kernel /= tddfpt_kernel_none) THEN
+            CPABORT("ECD| TDDFPT ECD supports TDDFPT KERNEL FULL and KERNEL NONE")
+         END IF
+         IF (ALL(cell%perd == 1) .AND. tddfpt_kernel == tddfpt_kernel_full) THEN
+            CPABORT("ECD| PERIODIC XYZ ECD currently supports independent-particle transitions only")
+         END IF
+         CALL timestop(handle)
+         RETURN
+      END IF
+
+      IF (ALL(cell%perd == 0)) THEN
+         CALL ecd_spectra_none(qs_env)
+      ELSE
+         CALL ecd_spectra_xyz(qs_env, pseudopotential_commutator)
+      END IF
+
+      CALL timestop(handle)
+
+   END SUBROUTINE ecd_post_scf
+
+! **************************************************************************************************
+!> \brief Dispatch ECD while TDDFPT response data are available.
+! **************************************************************************************************
+   SUBROUTINE ecd_tddfpt(qs_env, evects, evals, gs_mos, tddfpt_kernel, mult)
+      TYPE(qs_environment_type), POINTER                 :: qs_env
+      TYPE(cp_fm_type), DIMENSION(:, :), INTENT(IN)      :: evects
+      REAL(KIND=dp), DIMENSION(:), INTENT(IN)            :: evals
+      TYPE(tddfpt_ground_state_mos), DIMENSION(:), POINTER, INTENT(IN) :: gs_mos
+      INTEGER, INTENT(IN)                                :: mult, tddfpt_kernel
+
+      CHARACTER(LEN=*), PARAMETER                        :: routineN = 'ecd_tddfpt'
+
+      INTEGER                                            :: handle
+      LOGICAL                                            :: do_ecd, pseudopotential_commutator
+      TYPE(cell_type), POINTER                           :: cell
+      TYPE(section_vals_type), POINTER                   :: ecd_section
+
+      CALL timeset(routineN, handle)
+
+      NULLIFY (cell, ecd_section)
+      ecd_section => section_vals_get_subs_vals(qs_env%input, "PROPERTIES%ECD")
+      CALL section_vals_val_get(ecd_section, "DO_ECD", l_val=do_ecd)
+      IF (.NOT. do_ecd) THEN
+         CALL timestop(handle)
+         RETURN
+      END IF
+      CALL get_qs_env(qs_env, cell=cell)
+      CPASSERT(ASSOCIATED(cell))
+      IF (ALL(cell%perd == 0)) THEN
+         IF (tddfpt_kernel == tddfpt_kernel_full) THEN
+            CALL ecd_spectra_none(qs_env, evects, evals, gs_mos, tddfpt_kernel, mult)
+         ELSE
+            CALL ecd_spectra_none(qs_env)
+         END IF
+      ELSEIF (ALL(cell%perd == 1)) THEN
+         IF (tddfpt_kernel == tddfpt_kernel_full) CPABORT("ECD| PERIODIC XYZ TDDFPT ECD is unsupported")
+         CALL section_vals_val_get(ecd_section, "PSEUDOPOTENTIAL_COMMUTATOR", &
+                                   l_val=pseudopotential_commutator)
+         CALL ecd_spectra_xyz(qs_env, pseudopotential_commutator)
+      ELSE
+         CPABORT("ECD| Current implementation requires CELL%PERIODIC NONE or XYZ")
+      END IF
+
+      CALL timestop(handle)
+
+   END SUBROUTINE ecd_tddfpt
+
+! **************************************************************************************************
+!> \brief Assemble PERIODIC NONE ECD sticks from direct or TDDFPT transition data.
+!> \param qs_env Quickstep environment
+! **************************************************************************************************
+   SUBROUTINE ecd_spectra_none(qs_env, evects, evals, gs_mos, tddfpt_kernel, mult)
+      TYPE(qs_environment_type), POINTER                 :: qs_env
+      TYPE(cp_fm_type), DIMENSION(:, :), OPTIONAL, INTENT(IN) :: evects
+      REAL(KIND=dp), DIMENSION(:), OPTIONAL, INTENT(IN)  :: evals
+      TYPE(tddfpt_ground_state_mos), DIMENSION(:), POINTER, OPTIONAL :: gs_mos
+      INTEGER, OPTIONAL, INTENT(IN)                      :: mult, tddfpt_kernel
+
+      CHARACTER(LEN=*), PARAMETER                        :: routineN = 'ecd_spectra_none'
+
+      INTEGER                                            :: e1_unit, handle, homo, idir, iocc, iounit, ispin, istate, &
+                                                            itrans, ivirt, m1_unit, nao, nactive, nmo, nspins, nstates, &
+                                                            ntrans_total, output_index, reference
+      CHARACTER(LEN=default_path_length)                 :: e1_filename, m1_filename
+      LOGICAL                                            :: pseudopotential_commutator, use_direct_transitions
+      LOGICAL                                            :: ref_point_explicit, write_transition_matrices
+      REAL(KIND=dp), DIMENSION(ncart)                    :: reference_point
+      REAL(KIND=dp), DIMENSION(ncart)                    :: transition_magnetic, transition_position
+      INTEGER, ALLOCATABLE, DIMENSION(:)                 :: transition_occupied, transition_order, transition_spin, &
+                                                            transition_virtual
+      REAL(KIND=dp), DIMENSION(:, :, :), ALLOCATABLE     :: magnetic_spin, position_spin
+      REAL(KIND=dp), DIMENSION(:, :), ALLOCATABLE        :: transition_magnetic_all, transition_position_all
+      REAL(KIND=dp), DIMENSION(:), ALLOCATABLE           :: rotatory_strength, transition_energy, transition_weight_all
+      REAL(KIND=dp), DIMENSION(:), POINTER               :: eigenvalues, occupation_numbers
+      REAL(KIND=dp), DIMENSION(:), POINTER               :: ref_point
+      TYPE(cp_fm_type), ALLOCATABLE, DIMENSION(:, :)     :: magnetic_active_action, position_active_action
+      TYPE(cp_fm_type), DIMENSION(ncart)                 :: magnetic_mo, position_mo
+      TYPE(cp_fm_struct_type), POINTER                   :: fm_struct
+      TYPE(cp_fm_type), POINTER                          :: mo_coeff
+      TYPE(dbcsr_p_type), DIMENSION(:), POINTER          :: magnetic_ao, position_ao
+      TYPE(cp_logger_type), POINTER                      :: logger
+      TYPE(mo_set_type), DIMENSION(:), POINTER           :: mos
+      TYPE(scf_control_type), POINTER                    :: scf_control
+      TYPE(section_vals_type), POINTER                   :: ecd_section
+
+      CALL timeset(routineN, handle)
+
+      NULLIFY (ecd_section, eigenvalues, fm_struct, logger, magnetic_ao, mo_coeff, mos, occupation_numbers, &
+               position_ao, ref_point, scf_control)
+      ecd_section => section_vals_get_subs_vals(qs_env%input, "PROPERTIES%ECD")
 
       use_direct_transitions = .TRUE.
       IF (PRESENT(evects)) THEN
-         IF (.NOT. (PRESENT(evals) .AND. PRESENT(gs_mos) .AND. PRESENT(tddfpt_kernel) .AND. &
-                    PRESENT(mult) .AND. PRESENT(do_soc) .AND. PRESENT(spinflip))) THEN
-            CPABORT("ECD| TDDFPT callback requires complete response data")
+         IF (.NOT. (PRESENT(evals) .AND. PRESENT(gs_mos) .AND. PRESENT(tddfpt_kernel) .AND. PRESENT(mult))) THEN
+            CPABORT("ECD| PERIODIC NONE TDDFPT ECD requires complete response data")
          END IF
-         IF (do_soc) CPABORT("ECD| TDDFPT ECD does not support TDDFPT SOC")
-         IF (spinflip /= no_sf_tddfpt) CPABORT("ECD| TDDFPT ECD does not support spin-flip TDDFPT")
-         ! FULL supplies coupled response amplitudes; NONE uses direct occupied-virtual transitions.
-         SELECT CASE (tddfpt_kernel)
-         CASE (tddfpt_kernel_full)
-            use_direct_transitions = .FALSE.
-         CASE (tddfpt_kernel_none)
-            use_direct_transitions = .TRUE.
-         CASE DEFAULT
-            CPABORT("ECD| TDDFPT ECD supports TDDFPT KERNEL FULL and KERNEL NONE")
-         END SELECT
+         IF (tddfpt_kernel /= tddfpt_kernel_full) THEN
+            CPABORT("ECD| PERIODIC NONE response ECD requires TDDFPT KERNEL FULL")
+         END IF
+         use_direct_transitions = .FALSE.
       END IF
 
       CALL section_vals_val_get(ecd_section, "PSEUDOPOTENTIAL_COMMUTATOR", &
                                 l_val=pseudopotential_commutator)
+
       CALL section_vals_val_get(ecd_section, "REFERENCE", i_val=reference)
       CALL section_vals_val_get(ecd_section, "REF_POINT", explicit=ref_point_explicit)
       IF (ref_point_explicit) THEN
@@ -160,24 +281,8 @@ CONTAINS
          CALL get_reference_point(reference_point, qs_env=qs_env, reference=reference)
       END IF
 
-      CALL ecd_require_nonperiodic(qs_env)
-
-      hfx_section => section_vals_get_subs_vals(qs_env%input, "DFT%XC%HF")
-      CALL section_vals_get(hfx_section, explicit=do_hfx)
-      IF (do_hfx) THEN
-         CPABORT("ECD| Molecular ECD currently does not support HFX")
-      END IF
-
-      tddfpt_section => section_vals_get_subs_vals(qs_env%input, "PROPERTIES%TDDFPT")
-      CALL section_vals_get(tddfpt_section, explicit=tddfpt_enabled)
-      ! The TDDFPT callback emits ECD while its response data are available.
-      IF (.NOT. PRESENT(evects) .AND. tddfpt_enabled) THEN
-         CALL timestop(handle)
-         RETURN
-      END IF
-
       IF (use_direct_transitions) THEN
-         ! IPA and TDDFPT KERNEL NONE use individual occupied-virtual transitions.
+         ! Direct occupied-virtual transitions are assembled independently.
          CALL get_qs_env(qs_env, mos=mos, scf_control=scf_control)
          CPASSERT(ASSOCIATED(mos))
          CPASSERT(ASSOCIATED(scf_control))
@@ -193,7 +298,30 @@ CONTAINS
          END DO
          IF (ntrans_total <= 0) CPABORT("ECD| No independent-particle transitions available")
 
-         ALLOCATE (transition_order(ntrans_total), transition_energy(ntrans_total), rotatory_strength(ntrans_total))
+         ALLOCATE (transition_magnetic_all(ncart, ntrans_total), transition_position_all(ncart, ntrans_total), &
+                   transition_occupied(ntrans_total), transition_order(ntrans_total), transition_spin(ntrans_total), &
+                   transition_energy(ntrans_total), transition_virtual(ntrans_total), rotatory_strength(ntrans_total), &
+                   transition_weight_all(ntrans_total))
+         logger => cp_get_default_logger()
+         iounit = cp_logger_get_default_io_unit(logger)
+         CALL cp_logger_generate_filename(logger, e1_filename, logger%iter_info%project_name, &
+                                          "-ecd-e1-transition-matrix.dat", local=.FALSE.)
+         CALL cp_logger_generate_filename(logger, m1_filename, logger%iter_info%project_name, &
+                                          "-ecd-m1-transition-matrix.dat", local=.FALSE.)
+         write_transition_matrices = logger%para_env%is_source()
+         IF (write_transition_matrices) THEN
+            CALL open_file(e1_filename, file_status="UNKNOWN", file_action="WRITE", unit_number=e1_unit)
+            WRITE (e1_unit, '(A)') "# PERIODIC NONE E1 transition current and hypervirial dipole"
+            WRITE (e1_unit, '(A)') "# branch is zero for direct molecular transitions"
+            WRITE (e1_unit, '(A)') "# current = -gap*r; dipole = -r"
+            WRITE (e1_unit, '(A)') "# transition energy_eV spin occupied virtual branch component "// &
+                                   "current_real current_imag dipole_real dipole_imag occupation_difference"
+            CALL open_file(m1_filename, file_status="UNKNOWN", file_action="WRITE", unit_number=m1_unit)
+            WRITE (m1_unit, '(A)') "# PERIODIC NONE M1 transition angular and magnetic-dipole vertices"
+            WRITE (m1_unit, '(A)') "# lambda is the complete local plus GTH angular matrix; magnetic = i lambda/2"
+            WRITE (m1_unit, '(A)') "# transition energy_eV spin occupied virtual component "// &
+                                   "lambda_real lambda_imag magnetic_real magnetic_imag occupation_difference"
+         END IF
          itrans = 0
          DO ispin = 1, nspins
             CALL get_mo_set(mos(ispin), eigenvalues=eigenvalues, homo=homo, mo_coeff=mo_coeff, nao=nao, &
@@ -214,16 +342,23 @@ CONTAINS
                   itrans = itrans + 1
                   transition_energy(itrans) = eigenvalues(ivirt) - eigenvalues(iocc)
                   IF (transition_energy(itrans) <= 0.0_dp) CPABORT("ECD| IPA requires positive occupied-virtual gaps")
-                  transition_weight = occupation_numbers(iocc) - occupation_numbers(ivirt)
-                  IF (transition_weight <= 0.0_dp) THEN
+                  transition_weight_all(itrans) = occupation_numbers(iocc) - occupation_numbers(ivirt)
+                  IF (transition_weight_all(itrans) <= 0.0_dp) THEN
                      CPABORT("ECD| IPA requires a positive occupied-virtual occupation difference")
                   END IF
+                  transition_occupied(itrans) = iocc
+                  transition_spin(itrans) = ispin
+                  transition_virtual(itrans) = ivirt
                   DO idir = 1, ncart
-                     CALL cp_fm_get_element(position_mo(idir), ivirt, iocc, transition_position(idir))
-                     CALL cp_fm_get_element(magnetic_mo(idir), ivirt, iocc, transition_magnetic(idir))
+                     CALL cp_fm_get_element(position_mo(idir), ivirt, iocc, &
+                                             transition_position_all(idir, itrans))
+                     CALL cp_fm_get_element(magnetic_mo(idir), ivirt, iocc, &
+                                             transition_magnetic_all(idir, itrans))
                   END DO
-                  CALL ecd_transition_quantities(transition_position, transition_magnetic, transition_weight, &
-                                                 rotatory_strength(itrans))
+                  ! For real Gamma-point orbitals without SOC,
+                  ! R_ia = -w_ia*sum_lambda(r_lambda,ai*Lambda_lambda,ai)/2.
+                  rotatory_strength(itrans) = -0.5_dp*transition_weight_all(itrans)* &
+                                               SUM(transition_position_all(:, itrans)*transition_magnetic_all(:, itrans))
                END DO
             END DO
             DO idir = 1, ncart
@@ -233,9 +368,37 @@ CONTAINS
             CALL dbcsr_deallocate_matrix_set(magnetic_ao)
             CALL dbcsr_deallocate_matrix_set(position_ao)
          END DO
+         IF (iounit > 0) THEN
+            WRITE (iounit, '(/,T2,A)') "ECD| PERIODIC NONE E1 transition matrix written to "//TRIM(e1_filename)
+            WRITE (iounit, '(T2,A)') "ECD| PERIODIC NONE M1 transition matrix written to "//TRIM(m1_filename)
+         END IF
          CALL sort(transition_energy, ntrans_total, transition_order)
+         IF (write_transition_matrices) THEN
+            WRITE (e1_unit, '(A)') "# records are ordered by increasing excitation energy"
+            WRITE (m1_unit, '(A)') "# records are ordered by increasing excitation energy"
+            DO output_index = 1, ntrans_total
+               itrans = transition_order(output_index)
+               DO idir = 1, ncart
+                  WRITE (e1_unit, '(I0,1X,ES24.15E3,5(1X,I0),5(1X,ES24.15E3))') &
+                     output_index, transition_energy(output_index)*evolt, transition_spin(itrans), &
+                     transition_occupied(itrans), transition_virtual(itrans), 0, idir, &
+                     -transition_energy(output_index)*transition_position_all(idir, itrans), 0.0_dp, &
+                     -transition_position_all(idir, itrans), 0.0_dp, &
+                     transition_weight_all(itrans)
+                  WRITE (m1_unit, '(I0,1X,ES24.15E3,4(1X,I0),5(1X,ES24.15E3))') &
+                     output_index, transition_energy(output_index)*evolt, transition_spin(itrans), &
+                     transition_occupied(itrans), transition_virtual(itrans), idir, &
+                     transition_magnetic_all(idir, itrans), 0.0_dp, 0.0_dp, &
+                     0.5_dp*transition_magnetic_all(idir, itrans), &
+                     transition_weight_all(itrans)
+               END DO
+            END DO
+            CALL close_file(e1_unit)
+            CALL close_file(m1_unit)
+         END IF
          CALL ecd_print_sticks(transition_energy, rotatory_strength, transition_order)
-         DEALLOCATE (transition_order, rotatory_strength, transition_energy)
+         DEALLOCATE (transition_magnetic_all, transition_occupied, transition_order, transition_position_all, &
+                     transition_spin, transition_energy, transition_virtual, rotatory_strength, transition_weight_all)
       ELSE
          ! TDDFPT KERNEL FULL contracts the coupled response amplitudes with the operator actions.
          nspins = SIZE(gs_mos)
@@ -249,8 +412,24 @@ CONTAINS
          IF (nspins > 2) CPABORT("ECD| TDDFPT ECD supports at most two spin channels")
 
          ALLOCATE (position_active_action(ncart, nspins), magnetic_active_action(ncart, nspins))
-         CALL ecd_build_tddfpt_operator_actions(qs_env, gs_mos, pseudopotential_commutator, reference_point, &
-                                                position_active_action, magnetic_active_action)
+         CALL ecd_build_molecular_operators_ao_none(qs_env, pseudopotential_commutator, reference_point, &
+                                                    position_ao, magnetic_ao)
+         DO ispin = 1, nspins
+            CPASSERT(ASSOCIATED(gs_mos(ispin)%mos_active))
+            NULLIFY (fm_struct)
+            CALL cp_fm_get_info(gs_mos(ispin)%mos_active, matrix_struct=fm_struct, ncol_global=nactive)
+            DO idir = 1, ncart
+               CALL cp_fm_create(position_active_action(idir, ispin), fm_struct)
+               CALL cp_fm_create(magnetic_active_action(idir, ispin), fm_struct)
+               CALL cp_dbcsr_sm_fm_multiply(position_ao(idir)%matrix, gs_mos(ispin)%mos_active, &
+                                             position_active_action(idir, ispin), ncol=nactive, alpha=1.0_dp, beta=0.0_dp)
+               CALL cp_dbcsr_sm_fm_multiply(magnetic_ao(idir)%matrix, gs_mos(ispin)%mos_active, &
+                                             magnetic_active_action(idir, ispin), ncol=nactive, alpha=1.0_dp, beta=0.0_dp)
+            END DO
+         END DO
+         NULLIFY (fm_struct)
+         CALL dbcsr_deallocate_matrix_set(magnetic_ao)
+         CALL dbcsr_deallocate_matrix_set(position_ao)
          ALLOCATE (position_spin(nstates, ncart, nspins), magnetic_spin(nstates, ncart, nspins))
          position_spin = 0.0_dp
          magnetic_spin = 0.0_dp
@@ -276,8 +455,9 @@ CONTAINS
                transition_position = position_spin(istate, :, 1) + position_spin(istate, :, 2)
                transition_magnetic = magnetic_spin(istate, :, 1) + magnetic_spin(istate, :, 2)
             END IF
-            CALL ecd_transition_quantities(transition_position, transition_magnetic, 1.0_dp, &
-                                           rotatory_strength(istate))
+            ! TDDFPT amplitudes already provide the state transition moments, so w=1.
+            ! The same real-orbital reduction gives R = -sum_lambda(r_lambda*Lambda_lambda)/2.
+            rotatory_strength(istate) = -0.5_dp*SUM(transition_position*transition_magnetic)
          END DO
          CALL ecd_print_sticks(evals, rotatory_strength)
 
@@ -292,90 +472,7 @@ CONTAINS
 
       CALL timestop(handle)
 
-   END SUBROUTINE ecd_spectra
-
-! **************************************************************************************************
-!> \brief Enforce the currently supported non-periodic ECD calculation domain.
-!> \param qs_env Quickstep environment
-! **************************************************************************************************
-   SUBROUTINE ecd_require_nonperiodic(qs_env)
-      TYPE(qs_environment_type), POINTER                 :: qs_env
-
-      CHARACTER(LEN=*), PARAMETER                        :: routineN = 'ecd_require_nonperiodic'
-
-      INTEGER                                            :: handle, poisson_periodic
-      LOGICAL                                            :: do_kpoints
-      TYPE(cell_type), POINTER                           :: cell
-      TYPE(section_vals_type), POINTER                   :: input, poisson_section
-
-      CALL timeset(routineN, handle)
-
-      NULLIFY (cell, input, poisson_section)
-      CALL get_qs_env(qs_env, cell=cell, do_kpoints=do_kpoints, input=input)
-
-      CPASSERT(ASSOCIATED(cell))
-      CPASSERT(ASSOCIATED(input))
-
-      IF (ANY(cell%perd /= 0)) THEN
-         CPABORT("ECD| Current implementation supports only CELL%PERIODIC NONE")
-      END IF
-
-      poisson_section => section_vals_get_subs_vals(input, "DFT%POISSON")
-      CALL section_vals_val_get(poisson_section, "PERIODIC", i_val=poisson_periodic)
-      IF (poisson_periodic /= use_perd_none) THEN
-         CPABORT("ECD| Current implementation supports only POISSON%PERIODIC NONE")
-      END IF
-
-      IF (do_kpoints) THEN
-         CPABORT("ECD| Current implementation supports only Gamma-only PERIODIC NONE")
-      END IF
-
-      CALL timestop(handle)
-
-   END SUBROUTINE ecd_require_nonperiodic
-
-! **************************************************************************************************
-!> \brief Form direct AO operator actions on the active occupied TDDFPT ground-state orbitals.
-!> \param qs_env Quickstep environment
-!> \param gs_mos Ground-state active occupied MO data
-!> \param pseudopotential_commutator Include GTH non-local magnetic correction
-!> \param reference_point Common molecular reference point
-!> \param position_active_action Position operator actions X*C_active [direction, spin]
-!> \param magnetic_active_action Angular-momentum operator actions Lambda*C_active [direction, spin]
-! **************************************************************************************************
-   SUBROUTINE ecd_build_tddfpt_operator_actions(qs_env, gs_mos, pseudopotential_commutator, reference_point, &
-                                                position_active_action, magnetic_active_action)
-      TYPE(qs_environment_type), POINTER                 :: qs_env
-      TYPE(tddfpt_ground_state_mos), DIMENSION(:), &
-         POINTER                                         :: gs_mos
-      LOGICAL, INTENT(IN)                                :: pseudopotential_commutator
-      REAL(KIND=dp), DIMENSION(ncart), INTENT(IN)        :: reference_point
-      TYPE(cp_fm_type), DIMENSION(:, :), INTENT(INOUT)   :: magnetic_active_action, position_active_action
-
-      INTEGER                                            :: idir, ispin, nactive
-      TYPE(cp_fm_struct_type), POINTER                   :: fm_struct
-      TYPE(dbcsr_p_type), DIMENSION(:), POINTER          :: magnetic_ao, position_ao
-
-      NULLIFY (fm_struct, magnetic_ao, position_ao)
-      CALL ecd_build_molecular_operators_ao_none(qs_env, pseudopotential_commutator, reference_point, &
-                                                 position_ao, magnetic_ao)
-      DO ispin = 1, SIZE(gs_mos)
-         CPASSERT(ASSOCIATED(gs_mos(ispin)%mos_active))
-         CALL cp_fm_get_info(gs_mos(ispin)%mos_active, matrix_struct=fm_struct, ncol_global=nactive)
-         DO idir = 1, ncart
-            CALL cp_fm_create(position_active_action(idir, ispin), fm_struct)
-            CALL cp_fm_create(magnetic_active_action(idir, ispin), fm_struct)
-            CALL cp_dbcsr_sm_fm_multiply(position_ao(idir)%matrix, gs_mos(ispin)%mos_active, &
-                                         position_active_action(idir, ispin), ncol=nactive, alpha=1.0_dp, beta=0.0_dp)
-            CALL cp_dbcsr_sm_fm_multiply(magnetic_ao(idir)%matrix, gs_mos(ispin)%mos_active, &
-                                         magnetic_active_action(idir, ispin), ncol=nactive, alpha=1.0_dp, beta=0.0_dp)
-         END DO
-         NULLIFY (fm_struct)
-      END DO
-      CALL dbcsr_deallocate_matrix_set(magnetic_ao)
-      CALL dbcsr_deallocate_matrix_set(position_ao)
-
-   END SUBROUTINE ecd_build_tddfpt_operator_actions
+   END SUBROUTINE ecd_spectra_none
 
 ! **************************************************************************************************
 !> \brief Print molecular ECD excitation energies and rotatory strengths.
@@ -487,53 +584,5 @@ CONTAINS
       END IF
 
    END SUBROUTINE ecd_build_molecular_operators_ao_none
-
-! **************************************************************************************************
-!> \brief Project a sparse AO operator to the full MO space.
-!> \param operator_ao AO-space sparse operator
-!> \param mo_coeff MO coefficient matrix
-!> \param operator_mo Full MO-space operator
-! **************************************************************************************************
-   SUBROUTINE ecd_project_operator_to_mo(operator_ao, mo_coeff, operator_mo)
-      TYPE(dbcsr_p_type), INTENT(IN)                     :: operator_ao
-      TYPE(cp_fm_type), POINTER                          :: mo_coeff
-      TYPE(cp_fm_type), INTENT(INOUT)                    :: operator_mo
-
-      INTEGER                                            :: nao, nmo
-      TYPE(cp_fm_struct_type), POINTER                   :: coeff_struct
-      TYPE(cp_fm_type)                                   :: operator_coeff
-
-      NULLIFY (coeff_struct)
-
-      CALL cp_fm_get_info(mo_coeff, matrix_struct=coeff_struct, nrow_global=nao, ncol_global=nmo)
-      CALL cp_fm_create(operator_coeff, coeff_struct, name="ECD operator C")
-      CALL cp_fm_create(operator_mo, coeff_struct, nrow=nmo, ncol=nmo, name="ECD C^T operator C")
-
-      CALL cp_dbcsr_sm_fm_multiply(operator_ao%matrix, mo_coeff, operator_coeff, ncol=nmo, &
-                                   alpha=1.0_dp, beta=0.0_dp)
-      CALL parallel_gemm("T", "N", nmo, nmo, nao, 1.0_dp, mo_coeff, operator_coeff, &
-                         0.0_dp, operator_mo)
-
-      CALL cp_fm_release(operator_coeff)
-
-   END SUBROUTINE ecd_project_operator_to_mo
-
-! **************************************************************************************************
-!> \brief Assemble an isotropic ECD rotatory strength from Cartesian transition components.
-!> \param transition_position Position transition components
-!> \param transition_magnetic Angular-momentum transition components
-!> \param transition_weight Occupation or state weight
-!> \param rotatory_strength Isotropic rotatory strength
-! **************************************************************************************************
-   SUBROUTINE ecd_transition_quantities(transition_position, transition_magnetic, transition_weight, &
-                                        rotatory_strength)
-      REAL(KIND=dp), DIMENSION(ncart), INTENT(IN)        :: transition_position, transition_magnetic
-      REAL(KIND=dp), INTENT(IN)                          :: transition_weight
-      REAL(KIND=dp), INTENT(OUT)                         :: rotatory_strength
-
-      ! mu_ic = -r_ic and m_ci = i*Lambda_ci/2 for real molecular orbitals.
-      rotatory_strength = -0.5_dp*transition_weight*SUM(transition_position*transition_magnetic)
-
-   END SUBROUTINE ecd_transition_quantities
 
 END MODULE qs_ecd_methods

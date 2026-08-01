@@ -20,16 +20,25 @@ MODULE qs_operators_ao
    USE block_p_types,                   ONLY: block_p_type
    USE cell_types,                      ONLY: cell_type,&
                                               pbc
-   USE cp_dbcsr_api,                    ONLY: dbcsr_get_block_p,&
+   USE cp_dbcsr_api,                    ONLY: dbcsr_create,&
+                                              dbcsr_get_block_p,&
                                               dbcsr_get_matrix_type,&
                                               dbcsr_has_symmetry,&
                                               dbcsr_p_type,&
+                                              dbcsr_set,&
                                               dbcsr_type_antisymmetric,&
                                               dbcsr_type_no_symmetry
+   USE cp_dbcsr_cp2k_link,              ONLY: cp_dbcsr_alloc_block_from_nbl
+   USE cp_dbcsr_operations,             ONLY: dbcsr_allocate_matrix_set
    USE cp_log_handling,                 ONLY: cp_get_default_logger,&
                                               cp_logger_type
    USE kinds,                           ONLY: default_string_length,&
                                               dp
+   USE kpoint_methods,                  ONLY: kpoint_init_cell_index
+   USE kpoint_types,                    ONLY: get_kpoint_info,&
+                                              kpoint_create,&
+                                              kpoint_release,&
+                                              kpoint_type
    USE mathconstants,                   ONLY: pi
    USE message_passing,                 ONLY: mp_para_env_type
    USE orbital_pointers,                ONLY: coset,&
@@ -57,7 +66,7 @@ MODULE qs_operators_ao
 ! *** Public subroutines ***
 
    PUBLIC :: p_xyz_ao, rRc_xyz_ao, rRc_xyz_der_ao
-   PUBLIC :: build_lin_mom_matrix, build_ang_mom_matrix
+   PUBLIC :: build_lin_mom_matrix, build_lin_mom_matrix_rs_img, build_ang_mom_matrix
 
 CONTAINS
 
@@ -75,15 +84,95 @@ CONTAINS
       TYPE(qs_environment_type), POINTER                 :: qs_env
       TYPE(dbcsr_p_type), DIMENSION(:), POINTER          :: matrix
 
-      CHARACTER(len=*), PARAMETER :: routineN = 'build_lin_mom_matrix'
+      CALL build_lin_mom_matrix_core(qs_env, matrix=matrix)
 
-      INTEGER :: handle, i, iatom, icol, ikind, inode, irow, iset, jatom, jkind, jset, last_jatom, &
-         ldai, maxco, maxlgto, maxsgf, natom, ncoa, ncob, neighbor_list_id, nkind, nseta, nsetb, &
-         sgfa, sgfb
+   END SUBROUTINE build_lin_mom_matrix
+
+! **************************************************************************************************
+!> \brief Evaluate linear momentum integrals for every real-space image cell.
+!> \param qs_env Quickstep environment
+!> \param matrix_rs Image-resolved Cartesian momentum matrices
+!> \param cell_to_index_out Optional owned copy of the image-cell map
+! **************************************************************************************************
+   SUBROUTINE build_lin_mom_matrix_rs_img(qs_env, matrix_rs, cell_to_index_out)
+
+      TYPE(qs_environment_type), POINTER                 :: qs_env
+      TYPE(dbcsr_p_type), DIMENSION(:, :), POINTER       :: matrix_rs
+      INTEGER, DIMENSION(:, :, :), OPTIONAL, POINTER     :: cell_to_index_out
+
+      CHARACTER(len=*), PARAMETER :: routineN = 'build_lin_mom_matrix_rs_img'
+
+      INTEGER                                            :: handle, idir, iimage, nimages
+      INTEGER, DIMENSION(:, :, :), POINTER               :: cell_to_index
+      TYPE(dbcsr_p_type), DIMENSION(:, :), POINTER       :: matrix_ks_kp
+      TYPE(kpoint_type), POINTER                         :: kpoints_all
+      TYPE(mp_para_env_type), POINTER                    :: para_env
+      TYPE(neighbor_list_set_p_type), DIMENSION(:), &
+         POINTER                                         :: sab_all
+
+      CALL timeset(routineN, handle)
+
+      NULLIFY (matrix_ks_kp, para_env, sab_all, kpoints_all)
+      CALL get_qs_env(qs_env=qs_env, matrix_ks_kp=matrix_ks_kp, &
+                      para_env=para_env, sab_all=sab_all)
+
+      CALL kpoint_create(kpoints_all)
+      CALL kpoint_init_cell_index(kpoints_all, sab_all, para_env, nimages)
+      CALL get_kpoint_info(kpoints_all, cell_to_index=cell_to_index)
+      IF (PRESENT(cell_to_index_out)) THEN
+         ALLOCATE (cell_to_index_out(LBOUND(cell_to_index, 1):UBOUND(cell_to_index, 1), &
+                                     LBOUND(cell_to_index, 2):UBOUND(cell_to_index, 2), &
+                                     LBOUND(cell_to_index, 3):UBOUND(cell_to_index, 3)))
+         cell_to_index_out = cell_to_index
+      END IF
+
+      CALL dbcsr_allocate_matrix_set(matrix_rs, 3, nimages)
+      DO iimage = 1, nimages
+         DO idir = 1, 3
+            ALLOCATE (matrix_rs(idir, iimage)%matrix)
+            CALL dbcsr_create(matrix=matrix_rs(idir, iimage)%matrix, &
+                              template=matrix_ks_kp(1, 1)%matrix, &
+                              matrix_type=dbcsr_type_no_symmetry, &
+                              name="ECD LINEAR MOMENTUM")
+            CALL cp_dbcsr_alloc_block_from_nbl(matrix_rs(idir, iimage)%matrix, sab_all)
+            CALL dbcsr_set(matrix_rs(idir, iimage)%matrix, 0.0_dp)
+         END DO
+      END DO
+
+      CALL build_lin_mom_matrix_core(qs_env, matrix_rs=matrix_rs, cell_to_index=cell_to_index)
+      CALL kpoint_release(kpoints_all)
+
+      CALL timestop(handle)
+
+   END SUBROUTINE build_lin_mom_matrix_rs_img
+
+! **************************************************************************************************
+!> \brief Evaluate linear momentum integrals into folded or image-resolved DBCSR matrices.
+!> \param qs_env Quickstep environment
+!> \param matrix Folded Cartesian momentum matrices
+!> \param matrix_rs Image-resolved Cartesian momentum matrices
+!> \param cell_to_index Image-cell map used with matrix_rs
+! **************************************************************************************************
+   SUBROUTINE build_lin_mom_matrix_core(qs_env, matrix, matrix_rs, cell_to_index)
+
+      TYPE(qs_environment_type), POINTER                 :: qs_env
+      TYPE(dbcsr_p_type), DIMENSION(:), OPTIONAL, &
+         POINTER                                         :: matrix
+      TYPE(dbcsr_p_type), DIMENSION(:, :), OPTIONAL, &
+         POINTER                                         :: matrix_rs
+      INTEGER, DIMENSION(:, :, :), OPTIONAL, POINTER     :: cell_to_index
+
+      CHARACTER(len=*), PARAMETER :: routineN = 'build_lin_mom_matrix_core'
+
+      INTEGER :: handle, i, iatom, ic, icol, ikind, inode, irow, iset, jatom, jkind, jset, &
+         last_jatom, ldai, maxco, maxlgto, maxsgf, natom, ncoa, ncob, neighbor_list_id, nkind, &
+         nseta, nsetb, sgfa, sgfb
+      INTEGER, DIMENSION(3)                              :: image_cell
       INTEGER, DIMENSION(:), POINTER                     :: la_max, la_min, lb_max, lb_min, npgfa, &
                                                             npgfb, nsgfa, nsgfb
       INTEGER, DIMENSION(:, :), POINTER                  :: first_sgfa, first_sgfb
-      LOGICAL                                            :: do_symmetric, found, new_atom_b
+      LOGICAL                                            :: do_symmetric, found, new_atom_b, &
+                                                            output_rs
       REAL(KIND=dp)                                      :: dab, rab2
       REAL(KIND=dp), ALLOCATABLE, DIMENSION(:, :)        :: work
       REAL(KIND=dp), ALLOCATABLE, DIMENSION(:, :, :)     :: intab, rr_work
@@ -106,6 +195,17 @@ CONTAINS
 
       CALL timeset(routineN, handle)
 
+      output_rs = PRESENT(matrix_rs)
+      IF (PRESENT(matrix) .EQV. output_rs) THEN
+         CPABORT("build_lin_mom_matrix_core requires exactly one folded or image-resolved target")
+      END IF
+      IF (output_rs) THEN
+         IF (.NOT. PRESENT(cell_to_index)) THEN
+            CPABORT("build_lin_mom_matrix_core requires an image map for image-resolved targets")
+         END IF
+         CPASSERT(SIZE(matrix_rs, 1) == 3)
+      END IF
+
       NULLIFY (cell, sab_nl, qs_kind_set, particle_set, para_env)
       NULLIFY (logger)
 
@@ -122,7 +222,8 @@ CONTAINS
       natom = SIZE(particle_set)
 
       ! Take into account the symmetry of the input matrix
-      do_symmetric = dbcsr_has_symmetry(matrix(1)%matrix)
+      do_symmetric = .FALSE.
+      IF (.NOT. output_rs) do_symmetric = dbcsr_has_symmetry(matrix(1)%matrix)
       IF (do_symmetric) THEN
          CALL get_qs_env(qs_env=qs_env, sab_orb=sab_nl)
       ELSE
@@ -156,7 +257,7 @@ CONTAINS
       CALL neighbor_list_iterator_create(nl_iterator, sab_nl)
       DO WHILE (neighbor_list_iterate(nl_iterator) == 0)
          CALL get_iterator_info(nl_iterator, ikind=ikind, jkind=jkind, inode=inode, &
-                                iatom=iatom, jatom=jatom, r=rab)
+                                iatom=iatom, jatom=jatom, r=rab, cell=image_cell)
          basis_set_a => basis_set_list(ikind)%gto_basis_set
          IF (.NOT. ASSOCIATED(basis_set_a)) CYCLE
          basis_set_b => basis_set_list(jkind)%gto_basis_set
@@ -184,34 +285,46 @@ CONTAINS
          sphi_b => basis_set_b%sphi
          zetb => basis_set_b%zet
 
-         IF (inode == 1) last_jatom = 0
-         IF (jatom /= last_jatom) THEN
-            new_atom_b = .TRUE.
-            last_jatom = jatom
-         ELSE
-            new_atom_b = .FALSE.
-         END IF
-
-         IF (new_atom_b) THEN
-            IF (do_symmetric) THEN
-               IF (iatom <= jatom) THEN
-                  irow = iatom
-                  icol = jatom
-               ELSE
-                  irow = jatom
-                  icol = iatom
-               END IF
-            ELSE
-               irow = iatom
-               icol = jatom
-            END IF
-
+         IF (output_rs) THEN
+            irow = iatom
+            icol = jatom
+            ic = cell_to_index(image_cell(1), image_cell(2), image_cell(3))
             DO i = 1, 3
                NULLIFY (integral(i)%block)
-               CALL dbcsr_get_block_p(matrix=matrix(i)%matrix, &
+               CALL dbcsr_get_block_p(matrix=matrix_rs(i, ic)%matrix, &
                                       row=irow, col=icol, BLOCK=integral(i)%block, found=found)
-               CPASSERT(ASSOCIATED(INTEGRAL(i)%block))
+               CPASSERT(ASSOCIATED(integral(i)%block))
             END DO
+         ELSE
+            IF (inode == 1) last_jatom = 0
+            IF (jatom /= last_jatom) THEN
+               new_atom_b = .TRUE.
+               last_jatom = jatom
+            ELSE
+               new_atom_b = .FALSE.
+            END IF
+
+            IF (new_atom_b) THEN
+               IF (do_symmetric) THEN
+                  IF (iatom <= jatom) THEN
+                     irow = iatom
+                     icol = jatom
+                  ELSE
+                     irow = jatom
+                     icol = iatom
+                  END IF
+               ELSE
+                  irow = iatom
+                  icol = jatom
+               END IF
+
+               DO i = 1, 3
+                  NULLIFY (integral(i)%block)
+                  CALL dbcsr_get_block_p(matrix=matrix(i)%matrix, &
+                                         row=irow, col=icol, BLOCK=integral(i)%block, found=found)
+                  CPASSERT(ASSOCIATED(integral(i)%block))
+               END DO
+            END IF
          END IF
 
          rab2 = rab(1)*rab(1) + rab(2)*rab(2) + rab(3)*rab(3)
@@ -300,7 +413,7 @@ CONTAINS
 
       CALL timestop(handle)
 
-   END SUBROUTINE build_lin_mom_matrix
+   END SUBROUTINE build_lin_mom_matrix_core
 
 ! **************************************************************************************************
 !> \brief   Calculation of the primitive paramagnetic spin orbit integrals over
@@ -1638,4 +1751,3 @@ CONTAINS
    END SUBROUTINE rRc_xyz_der_ao
 
 END MODULE qs_operators_ao
-

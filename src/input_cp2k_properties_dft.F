@@ -2214,14 +2214,14 @@ CONTAINS
       CALL keyword_release(keyword)
 
       CALL keyword_create(keyword, __LOCATION__, name="PSEUDOPOTENTIAL_COMMUTATOR", &
-                          description="Controls the GTH non-local contribution to the molecular magnetic operator.", &
+                          description="Controls the GTH non-local contribution to the ECD electric and spatial vertices.", &
                           usage="PSEUDOPOTENTIAL_COMMUTATOR {logical}", &
                           type_of_var=logical_t, default_l_val=.TRUE., lone_keyword_l_val=.TRUE.)
       CALL section_add_keyword(section, keyword)
       CALL keyword_release(keyword)
 
       CALL keyword_create(keyword, __LOCATION__, name="REFERENCE", &
-                          description="Reference point used consistently by molecular ECD operators.", &
+                          description="Reference point used consistently by ECD operators.", &
                           usage="REFERENCE COAC", &
                           enum_c_vals=s2a("COM", "COAC", "USER_DEFINED", "ZERO"), &
                           enum_desc=s2a("Use Center of Mass", &
