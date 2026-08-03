@@ -2203,13 +2203,23 @@ CONTAINS
       CPASSERT(.NOT. ASSOCIATED(section))
       CALL section_create(section, __LOCATION__, name="ECD", &
                           description="Parameters needed to set up electronic circular dichroism spectra.", &
-                          n_keywords=4, n_subsections=0, repeats=.FALSE.)
+                          n_keywords=5, n_subsections=0, repeats=.FALSE.)
 
       NULLIFY (keyword)
       CALL keyword_create(keyword, __LOCATION__, name="DO_ECD", &
                           description="Controls the activation of the electronic circular dichroism calculation.", &
                           usage="DO_ECD T", type_of_var=logical_t, &
                           default_l_val=.FALSE., lone_keyword_l_val=.TRUE.)
+      CALL section_add_keyword(section, keyword)
+      CALL keyword_release(keyword)
+
+      CALL keyword_create(keyword, __LOCATION__, name="GAUGE", &
+                          description="Electric-dipole representation used by nonperiodic independent-particle ECD.", &
+                          usage="GAUGE LENGTH", enum_c_vals=s2a("LENGTH", "VELOCITY"), &
+                          enum_desc=s2a("Use the position-operator E1 vertex.", &
+                                        "Use the complete-velocity E1 vertex."), &
+                          enum_i_vals=[tddfpt_dipole_length, tddfpt_dipole_velocity], &
+                          default_i_val=tddfpt_dipole_length)
       CALL section_add_keyword(section, keyword)
       CALL keyword_release(keyword)
 
