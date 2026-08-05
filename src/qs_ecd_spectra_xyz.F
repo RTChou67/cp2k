@@ -6,7 +6,7 @@
 !--------------------------------------------------------------------------------------------------!
 
 ! **************************************************************************************************
-!> \brief Gamma-point PERIODIC XYZ ECD spectra.
+!> \brief Gamma-point PERIODIC XYZ IPA ECD spectra.
 ! **************************************************************************************************
 MODULE qs_ecd_spectra_xyz
    USE cell_types, ONLY: cell_type, &
@@ -61,9 +61,10 @@ MODULE qs_ecd_spectra_xyz
    REAL(KIND=dp), PARAMETER, PRIVATE :: occupation_threshold = 1.0E-8_dp
    REAL(KIND=dp), PARAMETER, PRIVATE :: energy_degeneracy_threshold = 1.0E-8_dp
    REAL(KIND=dp), DIMENSION(ncart, ncart), PARAMETER, PRIVATE :: cartesian_identity = &
-      RESHAPE([1.0_dp, 0.0_dp, 0.0_dp, 0.0_dp, 1.0_dp, 0.0_dp, 0.0_dp, 0.0_dp, 1.0_dp], [ncart, ncart])
+      RESHAPE([1.0_dp, 0.0_dp, 0.0_dp, 0.0_dp, 1.0_dp, 0.0_dp, &
+               0.0_dp, 0.0_dp, 1.0_dp], [ncart, ncart])
 
-   PUBLIC :: ecd_spectra_xyz
+   PUBLIC :: ecd_spectra_xyz_ipa
 
 CONTAINS
 
@@ -75,7 +76,7 @@ CONTAINS
 !> coefficient of the Gamma CD tensor is written for every transition.
 !> \param pseudopotential_commutator Include the GTH non-local velocity commutator
 ! **************************************************************************************************
-   SUBROUTINE ecd_spectra_xyz(qs_env, pseudopotential_commutator)
+   SUBROUTINE ecd_spectra_xyz_ipa(qs_env, pseudopotential_commutator)
       TYPE(qs_environment_type), POINTER                 :: qs_env
       LOGICAL, INTENT(IN)                                 :: pseudopotential_commutator
 
@@ -84,10 +85,10 @@ CONTAINS
                                                             ncommutator_block, nmo, nspin, ntransition, output_index, &
                                                             tensor_unit
       CHARACTER(LEN=default_path_length)                 :: e1_filename, m1_filename, tensor_filename
-      LOGICAL                                            :: include_nonlocal_velocity
+      LOGICAL                                            :: include_nonlocal_velocity, write_transition_matrices
       REAL(KIND=dp)                                      :: cell_volume, gap, occupation_difference, velocity_magnetic_dipole_dot
-      COMPLEX(KIND=dp), ALLOCATABLE, DIMENSION(:, :)     :: electric_dipole_transition, magnetic_dipole_transition
-      COMPLEX(KIND=dp), ALLOCATABLE, DIMENSION(:, :, :)  :: magnetic_dipole_matrix, position_velocity_matrix, velocity_matrix
+      COMPLEX(KIND=dp), DIMENSION(ncart)                 :: m1_ai, velocity_ai
+      COMPLEX(KIND=dp), ALLOCATABLE, DIMENSION(:, :, :)  :: e1_mo, m1_mo, velocity_mo_matrix
       REAL(KIND=dp), ALLOCATABLE, DIMENSION(:, :)        :: momentum_matrix
       REAL(KIND=dp), ALLOCATABLE, DIMENSION(:, :)        :: commutator_matrix
       REAL(KIND=dp), ALLOCATABLE, DIMENSION(:, :, :)     :: spectral_tensor
@@ -142,27 +143,28 @@ CONTAINS
 
       ALLOCATE (occupation_weight(ntransition), transition_energy(ntransition), &
                 occupied(ntransition), spin_channel(ntransition), transition_order(ntransition), virtual(ntransition))
-      itransition = 0
-      DO ispin = 1, nspin
-         NULLIFY (eigenvalues, occupations)
-         CALL get_mo_set(mos(ispin), eigenvalues=eigenvalues, nmo=nmo, occupation_numbers=occupations)
-         DO iocc = 1, nmo
-            IF (occupations(iocc) <= occupation_threshold) CYCLE
-            DO ivirt = 1, nmo
-               IF (occupations(ivirt) > occupation_threshold) CYCLE
-               gap = eigenvalues(ivirt) - eigenvalues(iocc)
-               occupation_difference = occupations(iocc) - occupations(ivirt)
-               IF (gap <= 0.0_dp .OR. occupation_difference <= 0.0_dp) CYCLE
-               itransition = itransition + 1
-               transition_energy(itransition) = gap
-               occupation_weight(itransition) = occupation_difference
-               occupied(itransition) = iocc
-               spin_channel(itransition) = ispin
-               virtual(itransition) = ivirt
-            END DO
-         END DO
-      END DO
-      IF (itransition /= ntransition) CPABORT("ECD| Periodic velocity E1/M1 transition count is inconsistent")
+
+      logger => cp_get_default_logger()
+      iounit = cp_logger_get_default_io_unit(logger)
+      CALL cp_logger_generate_filename(logger, e1_filename, logger%iter_info%project_name, &
+                                       "-ecd-e1-transition-matrix.dat", local=.FALSE.)
+      CALL cp_logger_generate_filename(logger, m1_filename, logger%iter_info%project_name, &
+                                       "-ecd-m1-transition-matrix.dat", local=.FALSE.)
+      CALL cp_logger_generate_filename(logger, tensor_filename, logger%iter_info%project_name, &
+                                       "-periodic-ipa-e1m1-tensor.dat", local=.FALSE.)
+      write_transition_matrices = logger%para_env%is_source()
+      IF (write_transition_matrices) THEN
+         CALL open_file(e1_filename, file_status="UNKNOWN", file_action="WRITE", unit_number=e1_unit)
+         WRITE (e1_unit, '(A)') "# Periodic Gamma E1 matrix in the velocity representation"
+         WRITE (e1_unit, '(A)') "# E1_ai = i*v_ai/(epsilon_a-epsilon_i)"
+         WRITE (e1_unit, '(A)') "# records follow the occupied-empty MO traversal order"
+         WRITE (e1_unit, '(A)') "# state energy_eV spin occupied virtual component e1_real e1_imag occupation_difference"
+         CALL open_file(m1_filename, file_status="UNKNOWN", file_action="WRITE", unit_number=m1_unit)
+         WRITE (m1_unit, '(A)') "# Periodic Gamma M1 matrix in the velocity representation"
+         WRITE (m1_unit, '(A)') "# M1 = E1 cross v/2"
+         WRITE (m1_unit, '(A)') "# records follow the occupied-empty MO traversal order"
+         WRITE (m1_unit, '(A)') "# state energy_eV spin occupied virtual component m1_real m1_imag occupation_difference"
+      END IF
 
       ! At Gamma, every real-space image carries unit phase.  Build the folded
       ! local momentum p_lambda^loc,AO directly instead of retaining image matrices.
@@ -239,18 +241,19 @@ CONTAINS
       END IF
 
       ! cp_fm_get_submatrix replicates each distributed MO block on every rank.
-      ! Every rank therefore assembles the same complete velocity matrix.
-      ALLOCATE (electric_dipole_transition(ncart, ntransition), magnetic_dipole_transition(ncart, ntransition), &
-                spectral_tensor(ncart, ncart, ntransition))
+      ! Every rank therefore assembles the same complete E1 and M1 MO matrices.
+      ALLOCATE (spectral_tensor(ncart, ncart, ntransition))
       spectral_tensor = 0.0_dp
+      itransition = 0
       DO ispin = 1, nspin
-         NULLIFY (eigenvalues, mo_coeff)
-         CALL get_mo_set(mos(ispin), eigenvalues=eigenvalues, mo_coeff=mo_coeff, nmo=nmo)
-         IF (.NOT. ASSOCIATED(eigenvalues) .OR. .NOT. ASSOCIATED(mo_coeff)) THEN
+         NULLIFY (eigenvalues, mo_coeff, occupations)
+         CALL get_mo_set(mos(ispin), eigenvalues=eigenvalues, mo_coeff=mo_coeff, nmo=nmo, &
+                         occupation_numbers=occupations)
+         IF (.NOT. ASSOCIATED(eigenvalues) .OR. .NOT. ASSOCIATED(mo_coeff) .OR. .NOT. ASSOCIATED(occupations)) THEN
             CPABORT("ECD| Periodic velocity E1/M1 output received incomplete Gamma MO data")
          END IF
-         ALLOCATE (magnetic_dipole_matrix(ncart, nmo, nmo), momentum_matrix(nmo, nmo), &
-                   position_velocity_matrix(ncart, nmo, nmo), velocity_matrix(ncart, nmo, nmo))
+         ALLOCATE (e1_mo(ncart, nmo, nmo), m1_mo(ncart, nmo, nmo), momentum_matrix(nmo, nmo), &
+                   velocity_mo_matrix(ncart, nmo, nmo))
          IF (include_nonlocal_velocity) ALLOCATE (commutator_matrix(nmo, nmo))
          DO idir = 1, ncart
             ! Project, collect, and release each Cartesian MO operator before the next one.
@@ -264,95 +267,90 @@ CONTAINS
                CALL cp_fm_release(commutator_mo)
             END IF
             ! The real antisymmetric AO convention becomes a Hermitian velocity through -i.
-            velocity_matrix(idir, :, :) = CMPLX(0.0_dp, -momentum_matrix, KIND=dp)
+            velocity_mo_matrix(idir, :, :) = CMPLX(0.0_dp, -momentum_matrix, KIND=dp)
             CALL cp_fm_release(linear_momentum_mo)
          END DO
          DEALLOCATE (momentum_matrix)
          IF (include_nonlocal_velocity) DEALLOCATE (commutator_matrix)
-         ! In the non-degenerate off-diagonal MO subspace, r^V_pq=v_pq/[i(e_p-e_q)].
-         ! The diagonal is set to zero because it is a separate Bloch-gauge connection.
-         position_velocity_matrix = CMPLX(0.0_dp, 0.0_dp, KIND=dp)
+         ! Construct physical E1 and M1 matrices before selecting occupied-empty elements.
+         ! The diagonal E1 element is the omitted Bloch connection and remains zero.
+         e1_mo = CMPLX(0.0_dp, 0.0_dp, KIND=dp)
          DO ivirt = 1, nmo
             DO iocc = 1, nmo
                IF (ivirt == iocc) CYCLE
                IF (ABS(eigenvalues(ivirt) - eigenvalues(iocc)) <= energy_degeneracy_threshold) CYCLE
-               position_velocity_matrix(:, ivirt, iocc) = velocity_matrix(:, ivirt, iocc)/ &
-                                                           CMPLX(0.0_dp, eigenvalues(ivirt) - eigenvalues(iocc), KIND=dp)
+               e1_mo(:, ivirt, iocc) = CMPLX(0.0_dp, 1.0_dp, KIND=dp)* &
+                                       velocity_mo_matrix(:, ivirt, iocc)/(eigenvalues(ivirt) - eigenvalues(iocc))
             END DO
          END DO
-         ! Direct complete-space velocity construction: m^V=-r^V x v/2.
-         magnetic_dipole_matrix(1, :, :) = -0.5_dp*( &
-            MATMUL(position_velocity_matrix(2, :, :), velocity_matrix(3, :, :)) - &
-            MATMUL(position_velocity_matrix(3, :, :), velocity_matrix(2, :, :)))
-         magnetic_dipole_matrix(2, :, :) = -0.5_dp*( &
-            MATMUL(position_velocity_matrix(3, :, :), velocity_matrix(1, :, :)) - &
-            MATMUL(position_velocity_matrix(1, :, :), velocity_matrix(3, :, :)))
-         magnetic_dipole_matrix(3, :, :) = -0.5_dp*( &
-            MATMUL(position_velocity_matrix(1, :, :), velocity_matrix(2, :, :)) - &
-            MATMUL(position_velocity_matrix(2, :, :), velocity_matrix(1, :, :)))
-         DO itransition = 1, ntransition
-            IF (spin_channel(itransition) /= ispin) CYCLE
-            ! E1 in the periodic velocity representation:
-            ! mu_lambda,ai = i*pi_lambda,ai/(epsilon_a-epsilon_i).
-            electric_dipole_transition(:, itransition) = CMPLX(0.0_dp, 1.0_dp, KIND=dp)* &
-                                                         velocity_matrix(:, virtual(itransition), occupied(itransition))/ &
-                                                         transition_energy(itransition)
-            magnetic_dipole_transition(:, itransition) = &
-               magnetic_dipole_matrix(:, virtual(itransition), occupied(itransition))
-            ! Assemble the E1--M1 coefficient C^M1_ai of the Gamma CD tensor.
-            ! C^M1_mu,nu=Re[v_mu^*m_nu+v_nu^*m_mu]-2 delta_mu,nu Re[v^* dot m].
-            spectral_tensor(:, :, itransition) = REAL( &
-               MATMUL(RESHAPE(CONJG(velocity_matrix(:, virtual(itransition), occupied(itransition))), [ncart, 1]), &
-                      RESHAPE(magnetic_dipole_transition(:, itransition), [1, ncart])), KIND=dp)
-            spectral_tensor(:, :, itransition) = spectral_tensor(:, :, itransition) + &
-                                                 TRANSPOSE(spectral_tensor(:, :, itransition))
-            velocity_magnetic_dipole_dot = REAL( &
-               SUM(CONJG(velocity_matrix(:, virtual(itransition), occupied(itransition)))* &
-                   magnetic_dipole_transition(:, itransition)), KIND=dp)
-            spectral_tensor(:, :, itransition) = spectral_tensor(:, :, itransition) - &
-                                                 2.0_dp*velocity_magnetic_dipole_dot*cartesian_identity
-            ! Delta_alpha^Gamma_ai = 4*pi^2*w_ia*C^M1_ai /
-            ! (Delta_epsilon_ia^2*Omega) delta(Delta_epsilon_ia-omega).
-            spectral_tensor(:, :, itransition) = 4.0_dp*pi*pi*occupation_weight(itransition)* &
-                                                 spectral_tensor(:, :, itransition)/ &
-                                                 (transition_energy(itransition)**2*cell_volume)
+         ! M1 = -r^V x v/2 = E1 x v/2 because E1 = -r^V.
+         m1_mo(1, :, :) = 0.5_dp*(MATMUL(e1_mo(2, :, :), velocity_mo_matrix(3, :, :)) - &
+                                  MATMUL(e1_mo(3, :, :), velocity_mo_matrix(2, :, :)))
+         m1_mo(2, :, :) = 0.5_dp*(MATMUL(e1_mo(3, :, :), velocity_mo_matrix(1, :, :)) - &
+                                  MATMUL(e1_mo(1, :, :), velocity_mo_matrix(3, :, :)))
+         m1_mo(3, :, :) = 0.5_dp*(MATMUL(e1_mo(1, :, :), velocity_mo_matrix(2, :, :)) - &
+                                  MATMUL(e1_mo(2, :, :), velocity_mo_matrix(1, :, :)))
+         DO iocc = 1, nmo
+            IF (occupations(iocc) <= occupation_threshold) CYCLE
+            DO ivirt = 1, nmo
+               IF (occupations(ivirt) > occupation_threshold) CYCLE
+               gap = eigenvalues(ivirt) - eigenvalues(iocc)
+               occupation_difference = occupations(iocc) - occupations(ivirt)
+               IF (gap <= 0.0_dp .OR. occupation_difference <= 0.0_dp) CYCLE
+               itransition = itransition + 1
+               transition_energy(itransition) = gap
+               occupation_weight(itransition) = occupation_difference
+               occupied(itransition) = iocc
+               spin_channel(itransition) = ispin
+               virtual(itransition) = ivirt
+
+               velocity_ai = velocity_mo_matrix(:, ivirt, iocc)
+               m1_ai = m1_mo(:, ivirt, iocc)
+               ! Assemble the E1--M1 coefficient C^M1_ai of the Gamma CD tensor.
+               ! C^M1_mu,nu=Re[v_mu^*m_nu+v_nu^*m_mu]-2 delta_mu,nu Re[v^* dot m].
+               spectral_tensor(:, :, itransition) = REAL( &
+                  MATMUL(RESHAPE(CONJG(velocity_ai), [ncart, 1]), &
+                         RESHAPE(m1_ai, [1, ncart])), KIND=dp)
+               spectral_tensor(:, :, itransition) = spectral_tensor(:, :, itransition) + &
+                                                    TRANSPOSE(spectral_tensor(:, :, itransition))
+               velocity_magnetic_dipole_dot = REAL(SUM(CONJG(velocity_ai)*m1_ai), KIND=dp)
+               spectral_tensor(:, :, itransition) = spectral_tensor(:, :, itransition) - &
+                                                    2.0_dp*velocity_magnetic_dipole_dot*cartesian_identity
+               ! Delta_alpha^Gamma_ai = 4*pi^2*w_ia*C^M1_ai /
+               ! (Delta_epsilon_ia^2*Omega) delta(Delta_epsilon_ia-omega).
+               spectral_tensor(:, :, itransition) = 4.0_dp*pi*pi*occupation_difference* &
+                                                    spectral_tensor(:, :, itransition)/(gap**2*cell_volume)
+               IF (write_transition_matrices) THEN
+                  DO idir = 1, ncart
+                     WRITE (e1_unit, '(I0,1X,ES24.15E3,4(1X,I0),3(1X,ES24.15E3))') &
+                        itransition, gap*evolt, ispin, iocc, ivirt, idir, REAL(e1_mo(idir, ivirt, iocc), KIND=dp), &
+                        AIMAG(e1_mo(idir, ivirt, iocc)), occupation_difference
+                     WRITE (m1_unit, '(I0,1X,ES24.15E3,4(1X,I0),3(1X,ES24.15E3))') &
+                        itransition, gap*evolt, ispin, iocc, ivirt, idir, REAL(m1_mo(idir, ivirt, iocc), KIND=dp), &
+                        AIMAG(m1_mo(idir, ivirt, iocc)), occupation_difference
+                  END DO
+               END IF
+            END DO
          END DO
-         DEALLOCATE (magnetic_dipole_matrix, position_velocity_matrix, velocity_matrix)
+         DEALLOCATE (e1_mo, m1_mo, velocity_mo_matrix)
       END DO
+      IF (itransition /= ntransition) CPABORT("ECD| Periodic velocity E1/M1 transition count is inconsistent")
       DO idir = 1, ncart
          CALL dbcsr_release_p(linear_momentum_ao(idir)%matrix)
          IF (include_nonlocal_velocity) CALL dbcsr_release_p(commutator_ao(idir)%matrix)
       END DO
       DEALLOCATE (linear_momentum_ao)
       IF (include_nonlocal_velocity) DEALLOCATE (commutator_ao)
+      IF (write_transition_matrices) THEN
+         CALL close_file(e1_unit)
+         CALL close_file(m1_unit)
+      END IF
 
       ! All E1, M1, and tensor denominators above use the original transition index.
       ! Sort only after assembly, so transition_order maps the energy-ordered output to it.
       CALL sort(transition_energy, ntransition, transition_order)
 
-      logger => cp_get_default_logger()
-      iounit = cp_logger_get_default_io_unit(logger)
-      CALL cp_logger_generate_filename(logger, e1_filename, logger%iter_info%project_name, &
-                                       "-ecd-e1-transition-matrix.dat", local=.FALSE.)
-      CALL cp_logger_generate_filename(logger, m1_filename, logger%iter_info%project_name, &
-                                       "-ecd-m1-transition-matrix.dat", local=.FALSE.)
-      CALL cp_logger_generate_filename(logger, tensor_filename, logger%iter_info%project_name, &
-                                       "-periodic-ipa-e1m1-tensor.dat", local=.FALSE.)
-      IF (logger%para_env%is_source()) THEN
-         CALL open_file(e1_filename, file_status="UNKNOWN", file_action="WRITE", unit_number=e1_unit)
-         WRITE (e1_unit, '(A)') "# Periodic Gamma E1 transition matrix in the velocity representation"
-         WRITE (e1_unit, '(A)') "# mu(a,i) = i*v(a,i)/(e(a)-e(i))"
-         WRITE (e1_unit, '(A)') "# state energy_eV spin occupied virtual component dipole_real dipole_imag "// &
-                                "occupation_difference"
-
-         CALL open_file(m1_filename, file_status="UNKNOWN", file_action="WRITE", unit_number=m1_unit)
-         WRITE (m1_unit, '(A)') "# Periodic Gamma M1 matrix in the complete velocity representation"
-         WRITE (m1_unit, '(A)') "# r_velocity(p,q) = v(p,q)/(i*(e(p)-e(q))) for p /= q; r_velocity(p,p) = 0"
-         WRITE (m1_unit, '(A)') "# magnetic_dipole = -r_velocity cross velocity/2"
-         WRITE (m1_unit, '(A)') "# state energy_eV spin occupied virtual component minus_two_magnetic_real "// &
-                                "minus_two_magnetic_imag "// &
-                                "magnetic_dipole_real magnetic_dipole_imag occupation_difference"
-
+      IF (write_transition_matrices) THEN
          CALL open_file(tensor_filename, file_status="UNKNOWN", file_action="WRITE", unit_number=tensor_unit)
          WRITE (tensor_unit, '(A)') "# Periodic Gamma IPA CD tensor coefficient"
          WRITE (tensor_unit, '(A)') "# E1_M1_ONLY: D = D_M1 and D_E2 = 0"
@@ -362,18 +360,6 @@ CONTAINS
          DO output_index = 1, ntransition
             itransition = transition_order(output_index)
             DO idir = 1, ncart
-               WRITE (e1_unit, '(I0,1X,ES24.15E3,4(1X,I0),3(1X,ES24.15E3))') &
-                  output_index, transition_energy(output_index)*evolt, spin_channel(itransition), &
-                  occupied(itransition), virtual(itransition), idir, &
-                  REAL(electric_dipole_transition(idir, itransition), KIND=dp), &
-                  AIMAG(electric_dipole_transition(idir, itransition)), occupation_weight(itransition)
-               WRITE (m1_unit, '(I0,1X,ES24.15E3,4(1X,I0),5(1X,ES24.15E3))') &
-                  output_index, transition_energy(output_index)*evolt, spin_channel(itransition), &
-                  occupied(itransition), virtual(itransition), idir, &
-                  REAL(-2.0_dp*magnetic_dipole_transition(idir, itransition), KIND=dp), &
-                  AIMAG(-2.0_dp*magnetic_dipole_transition(idir, itransition)), &
-                  REAL(magnetic_dipole_transition(idir, itransition), KIND=dp), &
-                  AIMAG(magnetic_dipole_transition(idir, itransition)), occupation_weight(itransition)
                DO jdir = 1, ncart
                   WRITE (tensor_unit, '(I0,1X,ES24.15E3,5(1X,I0),1X,ES24.15E3)') &
                      output_index, transition_energy(output_index)*evolt, spin_channel(itransition), &
@@ -382,13 +368,10 @@ CONTAINS
                END DO
             END DO
          END DO
-         CALL close_file(e1_unit)
-         CALL close_file(m1_unit)
          CALL close_file(tensor_unit)
       END IF
 
-      DEALLOCATE (electric_dipole_transition, magnetic_dipole_transition, occupation_weight, &
-                  occupied, spectral_tensor, spin_channel, &
+      DEALLOCATE (occupation_weight, occupied, spectral_tensor, spin_channel, &
                   transition_energy, transition_order, virtual)
 
       IF (iounit > 0) THEN
@@ -398,6 +381,6 @@ CONTAINS
          WRITE (iounit, '(T2,A,I0)') "ECD| Transition count ", ntransition
       END IF
 
-   END SUBROUTINE ecd_spectra_xyz
+   END SUBROUTINE ecd_spectra_xyz_ipa
 
 END MODULE qs_ecd_spectra_xyz

@@ -43,7 +43,8 @@ MODULE qs_energy_utils
    USE qs_core_matrices,                ONLY: core_matrices
    USE qs_dispersion_types,             ONLY: qs_dispersion_type
    USE qs_energy_types,                 ONLY: qs_energy_type
-   USE qs_ecd_methods,                  ONLY: ecd_post_scf
+   USE qs_ecd_methods,                  ONLY: ecd_dispatch, &
+                                              ecd_validate_input
    USE qs_environment_types,            ONLY: get_qs_env,&
                                               qs_environment_type
    USE qs_integrate_potential,          ONLY: integrate_v_core_rspace,&
@@ -198,13 +199,16 @@ CONTAINS
          CALL linres_calculation_low(qs_env)
       END IF
 
-      ! Validate ECD input and emit direct ECD before an optional TDDFPT calculation.
-      CALL ecd_post_scf(qs_env)
+      ! Validate unsupported ECD configurations before an optional TDDFPT calculation.
+      CALL ecd_validate_input(qs_env)
 
       ! Calculates the energy, response vector and some contributions to the force
       IF (dft_control%tddfpt2_control%enabled) THEN
          CALL tddfpt(qs_env, calc_forces)
       END IF
+
+      ! TDDFPT response ECD is consumed while roots are live; dispatch IPA here.
+      CALL ecd_dispatch(qs_env)
 
       ! stand-alone RIXS, does not depend on previous xas_tdp and/or tddfpt2 calculations
       IF (qs_env%do_rixs) CALL rixs(qs_env)
