@@ -29,10 +29,10 @@ MODULE qs_ecd_operator_utils
 CONTAINS
 
 ! **************************************************************************************************
-!> \brief Project a real sparse AO operator into the full real MO basis.
-!> The two matrix products evaluate O^MO = C^T O^AO C.  For periodic ECD,
-!> O^AO is one Cartesian component of the complete optical momentum and
-!> O^MO provides pi_lambda,ab for both the E1 and M1 formulae.
+!> \brief Project a real sparse AO operator into the full real Gamma-point MO basis.
+!> The two matrix products evaluate O^MO = C^T O^AO C.  For length-gauge E1,
+!> O^AO is r_lambda-R0_lambda and mu_lambda=-O^MO_lambda.  The same projection
+!> is used for the real AO angular-momentum and velocity-generator matrices.
 !> \param operator_ao AO-space sparse operator
 !> \param mo_coeff Real MO coefficient matrix
 !> \param operator_mo Full MO-space operator

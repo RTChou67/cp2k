@@ -2214,7 +2214,8 @@ CONTAINS
       CALL keyword_release(keyword)
 
       CALL keyword_create(keyword, __LOCATION__, name="GAUGE", &
-                          description="Electric-dipole representation used by nonperiodic independent-particle ECD.", &
+                          description="Electric-dipole representation used by independent-particle ECD. "// &
+                                      "Explicit LENGTH selects the GAPW all-electron XYZ molecular-supercell route.", &
                           usage="GAUGE LENGTH", enum_c_vals=s2a("LENGTH", "VELOCITY"), &
                           enum_desc=s2a("Use the position-operator E1 vertex.", &
                                         "Use the complete-velocity E1 vertex."), &

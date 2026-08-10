@@ -60,10 +60,6 @@ MODULE qs_ecd_spectra_xyz
    INTEGER, PARAMETER, PRIVATE :: ncart = 3
    REAL(KIND=dp), PARAMETER, PRIVATE :: occupation_threshold = 1.0E-8_dp
    REAL(KIND=dp), PARAMETER, PRIVATE :: energy_degeneracy_threshold = 1.0E-8_dp
-   REAL(KIND=dp), DIMENSION(ncart, ncart), PARAMETER, PRIVATE :: cartesian_identity = &
-      RESHAPE([1.0_dp, 0.0_dp, 0.0_dp, 0.0_dp, 1.0_dp, 0.0_dp, &
-               0.0_dp, 0.0_dp, 1.0_dp], [ncart, ncart])
-
    PUBLIC :: ecd_spectra_xyz_ipa
 
 CONTAINS
@@ -86,13 +82,13 @@ CONTAINS
                                                             tensor_unit
       CHARACTER(LEN=default_path_length)                 :: e1_filename, m1_filename, tensor_filename
       LOGICAL                                            :: include_nonlocal_velocity, write_transition_matrices
-      REAL(KIND=dp)                                      :: cell_volume, gap, occupation_difference, velocity_magnetic_dipole_dot
-      COMPLEX(KIND=dp), DIMENSION(ncart)                 :: m1_ai, velocity_ai
+      REAL(KIND=dp)                                      :: cell_volume, gap, occupation_difference
+      COMPLEX(KIND=dp), DIMENSION(ncart)                 :: e1_ai, m1_ai
       COMPLEX(KIND=dp), ALLOCATABLE, DIMENSION(:, :, :)  :: e1_mo, m1_mo, velocity_mo_matrix
       REAL(KIND=dp), ALLOCATABLE, DIMENSION(:, :)        :: momentum_matrix
       REAL(KIND=dp), ALLOCATABLE, DIMENSION(:, :)        :: commutator_matrix
       REAL(KIND=dp), ALLOCATABLE, DIMENSION(:, :, :)     :: spectral_tensor
-      REAL(KIND=dp), ALLOCATABLE, DIMENSION(:)           :: occupation_weight, transition_energy
+      REAL(KIND=dp), ALLOCATABLE, DIMENSION(:)           :: transition_energy
       INTEGER, ALLOCATABLE, DIMENSION(:)                 :: commutator_cols, commutator_rows, occupied, spin_channel, &
                                                             transition_order, virtual
       REAL(KIND=dp), DIMENSION(:), POINTER               :: eigenvalues, occupations
@@ -141,7 +137,7 @@ CONTAINS
       END DO
       IF (ntransition < 1) CPABORT("ECD| Periodic velocity E1/M1 output found no occupied-empty transitions")
 
-      ALLOCATE (occupation_weight(ntransition), transition_energy(ntransition), &
+      ALLOCATE (transition_energy(ntransition), &
                 occupied(ntransition), spin_channel(ntransition), transition_order(ntransition), virtual(ntransition))
 
       logger => cp_get_default_logger()
@@ -299,27 +295,22 @@ CONTAINS
                IF (gap <= 0.0_dp .OR. occupation_difference <= 0.0_dp) CYCLE
                itransition = itransition + 1
                transition_energy(itransition) = gap
-               occupation_weight(itransition) = occupation_difference
                occupied(itransition) = iocc
                spin_channel(itransition) = ispin
                virtual(itransition) = ivirt
 
-               velocity_ai = velocity_mo_matrix(:, ivirt, iocc)
+               e1_ai = e1_mo(:, ivirt, iocc)
                m1_ai = m1_mo(:, ivirt, iocc)
-               ! Assemble the E1--M1 coefficient C^M1_ai of the Gamma CD tensor.
-               ! C^M1_mu,nu=Re[v_mu^*m_nu+v_nu^*m_mu]-2 delta_mu,nu Re[v^* dot m].
-               spectral_tensor(:, :, itransition) = REAL( &
-                  MATMUL(RESHAPE(CONJG(velocity_ai), [ncart, 1]), &
-                         RESHAPE(m1_ai, [1, ncart])), KIND=dp)
-               spectral_tensor(:, :, itransition) = spectral_tensor(:, :, itransition) + &
-                                                    TRANSPOSE(spectral_tensor(:, :, itransition))
-               velocity_magnetic_dipole_dot = REAL(SUM(CONJG(velocity_ai)*m1_ai), KIND=dp)
-               spectral_tensor(:, :, itransition) = spectral_tensor(:, :, itransition) - &
-                                                    2.0_dp*velocity_magnetic_dipole_dot*cartesian_identity
-               ! Delta_alpha^Gamma_ai = 4*pi^2*w_ia*C^M1_ai /
-               ! (Delta_epsilon_ia^2*Omega) delta(Delta_epsilon_ia-omega).
-               spectral_tensor(:, :, itransition) = 4.0_dp*pi*pi*occupation_difference* &
-                                                    spectral_tensor(:, :, itransition)/(gap**2*cell_volume)
+               ! Direct form of the Gamma E1--M1 tensor coefficient:
+               ! Delta_alpha(mu,nu)_ai = 4*pi^2*w_ia/(gap*Omega) *
+               !   [2 delta_mu,nu Im(mu^* dot m) - Im(mu_mu^*m_nu + mu_nu^*m_mu)].
+               DO idir = 1, ncart
+                  DO jdir = 1, ncart
+                     spectral_tensor(idir, jdir, itransition) = 4.0_dp*pi*pi*occupation_difference/ &
+                        (gap*cell_volume)*(2.0_dp*MERGE(AIMAG(SUM(CONJG(e1_ai)*m1_ai)), 0.0_dp, idir == jdir) - &
+                        AIMAG(CONJG(e1_ai(idir))*m1_ai(jdir) + CONJG(e1_ai(jdir))*m1_ai(idir)))
+                  END DO
+               END DO
                IF (write_transition_matrices) THEN
                   DO idir = 1, ncart
                      WRITE (e1_unit, '(I0,1X,ES24.15E3,4(1X,I0),3(1X,ES24.15E3))') &
@@ -371,7 +362,7 @@ CONTAINS
          CALL close_file(tensor_unit)
       END IF
 
-      DEALLOCATE (occupation_weight, occupied, spectral_tensor, spin_channel, &
+      DEALLOCATE (occupied, spectral_tensor, spin_channel, &
                   transition_energy, transition_order, virtual)
 
       IF (iounit > 0) THEN
