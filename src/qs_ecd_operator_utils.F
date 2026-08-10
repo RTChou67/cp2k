@@ -1,64 +1,391 @@
 !--------------------------------------------------------------------------------------------------!
 !   CP2K: A general program for atomistic simulations                                              !
-!   Copyright 2000-2026 CP2K developers group <https://cp2k.org>                                   !
+!   Copyright 2000-2026 CP2K developers group                                                      !
 !                                                                                                  !
 !   SPDX-License-Identifier: GPL-2.0-or-later                                                      !
 !--------------------------------------------------------------------------------------------------!
 
 ! **************************************************************************************************
-!> \brief Common AO-to-MO operator projection for electronic circular dichroism.
+!> \brief Complete E1 and M1 operators for electronic circular dichroism.
 ! **************************************************************************************************
 MODULE qs_ecd_operator_utils
-   USE cp_dbcsr_api, ONLY: dbcsr_p_type
-   USE cp_dbcsr_operations, ONLY: cp_dbcsr_sm_fm_multiply
-   USE cp_fm_struct, ONLY: cp_fm_struct_type
-   USE cp_fm_types, ONLY: cp_fm_create, &
-                          cp_fm_get_info, &
-                          cp_fm_release, &
-                          cp_fm_type
-   USE kinds, ONLY: dp
-   USE parallel_gemm_api, ONLY: parallel_gemm
+   USE cell_types,                      ONLY: cell_type
+   USE commutator_rpnl,                 ONLY: build_com_mom_nl,&
+                                              build_com_nl_mag
+   USE cp_control_types,                ONLY: dft_control_type
+   USE cp_dbcsr_api,                    ONLY: &
+        dbcsr_add, dbcsr_create, dbcsr_desymmetrize, dbcsr_finalize, dbcsr_init_p, dbcsr_p_type, &
+        dbcsr_reserve_blocks, dbcsr_set, dbcsr_type_antisymmetric, dbcsr_type_no_symmetry, &
+        dbcsr_type_symmetric
+   USE cp_dbcsr_cp2k_link,              ONLY: cp_dbcsr_alloc_block_from_nbl
+   USE cp_dbcsr_operations,             ONLY: cp_dbcsr_sm_fm_multiply,&
+                                              dbcsr_allocate_matrix_set,&
+                                              dbcsr_deallocate_matrix_set
+   USE cp_fm_struct,                    ONLY: cp_fm_struct_type
+   USE cp_fm_types,                     ONLY: cp_fm_create,&
+                                              cp_fm_get_info,&
+                                              cp_fm_get_submatrix,&
+                                              cp_fm_release,&
+                                              cp_fm_type
+   USE input_constants,                 ONLY: tddfpt_dipole_length,&
+                                              tddfpt_dipole_velocity
+   USE kinds,                           ONLY: dp
+   USE parallel_gemm_api,               ONLY: parallel_gemm
+   USE particle_types,                  ONLY: particle_type
+   USE qs_environment_types,            ONLY: get_qs_env,&
+                                              qs_environment_type
+   USE qs_kind_types,                   ONLY: qs_kind_type
+   USE qs_mo_types,                     ONLY: get_mo_set,&
+                                              mo_set_type
+   USE qs_moments,                      ONLY: build_local_magmom_matrix,&
+                                              build_local_moment_matrix
+   USE qs_neighbor_list_types,          ONLY: get_iterator_info,&
+                                              neighbor_list_iterate,&
+                                              neighbor_list_iterator_create,&
+                                              neighbor_list_iterator_p_type,&
+                                              neighbor_list_iterator_release,&
+                                              neighbor_list_set_p_type
+   USE qs_operators_ao,                 ONLY: build_ang_mom_matrix,&
+                                              build_lin_mom_matrix
 #include "./base/base_uses.f90"
 
    IMPLICIT NONE
 
    PRIVATE
 
-   PUBLIC :: ecd_project_operator_to_mo
+   INTEGER, PARAMETER, PRIVATE       :: ncart = 3
+   REAL(KIND=dp), PARAMETER, PRIVATE :: velocity_degeneracy_threshold = 1.0E-8_dp
+
+   TYPE, PUBLIC :: ecd_mo_operators_type
+      COMPLEX(KIND=dp), DIMENSION(:, :, :), ALLOCATABLE :: e1, m1
+   END TYPE ecd_mo_operators_type
+
+   PUBLIC :: ecd_build_e1_m1_mo
+   PUBLIC :: ecd_build_length_ao
 
 CONTAINS
 
 ! **************************************************************************************************
-!> \brief Project a real sparse AO operator into the full real Gamma-point MO basis.
-!> The two matrix products evaluate O^MO = C^T O^AO C.  For length-gauge E1,
-!> O^AO is r_lambda-R0_lambda and mu_lambda=-O^MO_lambda.  The same projection
-!> is used for the real AO angular-momentum and velocity-generator matrices.
-!> \param operator_ao AO-space sparse operator
-!> \param mo_coeff Real MO coefficient matrix
-!> \param operator_mo Full MO-space operator
+!> \brief Build complete E1 and M1 MO matrices for every spin channel.
+!>
+!> LENGTH uses direct position and magnetic AO operators.  VELOCITY constructs
+!> the complete local plus non-local velocity internally, then uses it for both
+!> the off-diagonal E1 reconstruction and M1.  Velocity matrices never leave
+!> this routine.
 ! **************************************************************************************************
-   SUBROUTINE ecd_project_operator_to_mo(operator_ao, mo_coeff, operator_mo)
-      TYPE(dbcsr_p_type), INTENT(IN)                     :: operator_ao
-      TYPE(cp_fm_type), POINTER                          :: mo_coeff
-      TYPE(cp_fm_type), INTENT(INOUT)                    :: operator_mo
+   SUBROUTINE ecd_build_e1_m1_mo(qs_env, gauge, pseudopotential_commutator, reference_point, &
+                                 operators, reject_degenerate_velocity)
+      TYPE(qs_environment_type), POINTER                 :: qs_env
+      INTEGER, INTENT(IN)                                :: gauge
+      LOGICAL, INTENT(IN)                                :: pseudopotential_commutator
+      REAL(KIND=dp), DIMENSION(ncart), INTENT(IN)        :: reference_point
+      TYPE(ecd_mo_operators_type), ALLOCATABLE, &
+         DIMENSION(:), INTENT(OUT)                       :: operators
+      LOGICAL, INTENT(IN), OPTIONAL                      :: reject_degenerate_velocity
 
-      INTEGER                                            :: nao, nmo
+      COMPLEX(KIND=dp), ALLOCATABLE, DIMENSION(:, :, :)  :: velocity_mo
+      INTEGER                                            :: column, iatom, idir, inode, ispin, &
+                                                            jatom, last_jatom, nao, &
+                                                            ncommutator_block, nmo, row
+      INTEGER, ALLOCATABLE, DIMENSION(:)                 :: commutator_cols, commutator_rows
+      LOGICAL                                            :: include_nonlocal_velocity, &
+                                                            reject_degenerate, use_velocity
+      REAL(KIND=dp)                                      :: gap
+      REAL(KIND=dp), ALLOCATABLE, DIMENSION(:, :)        :: commutator_matrix, magnetic_matrix, &
+                                                            operator_matrix
+      REAL(KIND=dp), DIMENSION(:), POINTER               :: eigenvalues
+      TYPE(cell_type), POINTER                           :: cell
       TYPE(cp_fm_struct_type), POINTER                   :: coeff_struct
-      TYPE(cp_fm_type)                                   :: operator_coeff
+      TYPE(cp_fm_type)                                   :: operator_coeff, operator_mo
+      TYPE(cp_fm_type), POINTER                          :: mo_coeff
+      TYPE(dbcsr_p_type), DIMENSION(:), POINTER          :: commutator_ao, magnetic_ao, matrix_s, &
+                                                            operator_ao
+      TYPE(dft_control_type), POINTER                    :: dft_control
+      TYPE(mo_set_type), DIMENSION(:), POINTER           :: mos
+      TYPE(neighbor_list_iterator_p_type), &
+         DIMENSION(:), POINTER                           :: nl_iterator
+      TYPE(neighbor_list_set_p_type), DIMENSION(:), &
+         POINTER                                         :: sab_orb, sap_ppnl
+      TYPE(particle_type), DIMENSION(:), POINTER         :: particle_set
+      TYPE(qs_kind_type), DIMENSION(:), POINTER          :: qs_kind_set
 
-      NULLIFY (coeff_struct)
+      NULLIFY (cell, coeff_struct, commutator_ao, dft_control, eigenvalues, magnetic_ao, matrix_s, mo_coeff, mos, &
+               nl_iterator, operator_ao, particle_set, qs_kind_set, sab_orb, sap_ppnl)
+      CALL get_qs_env(qs_env, cell=cell, dft_control=dft_control, matrix_s=matrix_s, mos=mos, &
+                      particle_set=particle_set, qs_kind_set=qs_kind_set, sab_orb=sab_orb, sap_ppnl=sap_ppnl)
+      CPASSERT(ASSOCIATED(cell))
+      CPASSERT(ASSOCIATED(dft_control))
+      CPASSERT(ASSOCIATED(matrix_s))
+      CPASSERT(ASSOCIATED(mos))
+      CPASSERT(ASSOCIATED(particle_set))
+      CPASSERT(ASSOCIATED(qs_kind_set))
+      CPASSERT(ASSOCIATED(sab_orb))
+      IF (gauge /= tddfpt_dipole_length .AND. gauge /= tddfpt_dipole_velocity) THEN
+         CPABORT("ECD| E1/M1 construction received an unsupported gauge")
+      END IF
 
-      CALL cp_fm_get_info(mo_coeff, matrix_struct=coeff_struct, nrow_global=nao, ncol_global=nmo)
-      CALL cp_fm_create(operator_coeff, coeff_struct, name="ECD operator C")
-      CALL cp_fm_create(operator_mo, coeff_struct, nrow=nmo, ncol=nmo, name="ECD C^T operator C")
+      use_velocity = gauge == tddfpt_dipole_velocity
+      reject_degenerate = .FALSE.
+      IF (PRESENT(reject_degenerate_velocity)) reject_degenerate = reject_degenerate_velocity
+      IF (use_velocity) THEN
+         CALL dbcsr_allocate_matrix_set(operator_ao, ncart)
+         DO idir = 1, ncart
+            CALL dbcsr_init_p(operator_ao(idir)%matrix)
+            IF (ALL(cell%perd == 0)) THEN
+               CALL dbcsr_create(operator_ao(idir)%matrix, template=matrix_s(1)%matrix, &
+                                 matrix_type=dbcsr_type_antisymmetric)
+               CALL cp_dbcsr_alloc_block_from_nbl(operator_ao(idir)%matrix, sab_orb)
+            ELSE
+               CALL dbcsr_create(operator_ao(idir)%matrix, template=matrix_s(1)%matrix, &
+                                 matrix_type=dbcsr_type_no_symmetry)
+               CALL dbcsr_desymmetrize(matrix_s(1)%matrix, operator_ao(idir)%matrix)
+            END IF
+            CALL dbcsr_set(operator_ao(idir)%matrix, 0.0_dp)
+         END DO
+         CALL build_lin_mom_matrix(qs_env, operator_ao)
 
-      CALL cp_dbcsr_sm_fm_multiply(operator_ao%matrix, mo_coeff, operator_coeff, ncol=nmo, &
-                                   alpha=1.0_dp, beta=0.0_dp)
-      CALL parallel_gemm("T", "N", nmo, nmo, nao, 1.0_dp, mo_coeff, operator_coeff, &
-                         0.0_dp, operator_mo)
+         include_nonlocal_velocity = pseudopotential_commutator .AND. ASSOCIATED(sap_ppnl)
+         IF (include_nonlocal_velocity) THEN
+            CALL dbcsr_allocate_matrix_set(commutator_ao, ncart)
+            DO idir = 1, ncart
+               CALL dbcsr_init_p(commutator_ao(idir)%matrix)
+               CALL dbcsr_create(commutator_ao(idir)%matrix, template=matrix_s(1)%matrix, &
+                                 matrix_type=dbcsr_type_antisymmetric)
+               IF (ALL(cell%perd == 0)) THEN
+                  CALL cp_dbcsr_alloc_block_from_nbl(commutator_ao(idir)%matrix, sab_orb)
+                  CALL dbcsr_set(commutator_ao(idir)%matrix, 0.0_dp)
+               END IF
+            END DO
+            IF (ALL(cell%perd == 1)) THEN
+               ncommutator_block = 0
+               last_jatom = 0
+               CALL neighbor_list_iterator_create(nl_iterator, sab_orb)
+               DO WHILE (neighbor_list_iterate(nl_iterator) == 0)
+                  CALL get_iterator_info(nl_iterator, iatom=iatom, jatom=jatom, inode=inode)
+                  IF (inode == 1) last_jatom = 0
+                  IF (jatom == last_jatom) CYCLE
+                  last_jatom = jatom
+                  ncommutator_block = ncommutator_block + 1
+               END DO
+               CALL neighbor_list_iterator_release(nl_iterator)
+               ALLOCATE (commutator_cols(MAX(1, ncommutator_block)), &
+                         commutator_rows(MAX(1, ncommutator_block)))
+               ncommutator_block = 0
+               last_jatom = 0
+               CALL neighbor_list_iterator_create(nl_iterator, sab_orb)
+               DO WHILE (neighbor_list_iterate(nl_iterator) == 0)
+                  CALL get_iterator_info(nl_iterator, iatom=iatom, jatom=jatom, inode=inode)
+                  IF (inode == 1) last_jatom = 0
+                  IF (jatom == last_jatom) CYCLE
+                  last_jatom = jatom
+                  ncommutator_block = ncommutator_block + 1
+                  commutator_rows(ncommutator_block) = MIN(iatom, jatom)
+                  commutator_cols(ncommutator_block) = MAX(iatom, jatom)
+               END DO
+               CALL neighbor_list_iterator_release(nl_iterator)
+               DO idir = 1, ncart
+                  CALL dbcsr_finalize(commutator_ao(idir)%matrix)
+                  CALL dbcsr_reserve_blocks(commutator_ao(idir)%matrix, &
+                                            commutator_rows(1:ncommutator_block), &
+                                            commutator_cols(1:ncommutator_block))
+                  CALL dbcsr_finalize(commutator_ao(idir)%matrix)
+                  CALL dbcsr_set(commutator_ao(idir)%matrix, 0.0_dp)
+               END DO
+               DEALLOCATE (commutator_cols, commutator_rows)
+            END IF
+            CALL build_com_mom_nl(qs_kind_set, sab_orb, sap_ppnl, dft_control%qs_control%eps_ppnl, &
+                                  particle_set, cell, matrix_rv=commutator_ao)
+         END IF
+      ELSE
+         CALL ecd_build_length_ao(qs_env, pseudopotential_commutator, reference_point, operator_ao, magnetic_ao)
+         include_nonlocal_velocity = .FALSE.
+      END IF
 
-      CALL cp_fm_release(operator_coeff)
+      ALLOCATE (operators(SIZE(mos)))
+      DO ispin = 1, SIZE(mos)
+         NULLIFY (coeff_struct, eigenvalues, mo_coeff)
+         CALL get_mo_set(mos(ispin), eigenvalues=eigenvalues, mo_coeff=mo_coeff, nmo=nmo)
+         CPASSERT(ASSOCIATED(eigenvalues))
+         CPASSERT(ASSOCIATED(mo_coeff))
+         IF (SIZE(eigenvalues) /= nmo) CPABORT("ECD| E1/M1 eigenvalue and MO dimensions are inconsistent")
+         CALL cp_fm_get_info(mo_coeff, matrix_struct=coeff_struct, nrow_global=nao, ncol_global=nmo)
+         ALLOCATE (operators(ispin)%e1(ncart, nmo, nmo), operators(ispin)%m1(ncart, nmo, nmo), &
+                   operator_matrix(nmo, nmo))
+         operators(ispin)%e1 = CMPLX(0.0_dp, 0.0_dp, KIND=dp)
+         operators(ispin)%m1 = CMPLX(0.0_dp, 0.0_dp, KIND=dp)
+         IF (use_velocity) THEN
+            ALLOCATE (velocity_mo(ncart, nmo, nmo))
+            IF (include_nonlocal_velocity) ALLOCATE (commutator_matrix(nmo, nmo))
+         ELSE
+            ALLOCATE (magnetic_matrix(nmo, nmo))
+         END IF
 
-   END SUBROUTINE ecd_project_operator_to_mo
+         DO idir = 1, ncart
+            CALL cp_fm_create(operator_coeff, coeff_struct, name="ECD operator C")
+            CALL cp_fm_create(operator_mo, coeff_struct, nrow=nmo, ncol=nmo, name="ECD C^T operator C")
+            CALL cp_dbcsr_sm_fm_multiply(operator_ao(idir)%matrix, mo_coeff, operator_coeff, ncol=nmo, &
+                                         alpha=1.0_dp, beta=0.0_dp)
+            CALL parallel_gemm("T", "N", nmo, nmo, nao, &
+                               1.0_dp, mo_coeff, operator_coeff, 0.0_dp, operator_mo)
+            CALL cp_fm_get_submatrix(operator_mo, operator_matrix)
+            CALL cp_fm_release(operator_coeff)
+            CALL cp_fm_release(operator_mo)
+            IF (use_velocity) THEN
+               IF (include_nonlocal_velocity) THEN
+                  CALL cp_fm_create(operator_coeff, coeff_struct, name="ECD commutator C")
+                  CALL cp_fm_create(operator_mo, coeff_struct, nrow=nmo, ncol=nmo, name="ECD C^T commutator C")
+                  CALL cp_dbcsr_sm_fm_multiply(commutator_ao(idir)%matrix, mo_coeff, operator_coeff, ncol=nmo, &
+                                               alpha=1.0_dp, beta=0.0_dp)
+                  CALL parallel_gemm("T", "N", nmo, nmo, nao, &
+                                     1.0_dp, mo_coeff, operator_coeff, 0.0_dp, operator_mo)
+                  CALL cp_fm_get_submatrix(operator_mo, commutator_matrix)
+                  CALL cp_fm_release(operator_coeff)
+                  CALL cp_fm_release(operator_mo)
+                  operator_matrix = operator_matrix + commutator_matrix
+               END IF
+               velocity_mo(idir, :, :) = CMPLX(0.0_dp, -operator_matrix, KIND=dp)
+            ELSE
+               operators(ispin)%e1(idir, :, :) = CMPLX(-operator_matrix, 0.0_dp, KIND=dp)
+               CALL cp_fm_create(operator_coeff, coeff_struct, name="ECD magnetic C")
+               CALL cp_fm_create(operator_mo, coeff_struct, nrow=nmo, ncol=nmo, name="ECD C^T magnetic C")
+               CALL cp_dbcsr_sm_fm_multiply(magnetic_ao(idir)%matrix, mo_coeff, operator_coeff, ncol=nmo, &
+                                            alpha=1.0_dp, beta=0.0_dp)
+               CALL parallel_gemm("T", "N", nmo, nmo, nao, &
+                                  1.0_dp, mo_coeff, operator_coeff, 0.0_dp, operator_mo)
+               CALL cp_fm_get_submatrix(operator_mo, magnetic_matrix)
+               CALL cp_fm_release(operator_coeff)
+               CALL cp_fm_release(operator_mo)
+               operators(ispin)%m1(idir, :, :) = CMPLX(0.0_dp, 0.5_dp*magnetic_matrix, KIND=dp)
+            END IF
+         END DO
+
+         IF (use_velocity) THEN
+            DO column = 1, nmo
+               DO row = 1, nmo
+                  IF (row == column) CYCLE
+                  gap = eigenvalues(row) - eigenvalues(column)
+                  IF (ABS(gap) <= velocity_degeneracy_threshold) THEN
+                     IF (reject_degenerate) CPABORT("ECD| VELOCITY gauge requires non-degenerate MO energies")
+                     CYCLE
+                  END IF
+                  operators(ispin)%e1(:, row, column) = &
+                     CMPLX(0.0_dp, 1.0_dp, KIND=dp)*velocity_mo(:, row, column)/gap
+               END DO
+            END DO
+            operators(ispin)%m1(1, :, :) = 0.5_dp*( &
+                                           MATMUL(operators(ispin)%e1(2, :, :), velocity_mo(3, :, :)) - &
+                                           MATMUL(operators(ispin)%e1(3, :, :), velocity_mo(2, :, :)))
+            operators(ispin)%m1(2, :, :) = 0.5_dp*( &
+                                           MATMUL(operators(ispin)%e1(3, :, :), velocity_mo(1, :, :)) - &
+                                           MATMUL(operators(ispin)%e1(1, :, :), velocity_mo(3, :, :)))
+            operators(ispin)%m1(3, :, :) = 0.5_dp*( &
+                                           MATMUL(operators(ispin)%e1(1, :, :), velocity_mo(2, :, :)) - &
+                                           MATMUL(operators(ispin)%e1(2, :, :), velocity_mo(1, :, :)))
+            DEALLOCATE (velocity_mo)
+            IF (ALLOCATED(commutator_matrix)) DEALLOCATE (commutator_matrix)
+         ELSE
+            DEALLOCATE (magnetic_matrix)
+         END IF
+         DEALLOCATE (operator_matrix)
+      END DO
+
+      CALL dbcsr_deallocate_matrix_set(operator_ao)
+      IF (ASSOCIATED(magnetic_ao)) CALL dbcsr_deallocate_matrix_set(magnetic_ao)
+      IF (ASSOCIATED(commutator_ao)) CALL dbcsr_deallocate_matrix_set(commutator_ao)
+
+   END SUBROUTINE ecd_build_e1_m1_mo
+
+! **************************************************************************************************
+!> \brief Build direct length-gauge E1 and M1 AO operators.
+! **************************************************************************************************
+   SUBROUTINE ecd_build_length_ao(qs_env, pseudopotential_commutator, reference_point, position_ao, magnetic_ao)
+      TYPE(qs_environment_type), POINTER                 :: qs_env
+      LOGICAL, INTENT(IN)                                :: pseudopotential_commutator
+      REAL(KIND=dp), DIMENSION(ncart), INTENT(IN)        :: reference_point
+      TYPE(dbcsr_p_type), DIMENSION(:), INTENT(INOUT), &
+         POINTER                                         :: position_ao, magnetic_ao
+
+      INTEGER                                            :: idir
+      TYPE(cell_type), POINTER                           :: cell
+      TYPE(dbcsr_p_type), DIMENSION(:), POINTER          :: magnetic_nl, magnetic_nl_full, matrix_s
+      TYPE(dft_control_type), POINTER                    :: dft_control
+      TYPE(neighbor_list_set_p_type), DIMENSION(:), &
+         POINTER                                         :: sab_all, sab_orb, sap_ppnl
+      TYPE(particle_type), DIMENSION(:), POINTER         :: particle_set
+      TYPE(qs_kind_type), DIMENSION(:), POINTER          :: qs_kind_set
+
+      NULLIFY (cell, dft_control, magnetic_nl, magnetic_nl_full, matrix_s, particle_set, qs_kind_set, sab_all, sab_orb, &
+               sap_ppnl)
+      CALL get_qs_env(qs_env, cell=cell, dft_control=dft_control, matrix_s=matrix_s, &
+                      particle_set=particle_set, qs_kind_set=qs_kind_set, sab_orb=sab_orb, &
+                      sab_all=sab_all, sap_ppnl=sap_ppnl)
+      CPASSERT(ASSOCIATED(cell))
+      CPASSERT(ASSOCIATED(dft_control))
+      CPASSERT(ASSOCIATED(matrix_s))
+      CPASSERT(ASSOCIATED(particle_set))
+      CPASSERT(ASSOCIATED(qs_kind_set))
+      CPASSERT(ASSOCIATED(sab_all))
+      CPASSERT(ASSOCIATED(sab_orb))
+
+      CALL dbcsr_allocate_matrix_set(position_ao, ncart)
+      CALL dbcsr_allocate_matrix_set(magnetic_ao, ncart)
+      DO idir = 1, ncart
+         CALL dbcsr_init_p(position_ao(idir)%matrix)
+         CALL dbcsr_create(position_ao(idir)%matrix, template=matrix_s(1)%matrix, &
+                           matrix_type=dbcsr_type_symmetric)
+         CALL cp_dbcsr_alloc_block_from_nbl(position_ao(idir)%matrix, sab_orb)
+         CALL dbcsr_set(position_ao(idir)%matrix, 0.0_dp)
+         CALL dbcsr_init_p(magnetic_ao(idir)%matrix)
+         IF (ALL(cell%perd == 1)) THEN
+            CALL dbcsr_create(magnetic_ao(idir)%matrix, template=matrix_s(1)%matrix, &
+                              matrix_type=dbcsr_type_no_symmetry)
+            CALL cp_dbcsr_alloc_block_from_nbl(magnetic_ao(idir)%matrix, sab_all)
+         ELSE
+            CALL dbcsr_create(magnetic_ao(idir)%matrix, template=matrix_s(1)%matrix, &
+                              matrix_type=dbcsr_type_antisymmetric)
+            CALL cp_dbcsr_alloc_block_from_nbl(magnetic_ao(idir)%matrix, sab_orb)
+         END IF
+         CALL dbcsr_set(magnetic_ao(idir)%matrix, 0.0_dp)
+      END DO
+
+      CALL build_local_moment_matrix(qs_env, position_ao, 1, ref_point=reference_point)
+      IF (ALL(cell%perd == 1)) THEN
+         CALL build_ang_mom_matrix(qs_env, magnetic_ao, reference_point)
+      ELSE
+         CALL build_local_magmom_matrix(qs_env, magnetic_ao, 1, ref_point=reference_point)
+      END IF
+
+      IF (pseudopotential_commutator .AND. ASSOCIATED(sap_ppnl)) THEN
+         CALL dbcsr_allocate_matrix_set(magnetic_nl, ncart)
+         DO idir = 1, ncart
+            CALL dbcsr_init_p(magnetic_nl(idir)%matrix)
+            CALL dbcsr_create(magnetic_nl(idir)%matrix, template=matrix_s(1)%matrix, &
+                              matrix_type=dbcsr_type_antisymmetric)
+            CALL cp_dbcsr_alloc_block_from_nbl(magnetic_nl(idir)%matrix, sab_orb)
+            CALL dbcsr_set(magnetic_nl(idir)%matrix, 0.0_dp)
+         END DO
+         IF (ALL(cell%perd == 1)) THEN
+            CALL build_com_nl_mag(qs_kind_set, sab_orb, sap_ppnl, dft_control%qs_control%eps_ppnl, &
+                                  particle_set, magnetic_nl, reference_point, cell)
+            CALL dbcsr_allocate_matrix_set(magnetic_nl_full, ncart)
+            DO idir = 1, ncart
+               CALL dbcsr_init_p(magnetic_nl_full(idir)%matrix)
+               CALL dbcsr_create(magnetic_nl_full(idir)%matrix, template=matrix_s(1)%matrix, &
+                                 matrix_type=dbcsr_type_no_symmetry)
+               CALL dbcsr_desymmetrize(magnetic_nl(idir)%matrix, magnetic_nl_full(idir)%matrix)
+               CALL dbcsr_add(magnetic_ao(idir)%matrix, magnetic_nl_full(idir)%matrix, 1.0_dp, -1.0_dp)
+            END DO
+            CALL dbcsr_deallocate_matrix_set(magnetic_nl_full)
+         ELSE
+            CALL build_com_mom_nl(qs_kind_set, sab_orb, sap_ppnl, dft_control%qs_control%eps_ppnl, &
+                                  particle_set, cell, matrix_rxrv=magnetic_nl, ref_point=reference_point)
+            DO idir = 1, ncart
+               CALL dbcsr_add(magnetic_ao(idir)%matrix, magnetic_nl(idir)%matrix, 1.0_dp, 1.0_dp)
+            END DO
+         END IF
+         CALL dbcsr_deallocate_matrix_set(magnetic_nl)
+      END IF
+
+   END SUBROUTINE ecd_build_length_ao
 
 END MODULE qs_ecd_operator_utils

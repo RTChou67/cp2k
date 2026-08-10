@@ -9,72 +9,55 @@
 !> \brief Electronic circular dichroism input validation and spectrum drivers.
 ! **************************************************************************************************
 MODULE qs_ecd_methods
-   USE cell_types, ONLY: cell_type, &
-                         use_perd_none
-   USE commutator_rpnl, ONLY: build_com_mom_nl, &
-                              build_com_nl_mag
-   USE cp_files, ONLY: close_file, &
-                       open_file
-   USE cp_control_types, ONLY: dft_control_type
-   USE cp_dbcsr_api, ONLY: dbcsr_add, &
-                           dbcsr_create, &
-                           dbcsr_desymmetrize, &
-                           dbcsr_init_p, &
-                           dbcsr_p_type, &
-                           dbcsr_set, &
-                           dbcsr_type_no_symmetry, &
-                           dbcsr_type_antisymmetric, &
-                           dbcsr_type_symmetric
-   USE cp_dbcsr_cp2k_link, ONLY: cp_dbcsr_alloc_block_from_nbl
-   USE cp_dbcsr_operations, ONLY: cp_dbcsr_sm_fm_multiply, &
-                                  dbcsr_allocate_matrix_set, &
-                                  dbcsr_deallocate_matrix_set
-   USE cp_dbcsr_output, ONLY: cp_dbcsr_write_sparse_matrix
-   USE cp_fm_basic_linalg, ONLY: cp_fm_trace
-   USE cp_fm_struct, ONLY: cp_fm_struct_type
-   USE cp_fm_types, ONLY: cp_fm_create, &
-                          cp_fm_get_info, &
-                          cp_fm_get_submatrix, &
-                          cp_fm_release, &
-                          cp_fm_type
-   USE cp_log_handling, ONLY: cp_get_default_logger, &
-                              cp_logger_generate_filename, &
-                              cp_logger_get_default_io_unit, &
-                              cp_logger_type
-   USE external_potential_types, ONLY: all_potential_type
-   USE input_section_types, ONLY: section_vals_get, &
-                                  section_vals_get_subs_vals, &
-                                  section_vals_type, &
-                                  section_vals_val_get
-   USE input_constants, ONLY: do_method_gapw, &
-                              do_method_gpw, &
-                              no_sf_tddfpt, &
-                              tddfpt_dipole_length, &
-                              tddfpt_dipole_velocity, &
-                              tddfpt_kernel_full, &
-                              tddfpt_kernel_none, &
-                              use_mom_ref_user
-   USE kinds, ONLY: default_path_length, &
-                    dp
-   USE moments_utils, ONLY: get_reference_point
-   USE physcon, ONLY: evolt
-   USE qs_ecd_operator_utils, ONLY: ecd_project_operator_to_mo
-   USE qs_environment_types, ONLY: get_qs_env, &
-                                   qs_environment_type
-   USE qs_ecd_spectra_xyz, ONLY: ecd_spectra_xyz_ipa
-   USE qs_kind_types, ONLY: get_qs_kind, &
-                             qs_kind_type
-   USE qs_mo_types, ONLY: get_mo_set, &
-                          mo_set_type
-   USE qs_moments, ONLY: build_local_magmom_matrix, &
-                         build_local_moment_matrix
-   USE qs_neighbor_list_types, ONLY: neighbor_list_set_p_type
-   USE qs_operators_ao, ONLY: build_ang_mom_matrix, &
-                              build_lin_mom_matrix
-   USE qs_tddfpt2_types, ONLY: tddfpt_ground_state_mos
-   USE particle_types, ONLY: particle_type
-   USE scf_control_types, ONLY: scf_control_type
-   USE util, ONLY: sort
+   USE cell_types,                      ONLY: cell_type,&
+                                              use_perd_none
+   USE cp_control_types,                ONLY: dft_control_type
+   USE cp_dbcsr_api,                    ONLY: dbcsr_p_type
+   USE cp_dbcsr_operations,             ONLY: cp_dbcsr_sm_fm_multiply,&
+                                              dbcsr_deallocate_matrix_set
+   USE cp_files,                        ONLY: close_file,&
+                                              open_file
+   USE cp_fm_basic_linalg,              ONLY: cp_fm_trace
+   USE cp_fm_struct,                    ONLY: cp_fm_struct_type
+   USE cp_fm_types,                     ONLY: cp_fm_create,&
+                                              cp_fm_get_info,&
+                                              cp_fm_release,&
+                                              cp_fm_type
+   USE cp_log_handling,                 ONLY: cp_get_default_logger,&
+                                              cp_logger_generate_filename,&
+                                              cp_logger_get_default_io_unit,&
+                                              cp_logger_type
+   USE external_potential_types,        ONLY: all_potential_type
+   USE input_constants,                 ONLY: do_method_gapw,&
+                                              do_method_gpw,&
+                                              no_sf_tddfpt,&
+                                              tddfpt_dipole_length,&
+                                              tddfpt_dipole_velocity,&
+                                              tddfpt_kernel_full,&
+                                              tddfpt_kernel_none,&
+                                              use_mom_ref_user
+   USE input_section_types,             ONLY: section_vals_get,&
+                                              section_vals_get_subs_vals,&
+                                              section_vals_type,&
+                                              section_vals_val_get
+   USE kinds,                           ONLY: default_path_length,&
+                                              dp
+   USE moments_utils,                   ONLY: get_reference_point
+   USE particle_types,                  ONLY: particle_type
+   USE physcon,                         ONLY: evolt
+   USE qs_ecd_operator_utils,           ONLY: ecd_build_e1_m1_mo,&
+                                              ecd_build_length_ao,&
+                                              ecd_mo_operators_type
+   USE qs_ecd_spectra_xyz,              ONLY: ecd_spectra_xyz_ipa
+   USE qs_environment_types,            ONLY: get_qs_env,&
+                                              qs_environment_type
+   USE qs_kind_types,                   ONLY: get_qs_kind,&
+                                              qs_kind_type
+   USE qs_mo_types,                     ONLY: get_mo_set,&
+                                              mo_set_type
+   USE qs_tddfpt2_types,                ONLY: tddfpt_ground_state_mos
+   USE scf_control_types,               ONLY: scf_control_type
+   USE util,                            ONLY: sort
 #include "./base/base_uses.f90"
 
    IMPLICIT NONE
@@ -83,34 +66,43 @@ MODULE qs_ecd_methods
 
    CHARACTER(len=*), PARAMETER, PRIVATE :: moduleN = 'qs_ecd_methods'
    INTEGER, PARAMETER, PRIVATE          :: ncart = 3
-   REAL(KIND=dp), PARAMETER, PRIVATE    :: velocity_degeneracy_threshold = 1.0E-8_dp
 
-   PUBLIC :: ecd_dispatch, ecd_spectra_none_tddfpt, ecd_validate_input
+   PUBLIC :: ecd_spectra, ecd_spectra_none_tddfpt
 
 CONTAINS
 
 ! **************************************************************************************************
-!> \brief Validate ECD input before any optional TDDFPT calculation.
+!> \brief Read and validate the ECD configuration for the active calculation path.
 ! **************************************************************************************************
-   SUBROUTINE ecd_validate_input(qs_env)
+   SUBROUTINE ecd_read_input(qs_env, do_ecd, ecd_gauge, ecd_gauge_explicit, &
+                             pseudopotential_commutator, reference_point)
       TYPE(qs_environment_type), POINTER                 :: qs_env
+      LOGICAL, INTENT(OUT)                               :: do_ecd
+      INTEGER, INTENT(OUT)                               :: ecd_gauge
+      LOGICAL, INTENT(OUT)                               :: ecd_gauge_explicit, &
+                                                            pseudopotential_commutator
+      REAL(KIND=dp), DIMENSION(ncart), INTENT(OUT)       :: reference_point
 
-      CHARACTER(LEN=*), PARAMETER                        :: routineN = 'ecd_validate_input'
+      CHARACTER(LEN=*), PARAMETER                        :: routineN = 'ecd_read_input'
 
-      INTEGER                                            :: ecd_gauge, handle, ikind, poisson_periodic, spinflip, tddfpt_kernel
-      LOGICAL                                            :: do_ecd, do_hfx, do_kpoints, do_soc, ecd_gauge_explicit, &
-                                                            pseudopotential_commutator, tddfpt_enabled
+      INTEGER                                            :: handle, ikind, poisson_periodic, &
+                                                            reference, spinflip, tddfpt_kernel
+      LOGICAL                                            :: do_hfx, do_kpoints, do_soc, &
+                                                            ref_point_explicit, tddfpt_enabled
+      REAL(KIND=dp), DIMENSION(:), POINTER               :: ref_point
       TYPE(all_potential_type), POINTER                  :: all_potential
       TYPE(cell_type), POINTER                           :: cell
       TYPE(dft_control_type), POINTER                    :: dft_control
+      TYPE(particle_type), DIMENSION(:), POINTER         :: particle_set
       TYPE(qs_kind_type), DIMENSION(:), POINTER          :: qs_kind_set
-      TYPE(section_vals_type), POINTER                   :: ecd_section, hfx_section, poisson_section, soc_section, &
+      TYPE(section_vals_type), POINTER                   :: ecd_section, hfx_section, &
+                                                            poisson_section, soc_section, &
                                                             tddfpt_section
 
       CALL timeset(routineN, handle)
 
-      NULLIFY (all_potential, cell, dft_control, ecd_section, hfx_section, poisson_section, qs_kind_set, soc_section, &
-               tddfpt_section)
+      NULLIFY (all_potential, cell, dft_control, ecd_section, hfx_section, particle_set, qs_kind_set, ref_point, &
+               soc_section, tddfpt_section)
       ecd_section => section_vals_get_subs_vals(qs_env%input, "PROPERTIES%ECD")
       CALL section_vals_val_get(ecd_section, "DO_ECD", l_val=do_ecd)
       IF (.NOT. do_ecd) THEN
@@ -120,6 +112,18 @@ CONTAINS
       CALL section_vals_val_get(ecd_section, "GAUGE", i_val=ecd_gauge, explicit=ecd_gauge_explicit)
       IF (ecd_gauge /= tddfpt_dipole_length .AND. ecd_gauge /= tddfpt_dipole_velocity) THEN
          CPABORT("ECD| ECD supports GAUGE LENGTH and VELOCITY")
+      END IF
+      CALL section_vals_val_get(ecd_section, "PSEUDOPOTENTIAL_COMMUTATOR", &
+                                l_val=pseudopotential_commutator)
+      CALL section_vals_val_get(ecd_section, "REFERENCE", i_val=reference)
+      CALL section_vals_val_get(ecd_section, "REF_POINT", explicit=ref_point_explicit)
+      IF (ref_point_explicit) CALL section_vals_val_get(ecd_section, "REF_POINT", r_vals=ref_point)
+      IF (reference == use_mom_ref_user) THEN
+         IF (.NOT. ref_point_explicit) CPABORT("ECD| REFERENCE USER_DEFINED requires REF_POINT")
+         IF (.NOT. ASSOCIATED(ref_point)) CPABORT("ECD| REF_POINT expects three coordinates")
+         IF (SIZE(ref_point) /= ncart) CPABORT("ECD| REF_POINT expects three coordinates")
+      ELSEIF (ref_point_explicit) THEN
+         CPWARN("ECD| REF_POINT is used only with REFERENCE USER_DEFINED")
       END IF
       hfx_section => section_vals_get_subs_vals(qs_env%input, "DFT%XC%HF")
       CALL section_vals_get(hfx_section, explicit=do_hfx)
@@ -170,6 +174,22 @@ CONTAINS
          CPABORT("ECD| Current implementation requires CELL%PERIODIC NONE or XYZ")
       END IF
 
+      IF (ALL(cell%perd == 1)) THEN
+         CALL get_qs_env(qs_env, particle_set=particle_set)
+         CPASSERT(ASSOCIATED(particle_set))
+         IF (reference == use_mom_ref_user) THEN
+            CALL get_reference_point(reference_point, qs_env=qs_env, reference=reference, ref_point=ref_point, &
+                                     ifirst=1, ilast=SIZE(particle_set))
+         ELSE
+            CALL get_reference_point(reference_point, qs_env=qs_env, reference=reference, &
+                                     ifirst=1, ilast=SIZE(particle_set))
+         END IF
+      ELSEIF (reference == use_mom_ref_user) THEN
+         CALL get_reference_point(reference_point, qs_env=qs_env, reference=reference, ref_point=ref_point)
+      ELSE
+         CALL get_reference_point(reference_point, qs_env=qs_env, reference=reference)
+      END IF
+
       tddfpt_section => section_vals_get_subs_vals(qs_env%input, "PROPERTIES%TDDFPT")
       CALL section_vals_get(tddfpt_section, explicit=tddfpt_enabled)
       IF (tddfpt_enabled) THEN
@@ -194,149 +214,95 @@ CONTAINS
 
       CALL timestop(handle)
 
-   END SUBROUTINE ecd_validate_input
+   END SUBROUTINE ecd_read_input
 
 ! **************************************************************************************************
-!> \brief Dispatch independent-particle ECD after optional TDDFPT has completed.
+!> \brief Run independent-particle ECD after optional TDDFPT has completed.
 ! **************************************************************************************************
-   SUBROUTINE ecd_dispatch(qs_env)
+   SUBROUTINE ecd_spectra(qs_env)
       TYPE(qs_environment_type), POINTER                 :: qs_env
 
-      CHARACTER(LEN=*), PARAMETER                        :: routineN = 'ecd_dispatch'
+      CHARACTER(LEN=*), PARAMETER                        :: routineN = 'ecd_spectra'
 
-      INTEGER                                            :: ecd_gauge, handle, tddfpt_kernel
-      LOGICAL                                            :: do_ecd, ecd_gauge_explicit, pseudopotential_commutator, tddfpt_enabled
+      INTEGER                                            :: ecd_gauge, handle
+      LOGICAL                                            :: do_ecd, ecd_gauge_explicit, &
+                                                            pseudopotential_commutator
+      REAL(KIND=dp), DIMENSION(ncart)                    :: reference_point
       TYPE(cell_type), POINTER                           :: cell
-      TYPE(section_vals_type), POINTER                   :: ecd_section, tddfpt_section
+      TYPE(dft_control_type), POINTER                    :: dft_control
 
       CALL timeset(routineN, handle)
 
-      NULLIFY (cell, ecd_section, tddfpt_section)
-      ecd_section => section_vals_get_subs_vals(qs_env%input, "PROPERTIES%ECD")
-      CALL section_vals_val_get(ecd_section, "DO_ECD", l_val=do_ecd)
+      NULLIFY (cell, dft_control)
+      CALL get_qs_env(qs_env, cell=cell, dft_control=dft_control)
+      CPASSERT(ASSOCIATED(cell))
+      CPASSERT(ASSOCIATED(dft_control))
+      CALL ecd_read_input(qs_env, do_ecd, ecd_gauge, ecd_gauge_explicit, &
+                          pseudopotential_commutator, reference_point)
       IF (.NOT. do_ecd) THEN
          CALL timestop(handle)
          RETURN
       END IF
-
-      tddfpt_section => section_vals_get_subs_vals(qs_env%input, "PROPERTIES%TDDFPT")
-      CALL section_vals_get(tddfpt_section, explicit=tddfpt_enabled)
-      IF (tddfpt_enabled) THEN
-         CALL section_vals_val_get(tddfpt_section, "KERNEL", i_val=tddfpt_kernel)
-         IF (tddfpt_kernel == tddfpt_kernel_full) THEN
-            CALL timestop(handle)
-            RETURN
-         END IF
+      IF (dft_control%tddfpt2_control%enabled .AND. &
+          dft_control%tddfpt2_control%kernel == tddfpt_kernel_full) THEN
+         CALL timestop(handle)
+         RETURN
       END IF
 
-      CALL get_qs_env(qs_env, cell=cell)
-      CPASSERT(ASSOCIATED(cell))
-      IF (ALL(cell%perd == 0)) THEN
-         CALL ecd_spectra_molecular_ipa(qs_env, periodic_supercell=.FALSE.)
+      IF (ALL(cell%perd == 0) .OR. &
+          (ecd_gauge_explicit .AND. ecd_gauge == tddfpt_dipole_length)) THEN
+         CALL ecd_spectra_molecular_ipa(qs_env, ecd_gauge, pseudopotential_commutator, reference_point)
       ELSEIF (ALL(cell%perd == 1)) THEN
-         CALL section_vals_val_get(ecd_section, "GAUGE", i_val=ecd_gauge, explicit=ecd_gauge_explicit)
-         IF (ecd_gauge_explicit .AND. ecd_gauge == tddfpt_dipole_length) THEN
-            CALL ecd_spectra_molecular_ipa(qs_env, periodic_supercell=.TRUE.)
-         ELSE
-            CALL section_vals_val_get(ecd_section, "PSEUDOPOTENTIAL_COMMUTATOR", &
-                                      l_val=pseudopotential_commutator)
-            CALL ecd_spectra_xyz_ipa(qs_env, pseudopotential_commutator)
-         END IF
+         CALL ecd_spectra_xyz_ipa(qs_env, pseudopotential_commutator, reference_point)
       ELSE
          CPABORT("ECD| Current implementation requires CELL%PERIODIC NONE or XYZ")
       END IF
 
       CALL timestop(handle)
 
-   END SUBROUTINE ecd_dispatch
+   END SUBROUTINE ecd_spectra
 
 ! **************************************************************************************************
 !> \brief Assemble molecular IPA ECD sticks from open-boundary or periodic-supercell orbitals.
 !> \param qs_env Quickstep environment
-!> \param periodic_supercell Select the PERIODIC XYZ molecular-supercell length-gauge contract
+!> \param ecd_gauge E1/M1 gauge selected by the ECD input
+!> \param pseudopotential_commutator Include the non-local pseudopotential contribution
+!> \param reference_point Common E1/M1 reference point
 ! **************************************************************************************************
-   SUBROUTINE ecd_spectra_molecular_ipa(qs_env, periodic_supercell)
+   SUBROUTINE ecd_spectra_molecular_ipa(qs_env, ecd_gauge, pseudopotential_commutator, &
+                                        reference_point)
       TYPE(qs_environment_type), POINTER                 :: qs_env
-      LOGICAL, INTENT(IN)                                :: periodic_supercell
+      INTEGER, INTENT(IN)                                :: ecd_gauge
+      LOGICAL, INTENT(IN)                                :: pseudopotential_commutator
+      REAL(KIND=dp), DIMENSION(ncart), INTENT(IN)        :: reference_point
 
-      CHARACTER(LEN=*), PARAMETER                        :: routineN = 'ecd_spectra_molecular_ipa'
+      CHARACTER(LEN=*), PARAMETER :: routineN = 'ecd_spectra_molecular_ipa'
 
-      INTEGER                                            :: ao_e1_unit, ao_m1_unit, column, e1_mo_unit, e1_unit, ecd_gauge, &
-                                                            handle, homo, idir, iocc, iounit, ispin, itrans, ivirt, m1_mo_unit, &
-                                                            m1_unit, nmo, nspins, &
-                                                            ntrans_total, reference, row
-      CHARACTER(LEN=default_path_length)                 :: ao_e1_filename, ao_m1_filename, e1_filename, e1_mo_filename, &
-                                                            m1_filename, m1_mo_filename
-      LOGICAL                                            :: pseudopotential_commutator, use_velocity_gauge
-      LOGICAL                                            :: ref_point_explicit, write_operator_diagnostics, &
-                                                            write_transition_matrices
-      REAL(KIND=dp), DIMENSION(ncart)                    :: reference_point
+      CHARACTER(LEN=default_path_length)                 :: e1_filename, m1_filename
+      INTEGER                                            :: e1_unit, handle, homo, idir, iocc, &
+                                                            iounit, ispin, itrans, ivirt, m1_unit, &
+                                                            nmo, nspins, ntrans_total
       INTEGER, ALLOCATABLE, DIMENSION(:)                 :: transition_order
-      REAL(KIND=dp), DIMENSION(:), ALLOCATABLE           :: rotatory_strength, transition_energy
-      COMPLEX(KIND=dp), DIMENSION(:, :, :), ALLOCATABLE  :: e1_mo, m1_mo, velocity_mo_matrix
-      REAL(KIND=dp), DIMENSION(:, :), ALLOCATABLE        :: operator_mo_matrix
+      LOGICAL                                            :: periodic_supercell, use_velocity_gauge, &
+                                                            write_transition_matrices
+      REAL(KIND=dp), ALLOCATABLE, DIMENSION(:)           :: rotatory_strength, transition_energy
       REAL(KIND=dp), DIMENSION(:), POINTER               :: eigenvalues, occupation_numbers
-      REAL(KIND=dp), DIMENSION(:), POINTER               :: ref_point
-      TYPE(cp_fm_type)                                   :: operator_mo
-      TYPE(cp_fm_type), POINTER                          :: mo_coeff
-      TYPE(dbcsr_p_type), DIMENSION(:), POINTER          :: magnetic_ao, position_ao, velocity_ao
+      TYPE(cell_type), POINTER                           :: cell
       TYPE(cp_logger_type), POINTER                      :: logger
+      TYPE(ecd_mo_operators_type), ALLOCATABLE, &
+         DIMENSION(:)                                    :: operators
       TYPE(mo_set_type), DIMENSION(:), POINTER           :: mos
-      TYPE(particle_type), DIMENSION(:), POINTER         :: particle_set
       TYPE(scf_control_type), POINTER                    :: scf_control
-      TYPE(section_vals_type), POINTER                   :: ecd_section
 
       CALL timeset(routineN, handle)
 
-      NULLIFY (ecd_section, eigenvalues, logger, magnetic_ao, mo_coeff, mos, occupation_numbers, &
-               particle_set, position_ao, ref_point, scf_control, velocity_ao)
-      ecd_section => section_vals_get_subs_vals(qs_env%input, "PROPERTIES%ECD")
-
-      CALL section_vals_val_get(ecd_section, "GAUGE", i_val=ecd_gauge)
-      IF (ecd_gauge /= tddfpt_dipole_length .AND. ecd_gauge /= tddfpt_dipole_velocity) THEN
-         CPABORT("ECD| Molecular ECD supports GAUGE LENGTH and VELOCITY")
-      END IF
+      NULLIFY (cell, eigenvalues, logger, mos, occupation_numbers, scf_control)
+      CALL get_qs_env(qs_env, cell=cell)
+      CPASSERT(ASSOCIATED(cell))
+      periodic_supercell = ALL(cell%perd == 1)
       use_velocity_gauge = ecd_gauge == tddfpt_dipole_velocity
       IF (periodic_supercell .AND. use_velocity_gauge) THEN
          CPABORT("ECD| PERIODIC XYZ molecular-supercell ECD uses GAUGE LENGTH")
-      END IF
-
-      CALL section_vals_val_get(ecd_section, "PSEUDOPOTENTIAL_COMMUTATOR", &
-                                l_val=pseudopotential_commutator)
-
-      CALL section_vals_val_get(ecd_section, "REFERENCE", i_val=reference)
-      CALL section_vals_val_get(ecd_section, "REF_POINT", explicit=ref_point_explicit)
-      IF (ref_point_explicit) THEN
-         CALL section_vals_val_get(ecd_section, "REF_POINT", r_vals=ref_point)
-      END IF
-      IF (reference == use_mom_ref_user) THEN
-         IF (.NOT. ref_point_explicit) THEN
-            CPABORT("ECD| REFERENCE USER_DEFINED requires REF_POINT")
-         END IF
-         IF (.NOT. ASSOCIATED(ref_point) .OR. SIZE(ref_point) /= ncart) THEN
-            CPABORT("ECD| REF_POINT expects three coordinates")
-         END IF
-      ELSE
-         IF (ref_point_explicit) THEN
-            CPWARN("ECD| REF_POINT is used only with REFERENCE USER_DEFINED")
-         END IF
-      END IF
-      IF (periodic_supercell) THEN
-         ! Treat the cell contents as one localized molecule when resolving its
-         ! reference point, so a molecule centered on a periodic boundary stays whole.
-         CALL get_qs_env(qs_env, particle_set=particle_set)
-         CPASSERT(ASSOCIATED(particle_set))
-         IF (reference == use_mom_ref_user) THEN
-            CALL get_reference_point(reference_point, qs_env=qs_env, reference=reference, ref_point=ref_point, &
-                                     ifirst=1, ilast=SIZE(particle_set))
-         ELSE
-            CALL get_reference_point(reference_point, qs_env=qs_env, reference=reference, &
-                                     ifirst=1, ilast=SIZE(particle_set))
-         END IF
-      ELSEIF (reference == use_mom_ref_user) THEN
-         CALL get_reference_point(reference_point, qs_env=qs_env, reference=reference, ref_point=ref_point)
-      ELSE
-         CALL get_reference_point(reference_point, qs_env=qs_env, reference=reference)
       END IF
 
       ! Direct occupied-virtual transitions are assembled independently.
@@ -363,37 +329,6 @@ CONTAINS
       CALL cp_logger_generate_filename(logger, m1_filename, logger%iter_info%project_name, &
                                        "-ecd-m1-transition-matrix.dat", local=.FALSE.)
       write_transition_matrices = logger%para_env%is_source()
-      write_operator_diagnostics = .NOT. use_velocity_gauge
-      ao_e1_unit = -1
-      ao_m1_unit = -1
-      e1_mo_unit = -1
-      m1_mo_unit = -1
-      IF (write_operator_diagnostics) THEN
-         CALL cp_logger_generate_filename(logger, ao_e1_filename, logger%iter_info%project_name, &
-                                          "-ecd-e1-ao-matrix.dat", local=.FALSE.)
-         CALL cp_logger_generate_filename(logger, ao_m1_filename, logger%iter_info%project_name, &
-                                          "-ecd-m1-ao-matrix.dat", local=.FALSE.)
-         CALL cp_logger_generate_filename(logger, e1_mo_filename, logger%iter_info%project_name, &
-                                          "-ecd-e1-mo-matrix.dat", local=.FALSE.)
-         CALL cp_logger_generate_filename(logger, m1_mo_filename, logger%iter_info%project_name, &
-                                          "-ecd-m1-mo-matrix.dat", local=.FALSE.)
-         IF (write_transition_matrices) THEN
-            CALL open_file(ao_e1_filename, file_status="UNKNOWN", file_action="WRITE", unit_number=ao_e1_unit)
-            WRITE (ao_e1_unit, '(A)') "# E1 AO matrices: D_lambda = <chi_mu|(r_lambda-R0_lambda)|chi_nu>"
-            WRITE (ao_e1_unit, '(A,3(1X,ES24.15E3))') "# Reference point (bohr)", reference_point
-            CALL open_file(ao_m1_filename, file_status="UNKNOWN", file_action="WRITE", unit_number=ao_m1_unit)
-            WRITE (ao_m1_unit, '(A)') "# M1 AO matrices: Lambda = <chi_mu|((r-R0) cross nabla)|chi_nu>"
-            WRITE (ao_m1_unit, '(A,3(1X,ES24.15E3))') "# Reference point (bohr)", reference_point
-            CALL open_file(e1_mo_filename, file_status="UNKNOWN", file_action="WRITE", unit_number=e1_mo_unit)
-            WRITE (e1_mo_unit, '(A)') "# E1 MO matrices: mu_lambda,pq = -<p|r_lambda-R0_lambda|q>"
-            WRITE (e1_mo_unit, '(A,3(1X,ES24.15E3))') "# Reference point (bohr)", reference_point
-            WRITE (e1_mo_unit, '(A)') "# spin component row column e1_real"
-            CALL open_file(m1_mo_filename, file_status="UNKNOWN", file_action="WRITE", unit_number=m1_mo_unit)
-            WRITE (m1_mo_unit, '(A)') "# M1 MO matrices: m_lambda,pq = i*Lambda_lambda,pq/2"
-            WRITE (m1_mo_unit, '(A,3(1X,ES24.15E3))') "# Reference point (bohr)", reference_point
-            WRITE (m1_mo_unit, '(A)') "# spin component row column m1_real m1_imag"
-         END IF
-      END IF
       IF (write_transition_matrices) THEN
          CALL open_file(e1_filename, file_status="UNKNOWN", file_action="WRITE", unit_number=e1_unit)
          IF (periodic_supercell) THEN
@@ -422,86 +357,17 @@ CONTAINS
          WRITE (m1_unit, '(A)') "# records follow the occupied-empty MO traversal order"
          WRITE (m1_unit, '(A)') "# state energy_eV spin occupied virtual component m1_real m1_imag occupation_difference"
       END IF
-      IF (use_velocity_gauge) THEN
-         CALL ecd_build_molecular_velocity_ao_none(qs_env, pseudopotential_commutator, velocity_ao)
-      ELSE
-         CALL ecd_build_molecular_operators_ao(qs_env, pseudopotential_commutator, reference_point, &
-                                               position_ao, magnetic_ao)
-         DO idir = 1, ncart
-            IF (write_transition_matrices) WRITE (ao_e1_unit, '(/,A,I0)') "# Cartesian component ", idir
-            CALL cp_dbcsr_write_sparse_matrix(position_ao(idir)%matrix, 4, 15, qs_env, logger%para_env, &
-                                               output_unit=ao_e1_unit)
-            IF (write_transition_matrices) WRITE (ao_m1_unit, '(/,A,I0)') "# Cartesian component ", idir
-            CALL cp_dbcsr_write_sparse_matrix(magnetic_ao(idir)%matrix, 4, 15, qs_env, logger%para_env, &
-                                               output_unit=ao_m1_unit)
-         END DO
-      END IF
+      CALL ecd_build_e1_m1_mo(qs_env, ecd_gauge, pseudopotential_commutator, reference_point, &
+                              operators, reject_degenerate_velocity=.TRUE.)
+      IF (SIZE(operators) /= nspins) CPABORT("ECD| E1/M1 spin dimensions are inconsistent")
 
       itrans = 0
       DO ispin = 1, nspins
-         CALL get_mo_set(mos(ispin), eigenvalues=eigenvalues, homo=homo, mo_coeff=mo_coeff, &
-                         nmo=nmo, occupation_numbers=occupation_numbers)
+         CALL get_mo_set(mos(ispin), eigenvalues=eigenvalues, homo=homo, nmo=nmo, &
+                         occupation_numbers=occupation_numbers)
          CPASSERT(ASSOCIATED(eigenvalues))
-         CPASSERT(ASSOCIATED(mo_coeff))
          CPASSERT(ASSOCIATED(occupation_numbers))
          IF (homo <= 0 .OR. nmo <= homo) CYCLE
-
-         IF (use_velocity_gauge) THEN
-            ! Build the physical E1 and M1 MO matrices before selecting
-            ! occupied-empty elements.  v is only an intermediate matrix.
-            ALLOCATE (e1_mo(ncart, nmo, nmo), m1_mo(ncart, nmo, nmo), &
-                      velocity_mo_matrix(ncart, nmo, nmo), operator_mo_matrix(nmo, nmo))
-            DO idir = 1, ncart
-               CALL ecd_project_operator_to_mo(velocity_ao(idir), mo_coeff, operator_mo)
-               CALL cp_fm_get_submatrix(operator_mo, operator_mo_matrix)
-               CALL cp_fm_release(operator_mo)
-               velocity_mo_matrix(idir, :, :) = CMPLX(0.0_dp, -operator_mo_matrix, KIND=dp)
-            END DO
-            DEALLOCATE (operator_mo_matrix)
-            e1_mo = CMPLX(0.0_dp, 0.0_dp, KIND=dp)
-            DO column = 1, nmo
-               DO row = 1, nmo
-                  IF (row == column) CYCLE
-                  IF (ABS(eigenvalues(row) - eigenvalues(column)) <= velocity_degeneracy_threshold) THEN
-                     CPABORT("ECD| VELOCITY-gauge M1 requires non-degenerate molecular orbital energies")
-                  END IF
-                  e1_mo(:, row, column) = CMPLX(0.0_dp, 1.0_dp, KIND=dp)*velocity_mo_matrix(:, row, column)/ &
-                                          (eigenvalues(row) - eigenvalues(column))
-               END DO
-            END DO
-            ! m^V = -r^V x v/2 = E1^V x v/2 because E1^V = -r^V.
-            m1_mo(1, :, :) = 0.5_dp*(MATMUL(e1_mo(2, :, :), velocity_mo_matrix(3, :, :)) - &
-                                     MATMUL(e1_mo(3, :, :), velocity_mo_matrix(2, :, :)))
-            m1_mo(2, :, :) = 0.5_dp*(MATMUL(e1_mo(3, :, :), velocity_mo_matrix(1, :, :)) - &
-                                     MATMUL(e1_mo(1, :, :), velocity_mo_matrix(3, :, :)))
-            m1_mo(3, :, :) = 0.5_dp*(MATMUL(e1_mo(1, :, :), velocity_mo_matrix(2, :, :)) - &
-                                     MATMUL(e1_mo(2, :, :), velocity_mo_matrix(1, :, :)))
-         ELSE
-            ALLOCATE (e1_mo(ncart, nmo, nmo), m1_mo(ncart, nmo, nmo), operator_mo_matrix(nmo, nmo))
-            DO idir = 1, ncart
-               CALL ecd_project_operator_to_mo(position_ao(idir), mo_coeff, operator_mo)
-               CALL cp_fm_get_submatrix(operator_mo, operator_mo_matrix)
-               CALL cp_fm_release(operator_mo)
-               e1_mo(idir, :, :) = CMPLX(-operator_mo_matrix, 0.0_dp, KIND=dp)
-               CALL ecd_project_operator_to_mo(magnetic_ao(idir), mo_coeff, operator_mo)
-               CALL cp_fm_get_submatrix(operator_mo, operator_mo_matrix)
-               CALL cp_fm_release(operator_mo)
-               m1_mo(idir, :, :) = CMPLX(0.0_dp, 0.5_dp*operator_mo_matrix, KIND=dp)
-            END DO
-            IF (write_transition_matrices) THEN
-               DO idir = 1, ncart
-                  DO column = 1, nmo
-                     DO row = 1, nmo
-                        WRITE (e1_mo_unit, '(4(I0,1X),ES24.15E3)') ispin, idir, row, column, &
-                           REAL(e1_mo(idir, row, column), KIND=dp)
-                        WRITE (m1_mo_unit, '(4(I0,1X),2(ES24.15E3,1X))') ispin, idir, row, column, &
-                           REAL(m1_mo(idir, row, column), KIND=dp), AIMAG(m1_mo(idir, row, column))
-                     END DO
-                  END DO
-               END DO
-            END IF
-            DEALLOCATE (operator_mo_matrix)
-         END IF
          DO iocc = 1, homo
             DO ivirt = homo + 1, nmo
                itrans = itrans + 1
@@ -511,32 +377,25 @@ CONTAINS
                   CPABORT("ECD| IPA requires a positive occupied-virtual occupation difference")
                END IF
                rotatory_strength(itrans) = (occupation_numbers(iocc) - occupation_numbers(ivirt))*AIMAG( &
-                                           SUM(CONJG(e1_mo(:, ivirt, iocc))*m1_mo(:, ivirt, iocc)))
+                                           SUM(CONJG(operators(ispin)%e1(:, ivirt, iocc))*operators(ispin)%m1(:, ivirt, iocc)))
                IF (write_transition_matrices) THEN
                   DO idir = 1, ncart
                      WRITE (e1_unit, '(I0,1X,ES24.15E3,4(1X,I0),3(1X,ES24.15E3))') &
                         itrans, transition_energy(itrans)*evolt, ispin, iocc, ivirt, idir, &
-                        REAL(e1_mo(idir, ivirt, iocc), KIND=dp), AIMAG(e1_mo(idir, ivirt, iocc)), &
+                        REAL(operators(ispin)%e1(idir, ivirt, iocc), KIND=dp), &
+                        AIMAG(operators(ispin)%e1(idir, ivirt, iocc)), &
                         occupation_numbers(iocc) - occupation_numbers(ivirt)
                      WRITE (m1_unit, '(I0,1X,ES24.15E3,4(1X,I0),3(1X,ES24.15E3))') &
                         itrans, transition_energy(itrans)*evolt, ispin, iocc, ivirt, idir, &
-                        REAL(m1_mo(idir, ivirt, iocc), KIND=dp), AIMAG(m1_mo(idir, ivirt, iocc)), &
+                        REAL(operators(ispin)%m1(idir, ivirt, iocc), KIND=dp), &
+                        AIMAG(operators(ispin)%m1(idir, ivirt, iocc)), &
                         occupation_numbers(iocc) - occupation_numbers(ivirt)
                   END DO
                END IF
             END DO
          END DO
-         IF (use_velocity_gauge) THEN
-            DEALLOCATE (velocity_mo_matrix)
-         END IF
-         DEALLOCATE (e1_mo, m1_mo)
       END DO
-      IF (use_velocity_gauge) THEN
-         CALL dbcsr_deallocate_matrix_set(velocity_ao)
-      ELSE
-         CALL dbcsr_deallocate_matrix_set(magnetic_ao)
-         CALL dbcsr_deallocate_matrix_set(position_ao)
-      END IF
+      DEALLOCATE (operators)
       IF (iounit > 0) THEN
          IF (periodic_supercell) THEN
             WRITE (iounit, '(/,T2,A)') "ECD| PERIODIC XYZ length-gauge E1 transition matrix written to "//TRIM(e1_filename)
@@ -550,12 +409,6 @@ CONTAINS
       IF (write_transition_matrices) THEN
          CALL close_file(e1_unit)
          CALL close_file(m1_unit)
-      END IF
-      IF (write_operator_diagnostics .AND. write_transition_matrices) THEN
-         CALL close_file(ao_e1_unit)
-         CALL close_file(ao_m1_unit)
-         CALL close_file(e1_mo_unit)
-         CALL close_file(m1_mo_unit)
       END IF
       CALL ecd_print_sticks(transition_energy, rotatory_strength, transition_order)
       DEALLOCATE (transition_order, transition_energy, rotatory_strength)
@@ -575,58 +428,36 @@ CONTAINS
       TYPE(qs_environment_type), POINTER                 :: qs_env
       TYPE(cp_fm_type), DIMENSION(:, :), INTENT(IN)      :: evects
       REAL(KIND=dp), DIMENSION(:), INTENT(IN)            :: evals
-      TYPE(tddfpt_ground_state_mos), DIMENSION(:), POINTER, INTENT(IN) :: gs_mos
+      TYPE(tddfpt_ground_state_mos), DIMENSION(:), &
+         INTENT(IN), POINTER                             :: gs_mos
       INTEGER, INTENT(IN)                                :: mult
 
-      CHARACTER(LEN=*), PARAMETER                        :: routineN = 'ecd_spectra_none_tddfpt'
+      CHARACTER(LEN=*), PARAMETER :: routineN = 'ecd_spectra_none_tddfpt'
 
-      INTEGER                                            :: ecd_gauge, handle, idir, ispin, istate, nactive, nspins, &
-                                                            nstates, reference
-      LOGICAL                                            :: do_ecd, pseudopotential_commutator, ref_point_explicit
-      REAL(KIND=dp), DIMENSION(ncart)                    :: reference_point, transition_magnetic, transition_position
       COMPLEX(KIND=dp), DIMENSION(ncart)                 :: state_e1, state_m1
-      REAL(KIND=dp), DIMENSION(:, :, :), ALLOCATABLE     :: magnetic_spin, position_spin
-      REAL(KIND=dp), DIMENSION(:), ALLOCATABLE           :: rotatory_strength
-      REAL(KIND=dp), DIMENSION(:), POINTER               :: ref_point
-      TYPE(cp_fm_type), ALLOCATABLE, DIMENSION(:, :)     :: magnetic_active_action, position_active_action
+      INTEGER                                            :: ecd_gauge, handle, idir, ispin, istate, &
+                                                            nactive, nspins, nstates
+      LOGICAL                                            :: do_ecd, ecd_gauge_explicit, &
+                                                            pseudopotential_commutator
+      REAL(KIND=dp), ALLOCATABLE, DIMENSION(:)           :: rotatory_strength
+      REAL(KIND=dp), ALLOCATABLE, DIMENSION(:, :, :)     :: magnetic_spin, position_spin
+      REAL(KIND=dp), DIMENSION(ncart)                    :: reference_point, transition_magnetic, &
+                                                            transition_position
       TYPE(cp_fm_struct_type), POINTER                   :: fm_struct
+      TYPE(cp_fm_type), ALLOCATABLE, DIMENSION(:, :)     :: magnetic_active_action, &
+                                                            position_active_action
       TYPE(dbcsr_p_type), DIMENSION(:), POINTER          :: magnetic_ao, position_ao
-      TYPE(section_vals_type), POINTER                   :: ecd_section
 
       CALL timeset(routineN, handle)
 
-      NULLIFY (ecd_section, fm_struct, magnetic_ao, position_ao, ref_point)
-      ecd_section => section_vals_get_subs_vals(qs_env%input, "PROPERTIES%ECD")
-      CALL section_vals_val_get(ecd_section, "DO_ECD", l_val=do_ecd)
+      NULLIFY (fm_struct, magnetic_ao, position_ao)
+      CALL ecd_read_input(qs_env, do_ecd, ecd_gauge, ecd_gauge_explicit, &
+                          pseudopotential_commutator, reference_point)
       IF (.NOT. do_ecd) THEN
          CALL timestop(handle)
          RETURN
       END IF
-      CALL section_vals_val_get(ecd_section, "GAUGE", i_val=ecd_gauge)
-      IF (ecd_gauge /= tddfpt_dipole_length .AND. ecd_gauge /= tddfpt_dipole_velocity) THEN
-         CPABORT("ECD| TDDFPT ECD supports GAUGE LENGTH and VELOCITY")
-      END IF
       IF (ecd_gauge == tddfpt_dipole_velocity) CPABORT("ECD| TDDFPT ECD currently supports GAUGE LENGTH")
-
-      CALL section_vals_val_get(ecd_section, "PSEUDOPOTENTIAL_COMMUTATOR", &
-                                l_val=pseudopotential_commutator)
-      CALL section_vals_val_get(ecd_section, "REFERENCE", i_val=reference)
-      CALL section_vals_val_get(ecd_section, "REF_POINT", explicit=ref_point_explicit)
-      IF (ref_point_explicit) THEN
-         CALL section_vals_val_get(ecd_section, "REF_POINT", r_vals=ref_point)
-      END IF
-      IF (reference == use_mom_ref_user) THEN
-         IF (.NOT. ref_point_explicit) THEN
-            CPABORT("ECD| REFERENCE USER_DEFINED requires REF_POINT")
-         END IF
-         IF (.NOT. ASSOCIATED(ref_point) .OR. SIZE(ref_point) /= ncart) THEN
-            CPABORT("ECD| REF_POINT expects three coordinates")
-         END IF
-         CALL get_reference_point(reference_point, qs_env=qs_env, reference=reference, ref_point=ref_point)
-      ELSE
-         IF (ref_point_explicit) CPWARN("ECD| REF_POINT is used only with REFERENCE USER_DEFINED")
-         CALL get_reference_point(reference_point, qs_env=qs_env, reference=reference)
-      END IF
 
       nspins = SIZE(gs_mos)
       nstates = SIZE(evals)
@@ -639,8 +470,8 @@ CONTAINS
       IF (nspins > 2) CPABORT("ECD| TDDFPT ECD supports at most two spin channels")
 
       ALLOCATE (position_active_action(ncart, nspins), magnetic_active_action(ncart, nspins))
-      CALL ecd_build_molecular_operators_ao(qs_env, pseudopotential_commutator, reference_point, &
-                                            position_ao, magnetic_ao)
+      CALL ecd_build_length_ao(qs_env, pseudopotential_commutator, reference_point, &
+                               position_ao, magnetic_ao)
       DO ispin = 1, nspins
          CPASSERT(ASSOCIATED(gs_mos(ispin)%mos_active))
          NULLIFY (fm_struct)
@@ -707,9 +538,9 @@ CONTAINS
 ! **************************************************************************************************
    SUBROUTINE ecd_print_sticks(excitation_energy, rotatory_strength, order)
       REAL(KIND=dp), DIMENSION(:), INTENT(IN)            :: excitation_energy, rotatory_strength
-      INTEGER, DIMENSION(:), OPTIONAL, INTENT(IN)        :: order
+      INTEGER, DIMENSION(:), INTENT(IN), OPTIONAL        :: order
 
-      INTEGER                                            :: istate, iounit, source_state
+      INTEGER                                            :: iounit, istate, source_state
       TYPE(cp_logger_type), POINTER                      :: logger
 
       IF (SIZE(excitation_energy) /= SIZE(rotatory_strength)) THEN
@@ -736,175 +567,5 @@ CONTAINS
             "ECD|", istate, excitation_energy(istate)*evolt, rotatory_strength(source_state)
       END DO
    END SUBROUTINE ecd_print_sticks
-
-! **************************************************************************************************
-!> \brief Build direct length and orbital magnetic AO operators for a localized molecule.
-!> \param qs_env Quickstep environment
-!> \param pseudopotential_commutator Include the complete GTH non-local magnetic correction
-!> \param reference_point Common reference point for all molecular operators
-!> \param position_ao Three direct AO-space position matrices for length-gauge E1
-!> \param magnetic_ao Three direct AO-space angular-momentum matrices
-! **************************************************************************************************
-   SUBROUTINE ecd_build_molecular_operators_ao(qs_env, pseudopotential_commutator, reference_point, &
-                                               position_ao, magnetic_ao)
-      TYPE(qs_environment_type), POINTER                 :: qs_env
-      LOGICAL, INTENT(IN)                                :: pseudopotential_commutator
-      REAL(KIND=dp), DIMENSION(ncart), INTENT(IN)        :: reference_point
-      TYPE(dbcsr_p_type), DIMENSION(:), POINTER, INTENT(INOUT) :: magnetic_ao, position_ao
-
-      INTEGER                                            :: idir
-      TYPE(cell_type), POINTER                           :: cell
-      TYPE(dft_control_type), POINTER                    :: dft_control
-      TYPE(dbcsr_p_type), DIMENSION(:), POINTER          :: magnetic_nl, magnetic_nl_full, matrix_s
-      TYPE(neighbor_list_set_p_type), DIMENSION(:), &
-         POINTER                                         :: sab_all, sab_orb, sap_ppnl
-      TYPE(particle_type), DIMENSION(:), POINTER         :: particle_set
-      TYPE(qs_kind_type), DIMENSION(:), POINTER          :: qs_kind_set
-
-      NULLIFY (cell, dft_control, magnetic_nl, magnetic_nl_full, matrix_s, particle_set, qs_kind_set, sab_all, sab_orb, &
-               sap_ppnl)
-      CALL get_qs_env(qs_env, cell=cell, dft_control=dft_control, matrix_s=matrix_s, &
-                      particle_set=particle_set, qs_kind_set=qs_kind_set, sab_orb=sab_orb, &
-                      sab_all=sab_all, sap_ppnl=sap_ppnl)
-      CPASSERT(ASSOCIATED(cell))
-      CPASSERT(ASSOCIATED(dft_control))
-      CPASSERT(ASSOCIATED(matrix_s))
-      CPASSERT(ASSOCIATED(particle_set))
-      CPASSERT(ASSOCIATED(qs_kind_set))
-      CPASSERT(ASSOCIATED(sab_all))
-      CPASSERT(ASSOCIATED(sab_orb))
-
-      CALL dbcsr_allocate_matrix_set(position_ao, ncart)
-      CALL dbcsr_allocate_matrix_set(magnetic_ao, ncart)
-      DO idir = 1, ncart
-         CALL dbcsr_init_p(position_ao(idir)%matrix)
-         CALL dbcsr_create(position_ao(idir)%matrix, template=matrix_s(1)%matrix, &
-                           matrix_type=dbcsr_type_symmetric)
-         CALL cp_dbcsr_alloc_block_from_nbl(position_ao(idir)%matrix, sab_orb)
-         CALL dbcsr_set(position_ao(idir)%matrix, 0.0_dp)
-
-         CALL dbcsr_init_p(magnetic_ao(idir)%matrix)
-         IF (ALL(cell%perd == 1)) THEN
-            CALL dbcsr_create(magnetic_ao(idir)%matrix, template=matrix_s(1)%matrix, &
-                              matrix_type=dbcsr_type_no_symmetry)
-         ELSE
-            CALL dbcsr_create(magnetic_ao(idir)%matrix, template=matrix_s(1)%matrix, &
-                              matrix_type=dbcsr_type_antisymmetric)
-         END IF
-         IF (ALL(cell%perd == 1)) THEN
-            CALL cp_dbcsr_alloc_block_from_nbl(magnetic_ao(idir)%matrix, sab_all)
-         ELSE
-            CALL cp_dbcsr_alloc_block_from_nbl(magnetic_ao(idir)%matrix, sab_orb)
-         END IF
-         CALL dbcsr_set(magnetic_ao(idir)%matrix, 0.0_dp)
-
-      END DO
-
-      IF (ALL(cell%perd == 1)) THEN
-         ! Fold every AO center into the reference-centered minimum image before
-         ! evaluating the localized molecular length-gauge position operator.
-         CALL build_local_moment_matrix(qs_env, position_ao, 1, ref_point=reference_point)
-         CALL build_ang_mom_matrix(qs_env, magnetic_ao, reference_point)
-      ELSE
-         CALL build_local_moment_matrix(qs_env, position_ao, 1, ref_point=reference_point)
-         CALL build_local_magmom_matrix(qs_env, magnetic_ao, 1, ref_point=reference_point)
-      END IF
-
-      IF (pseudopotential_commutator .AND. ASSOCIATED(sap_ppnl)) THEN
-         CALL dbcsr_allocate_matrix_set(magnetic_nl, ncart)
-         DO idir = 1, ncart
-            CALL dbcsr_init_p(magnetic_nl(idir)%matrix)
-            CALL dbcsr_create(magnetic_nl(idir)%matrix, template=matrix_s(1)%matrix, &
-                              matrix_type=dbcsr_type_antisymmetric)
-            CALL cp_dbcsr_alloc_block_from_nbl(magnetic_nl(idir)%matrix, sab_orb)
-            CALL dbcsr_set(magnetic_nl(idir)%matrix, 0.0_dp)
-
-         END DO
-         IF (ALL(cell%perd == 1)) THEN
-            ! build_com_nl_mag returns (R_ps-R0) x [V_nl,r].  Its negative has
-            ! the [r,V_nl] convention of the ECD angular-momentum correction.
-            CALL build_com_nl_mag(qs_kind_set, sab_orb, sap_ppnl, dft_control%qs_control%eps_ppnl, &
-                                  particle_set, magnetic_nl, reference_point, cell)
-            CALL dbcsr_allocate_matrix_set(magnetic_nl_full, ncart)
-            DO idir = 1, ncart
-               CALL dbcsr_init_p(magnetic_nl_full(idir)%matrix)
-               CALL dbcsr_create(magnetic_nl_full(idir)%matrix, template=matrix_s(1)%matrix, &
-                                 matrix_type=dbcsr_type_no_symmetry)
-               CALL dbcsr_desymmetrize(magnetic_nl(idir)%matrix, magnetic_nl_full(idir)%matrix)
-               CALL dbcsr_add(magnetic_ao(idir)%matrix, magnetic_nl_full(idir)%matrix, 1.0_dp, -1.0_dp)
-            END DO
-            CALL dbcsr_deallocate_matrix_set(magnetic_nl_full)
-         ELSE
-            ! r_R0 x [r_R0,V_nl] is the non-local contribution required by
-            ! the orbital magnetic dipole.
-            CALL build_com_mom_nl(qs_kind_set, sab_orb, sap_ppnl, dft_control%qs_control%eps_ppnl, &
-                                  particle_set, cell, matrix_rxrv=magnetic_nl, ref_point=reference_point)
-            DO idir = 1, ncart
-               CALL dbcsr_add(magnetic_ao(idir)%matrix, magnetic_nl(idir)%matrix, 1.0_dp, 1.0_dp)
-            END DO
-         END IF
-         CALL dbcsr_deallocate_matrix_set(magnetic_nl)
-      END IF
-
-   END SUBROUTINE ecd_build_molecular_operators_ao
-
-! **************************************************************************************************
-!> \brief Build the raw molecular velocity-generator AO operators for PERIODIC NONE.
-!> \param qs_env Quickstep environment
-!> \param pseudopotential_commutator Include the GTH non-local velocity commutator
-!> \param velocity_ao Three real antisymmetric AO derivative matrices
-! **************************************************************************************************
-   SUBROUTINE ecd_build_molecular_velocity_ao_none(qs_env, pseudopotential_commutator, velocity_ao)
-      TYPE(qs_environment_type), POINTER                 :: qs_env
-      LOGICAL, INTENT(IN)                                :: pseudopotential_commutator
-      TYPE(dbcsr_p_type), DIMENSION(:), POINTER, INTENT(INOUT) :: velocity_ao
-
-      INTEGER                                            :: idir
-      TYPE(cell_type), POINTER                           :: cell
-      TYPE(dft_control_type), POINTER                    :: dft_control
-      TYPE(dbcsr_p_type), DIMENSION(:), POINTER          :: matrix_s, velocity_nl
-      TYPE(neighbor_list_set_p_type), DIMENSION(:), POINTER :: sab_orb, sap_ppnl
-      TYPE(particle_type), DIMENSION(:), POINTER         :: particle_set
-      TYPE(qs_kind_type), DIMENSION(:), POINTER          :: qs_kind_set
-
-      NULLIFY (cell, dft_control, matrix_s, particle_set, qs_kind_set, sab_orb, sap_ppnl, velocity_nl)
-      CALL get_qs_env(qs_env, cell=cell, dft_control=dft_control, matrix_s=matrix_s, &
-                      particle_set=particle_set, qs_kind_set=qs_kind_set, sab_orb=sab_orb, &
-                      sap_ppnl=sap_ppnl)
-      CPASSERT(ASSOCIATED(cell))
-      CPASSERT(ASSOCIATED(dft_control))
-      CPASSERT(ASSOCIATED(matrix_s))
-      CPASSERT(ASSOCIATED(particle_set))
-      CPASSERT(ASSOCIATED(qs_kind_set))
-      CPASSERT(ASSOCIATED(sab_orb))
-
-      CALL dbcsr_allocate_matrix_set(velocity_ao, ncart)
-      DO idir = 1, ncart
-         CALL dbcsr_init_p(velocity_ao(idir)%matrix)
-         CALL dbcsr_create(velocity_ao(idir)%matrix, template=matrix_s(1)%matrix, &
-                           matrix_type=dbcsr_type_antisymmetric)
-         CALL cp_dbcsr_alloc_block_from_nbl(velocity_ao(idir)%matrix, sab_orb)
-         CALL dbcsr_set(velocity_ao(idir)%matrix, 0.0_dp)
-      END DO
-      CALL build_lin_mom_matrix(qs_env, velocity_ao)
-
-      IF (pseudopotential_commutator .AND. ASSOCIATED(sap_ppnl)) THEN
-         CALL dbcsr_allocate_matrix_set(velocity_nl, ncart)
-         DO idir = 1, ncart
-            CALL dbcsr_init_p(velocity_nl(idir)%matrix)
-            CALL dbcsr_create(velocity_nl(idir)%matrix, template=matrix_s(1)%matrix, &
-                              matrix_type=dbcsr_type_antisymmetric)
-            CALL cp_dbcsr_alloc_block_from_nbl(velocity_nl(idir)%matrix, sab_orb)
-            CALL dbcsr_set(velocity_nl(idir)%matrix, 0.0_dp)
-         END DO
-         CALL build_com_mom_nl(qs_kind_set, sab_orb, sap_ppnl, dft_control%qs_control%eps_ppnl, &
-                               particle_set, cell, matrix_rv=velocity_nl)
-         DO idir = 1, ncart
-            CALL dbcsr_add(velocity_ao(idir)%matrix, velocity_nl(idir)%matrix, 1.0_dp, 1.0_dp)
-         END DO
-         CALL dbcsr_deallocate_matrix_set(velocity_nl)
-      END IF
-
-   END SUBROUTINE ecd_build_molecular_velocity_ao_none
 
 END MODULE qs_ecd_methods
