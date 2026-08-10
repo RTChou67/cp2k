@@ -15,8 +15,7 @@ MODULE qs_ecd_methods
    USE cp_dbcsr_api,                    ONLY: dbcsr_p_type
    USE cp_dbcsr_operations,             ONLY: cp_dbcsr_sm_fm_multiply,&
                                               dbcsr_deallocate_matrix_set
-   USE cp_files,                        ONLY: close_file,&
-                                              open_file
+   USE cp_files,                        ONLY: close_file
    USE cp_fm_basic_linalg,              ONLY: cp_fm_trace
    USE cp_fm_struct,                    ONLY: cp_fm_struct_type
    USE cp_fm_types,                     ONLY: cp_fm_create,&
@@ -24,7 +23,6 @@ MODULE qs_ecd_methods
                                               cp_fm_release,&
                                               cp_fm_type
    USE cp_log_handling,                 ONLY: cp_get_default_logger,&
-                                              cp_logger_generate_filename,&
                                               cp_logger_get_default_io_unit,&
                                               cp_logger_type
    USE external_potential_types,        ONLY: all_potential_type
@@ -47,7 +45,9 @@ MODULE qs_ecd_methods
    USE physcon,                         ONLY: evolt
    USE qs_ecd_operator_utils,           ONLY: ecd_build_e1_m1_mo,&
                                               ecd_build_length_ao,&
-                                              ecd_mo_operators_type
+                                              ecd_mo_operators_type,&
+                                              ecd_open_transition_files,&
+                                              ecd_write_transition_operators
    USE qs_ecd_spectra_xyz,              ONLY: ecd_spectra_xyz_ipa
    USE qs_environment_types,            ONLY: get_qs_env,&
                                               qs_environment_type
@@ -161,8 +161,6 @@ CONTAINS
                   END IF
                END DO
             CASE (do_method_gpw)
-               CALL section_vals_val_get(ecd_section, "PSEUDOPOTENTIAL_COMMUTATOR", &
-                                         l_val=pseudopotential_commutator)
                IF (.NOT. pseudopotential_commutator) THEN
                   CPABORT("ECD| PERIODIC XYZ GPW GAUGE LENGTH requires PSEUDOPOTENTIAL_COMMUTATOR T")
                END IF
@@ -278,10 +276,11 @@ CONTAINS
 
       CHARACTER(LEN=*), PARAMETER :: routineN = 'ecd_spectra_molecular_ipa'
 
-      CHARACTER(LEN=default_path_length)                 :: e1_filename, m1_filename
-      INTEGER                                            :: e1_unit, handle, homo, idir, iocc, &
-                                                            iounit, ispin, itrans, ivirt, m1_unit, &
-                                                            nmo, nspins, ntrans_total
+      CHARACTER(LEN=default_path_length)                 :: e1_filename, m1_filename, &
+                                                            transition_label
+      INTEGER                                            :: e1_unit, handle, homo, iocc, iounit, &
+                                                            ispin, itrans, ivirt, m1_unit, nmo, &
+                                                            nspins, ntrans_total
       INTEGER, ALLOCATABLE, DIMENSION(:)                 :: transition_order
       LOGICAL                                            :: periodic_supercell, use_velocity_gauge, &
                                                             write_transition_matrices
@@ -297,8 +296,10 @@ CONTAINS
       CALL timeset(routineN, handle)
 
       NULLIFY (cell, eigenvalues, logger, mos, occupation_numbers, scf_control)
-      CALL get_qs_env(qs_env, cell=cell)
+      CALL get_qs_env(qs_env, cell=cell, mos=mos, scf_control=scf_control)
       CPASSERT(ASSOCIATED(cell))
+      CPASSERT(ASSOCIATED(mos))
+      CPASSERT(ASSOCIATED(scf_control))
       periodic_supercell = ALL(cell%perd == 1)
       use_velocity_gauge = ecd_gauge == tddfpt_dipole_velocity
       IF (periodic_supercell .AND. use_velocity_gauge) THEN
@@ -306,9 +307,6 @@ CONTAINS
       END IF
 
       ! Direct occupied-virtual transitions are assembled independently.
-      CALL get_qs_env(qs_env, mos=mos, scf_control=scf_control)
-      CPASSERT(ASSOCIATED(mos))
-      CPASSERT(ASSOCIATED(scf_control))
       IF (scf_control%use_ot) THEN
          CPABORT("ECD| IPA currently requires diagonalization SCF with available virtual MOs")
       END IF
@@ -324,39 +322,13 @@ CONTAINS
       ALLOCATE (transition_order(ntrans_total), transition_energy(ntrans_total), rotatory_strength(ntrans_total))
       logger => cp_get_default_logger()
       iounit = cp_logger_get_default_io_unit(logger)
-      CALL cp_logger_generate_filename(logger, e1_filename, logger%iter_info%project_name, &
-                                       "-ecd-e1-transition-matrix.dat", local=.FALSE.)
-      CALL cp_logger_generate_filename(logger, m1_filename, logger%iter_info%project_name, &
-                                       "-ecd-m1-transition-matrix.dat", local=.FALSE.)
-      write_transition_matrices = logger%para_env%is_source()
-      IF (write_transition_matrices) THEN
-         CALL open_file(e1_filename, file_status="UNKNOWN", file_action="WRITE", unit_number=e1_unit)
-         IF (periodic_supercell) THEN
-            WRITE (e1_unit, '(A)') "# PERIODIC XYZ molecular-supercell length-gauge IPA E1 transition matrix"
-         ELSE
-            WRITE (e1_unit, '(A)') "# PERIODIC NONE IPA E1 transition matrix"
-         END IF
-         IF (use_velocity_gauge) THEN
-            WRITE (e1_unit, '(A)') "# mu_ai = i*v_ai/(epsilon_a-epsilon_i)"
-         ELSE
-            WRITE (e1_unit, '(A)') "# mu_ai = -r_ai"
-         END IF
-         WRITE (e1_unit, '(A)') "# records follow the occupied-empty MO traversal order"
-         WRITE (e1_unit, '(A)') "# state energy_eV spin occupied virtual component e1_real e1_imag occupation_difference"
-         CALL open_file(m1_filename, file_status="UNKNOWN", file_action="WRITE", unit_number=m1_unit)
-         IF (periodic_supercell) THEN
-            WRITE (m1_unit, '(A)') "# PERIODIC XYZ molecular-supercell length-gauge IPA M1 transition matrix"
-         ELSE
-            WRITE (m1_unit, '(A)') "# PERIODIC NONE IPA M1 transition matrix"
-         END IF
-         IF (use_velocity_gauge) THEN
-            WRITE (m1_unit, '(A)') "# m_ai = -[r_velocity cross v]_ai/2"
-         ELSE
-            WRITE (m1_unit, '(A)') "# m_ai = i*Lambda_ai/2"
-         END IF
-         WRITE (m1_unit, '(A)') "# records follow the occupied-empty MO traversal order"
-         WRITE (m1_unit, '(A)') "# state energy_eV spin occupied virtual component m1_real m1_imag occupation_difference"
+      IF (periodic_supercell) THEN
+         transition_label = "PERIODIC XYZ molecular-supercell length-gauge IPA"
+      ELSE
+         transition_label = "PERIODIC NONE IPA"
       END IF
+      CALL ecd_open_transition_files(logger, transition_label, write_transition_matrices, &
+                                     e1_unit, m1_unit, e1_filename, m1_filename)
       CALL ecd_build_e1_m1_mo(qs_env, ecd_gauge, pseudopotential_commutator, reference_point, &
                               operators, reject_degenerate_velocity=.TRUE.)
       IF (SIZE(operators) /= nspins) CPABORT("ECD| E1/M1 spin dimensions are inconsistent")
@@ -379,18 +351,10 @@ CONTAINS
                rotatory_strength(itrans) = (occupation_numbers(iocc) - occupation_numbers(ivirt))*AIMAG( &
                                            SUM(CONJG(operators(ispin)%e1(:, ivirt, iocc))*operators(ispin)%m1(:, ivirt, iocc)))
                IF (write_transition_matrices) THEN
-                  DO idir = 1, ncart
-                     WRITE (e1_unit, '(I0,1X,ES24.15E3,4(1X,I0),3(1X,ES24.15E3))') &
-                        itrans, transition_energy(itrans)*evolt, ispin, iocc, ivirt, idir, &
-                        REAL(operators(ispin)%e1(idir, ivirt, iocc), KIND=dp), &
-                        AIMAG(operators(ispin)%e1(idir, ivirt, iocc)), &
-                        occupation_numbers(iocc) - occupation_numbers(ivirt)
-                     WRITE (m1_unit, '(I0,1X,ES24.15E3,4(1X,I0),3(1X,ES24.15E3))') &
-                        itrans, transition_energy(itrans)*evolt, ispin, iocc, ivirt, idir, &
-                        REAL(operators(ispin)%m1(idir, ivirt, iocc), KIND=dp), &
-                        AIMAG(operators(ispin)%m1(idir, ivirt, iocc)), &
-                        occupation_numbers(iocc) - occupation_numbers(ivirt)
-                  END DO
+                  CALL ecd_write_transition_operators( &
+                     e1_unit, m1_unit, itrans, transition_energy(itrans), ispin, iocc, ivirt, &
+                     occupation_numbers(iocc) - occupation_numbers(ivirt), &
+                     operators(ispin)%e1(:, ivirt, iocc), operators(ispin)%m1(:, ivirt, iocc))
                END IF
             END DO
          END DO

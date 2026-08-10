@@ -23,7 +23,9 @@ MODULE qs_ecd_spectra_xyz
    USE mathconstants,                   ONLY: pi
    USE physcon,                         ONLY: evolt
    USE qs_ecd_operator_utils,           ONLY: ecd_build_e1_m1_mo,&
-                                              ecd_mo_operators_type
+                                              ecd_mo_operators_type,&
+                                              ecd_open_transition_files,&
+                                              ecd_write_transition_operators
    USE qs_environment_types,            ONLY: get_qs_env,&
                                               qs_environment_type
    USE qs_mo_types,                     ONLY: get_mo_set,&
@@ -104,25 +106,10 @@ CONTAINS
 
       logger => cp_get_default_logger()
       iounit = cp_logger_get_default_io_unit(logger)
-      CALL cp_logger_generate_filename(logger, e1_filename, logger%iter_info%project_name, &
-                                       "-ecd-e1-transition-matrix.dat", local=.FALSE.)
-      CALL cp_logger_generate_filename(logger, m1_filename, logger%iter_info%project_name, &
-                                       "-ecd-m1-transition-matrix.dat", local=.FALSE.)
       CALL cp_logger_generate_filename(logger, tensor_filename, logger%iter_info%project_name, &
                                        "-periodic-ipa-e1m1-tensor.dat", local=.FALSE.)
-      write_transition_matrices = logger%para_env%is_source()
-      IF (write_transition_matrices) THEN
-         CALL open_file(e1_filename, file_status="UNKNOWN", file_action="WRITE", unit_number=e1_unit)
-         WRITE (e1_unit, '(A)') "# Periodic Gamma E1 matrix in the velocity representation"
-         WRITE (e1_unit, '(A)') "# E1_ai = i*v_ai/(epsilon_a-epsilon_i)"
-         WRITE (e1_unit, '(A)') "# records follow the occupied-empty MO traversal order"
-         WRITE (e1_unit, '(A)') "# state energy_eV spin occupied virtual component e1_real e1_imag occupation_difference"
-         CALL open_file(m1_filename, file_status="UNKNOWN", file_action="WRITE", unit_number=m1_unit)
-         WRITE (m1_unit, '(A)') "# Periodic Gamma M1 matrix in the velocity representation"
-         WRITE (m1_unit, '(A)') "# M1 = E1 cross v/2"
-         WRITE (m1_unit, '(A)') "# records follow the occupied-empty MO traversal order"
-         WRITE (m1_unit, '(A)') "# state energy_eV spin occupied virtual component m1_real m1_imag occupation_difference"
-      END IF
+      CALL ecd_open_transition_files(logger, "PERIODIC XYZ Gamma velocity-gauge IPA", write_transition_matrices, &
+                                     e1_unit, m1_unit, e1_filename, m1_filename)
 
       CALL ecd_build_e1_m1_mo(qs_env, tddfpt_dipole_velocity, pseudopotential_commutator, reference_point, operators)
       IF (SIZE(operators) /= nspin) CPABORT("ECD| Periodic E1/M1 spin dimensions are inconsistent")
@@ -157,16 +144,9 @@ CONTAINS
                   END DO
                END DO
                IF (write_transition_matrices) THEN
-                  DO idir = 1, ncart
-                     WRITE (e1_unit, '(I0,1X,ES24.15E3,4(1X,I0),3(1X,ES24.15E3))') &
-                        itransition, gap*evolt, ispin, iocc, ivirt, idir, &
-                        REAL(operators(ispin)%e1(idir, ivirt, iocc), KIND=dp), &
-                        AIMAG(operators(ispin)%e1(idir, ivirt, iocc)), occupation_difference
-                     WRITE (m1_unit, '(I0,1X,ES24.15E3,4(1X,I0),3(1X,ES24.15E3))') &
-                        itransition, gap*evolt, ispin, iocc, ivirt, idir, &
-                        REAL(operators(ispin)%m1(idir, ivirt, iocc), KIND=dp), &
-                        AIMAG(operators(ispin)%m1(idir, ivirt, iocc)), occupation_difference
-                  END DO
+                  CALL ecd_write_transition_operators( &
+                     e1_unit, m1_unit, itransition, gap, ispin, iocc, ivirt, occupation_difference, &
+                     operators(ispin)%e1(:, ivirt, iocc), operators(ispin)%m1(:, ivirt, iocc))
                END IF
             END DO
          END DO

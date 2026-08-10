@@ -21,17 +21,21 @@ MODULE qs_ecd_operator_utils
    USE cp_dbcsr_operations,             ONLY: cp_dbcsr_sm_fm_multiply,&
                                               dbcsr_allocate_matrix_set,&
                                               dbcsr_deallocate_matrix_set
+   USE cp_files,                        ONLY: open_file
    USE cp_fm_struct,                    ONLY: cp_fm_struct_type
    USE cp_fm_types,                     ONLY: cp_fm_create,&
                                               cp_fm_get_info,&
                                               cp_fm_get_submatrix,&
                                               cp_fm_release,&
                                               cp_fm_type
+   USE cp_log_handling,                 ONLY: cp_logger_generate_filename,&
+                                              cp_logger_type
    USE input_constants,                 ONLY: tddfpt_dipole_length,&
                                               tddfpt_dipole_velocity
    USE kinds,                           ONLY: dp
    USE parallel_gemm_api,               ONLY: parallel_gemm
    USE particle_types,                  ONLY: particle_type
+   USE physcon,                         ONLY: evolt
    USE qs_environment_types,            ONLY: get_qs_env,&
                                               qs_environment_type
    USE qs_kind_types,                   ONLY: qs_kind_type
@@ -62,6 +66,8 @@ MODULE qs_ecd_operator_utils
 
    PUBLIC :: ecd_build_e1_m1_mo
    PUBLIC :: ecd_build_length_ao
+   PUBLIC :: ecd_open_transition_files
+   PUBLIC :: ecd_write_transition_operators
 
 CONTAINS
 
@@ -220,44 +226,36 @@ CONTAINS
             ALLOCATE (magnetic_matrix(nmo, nmo))
          END IF
 
+         CALL cp_fm_create(operator_coeff, coeff_struct, name="ECD operator C")
+         CALL cp_fm_create(operator_mo, coeff_struct, nrow=nmo, ncol=nmo, name="ECD C^T operator C")
          DO idir = 1, ncart
-            CALL cp_fm_create(operator_coeff, coeff_struct, name="ECD operator C")
-            CALL cp_fm_create(operator_mo, coeff_struct, nrow=nmo, ncol=nmo, name="ECD C^T operator C")
             CALL cp_dbcsr_sm_fm_multiply(operator_ao(idir)%matrix, mo_coeff, operator_coeff, ncol=nmo, &
                                          alpha=1.0_dp, beta=0.0_dp)
             CALL parallel_gemm("T", "N", nmo, nmo, nao, &
                                1.0_dp, mo_coeff, operator_coeff, 0.0_dp, operator_mo)
             CALL cp_fm_get_submatrix(operator_mo, operator_matrix)
-            CALL cp_fm_release(operator_coeff)
-            CALL cp_fm_release(operator_mo)
             IF (use_velocity) THEN
                IF (include_nonlocal_velocity) THEN
-                  CALL cp_fm_create(operator_coeff, coeff_struct, name="ECD commutator C")
-                  CALL cp_fm_create(operator_mo, coeff_struct, nrow=nmo, ncol=nmo, name="ECD C^T commutator C")
                   CALL cp_dbcsr_sm_fm_multiply(commutator_ao(idir)%matrix, mo_coeff, operator_coeff, ncol=nmo, &
                                                alpha=1.0_dp, beta=0.0_dp)
                   CALL parallel_gemm("T", "N", nmo, nmo, nao, &
                                      1.0_dp, mo_coeff, operator_coeff, 0.0_dp, operator_mo)
                   CALL cp_fm_get_submatrix(operator_mo, commutator_matrix)
-                  CALL cp_fm_release(operator_coeff)
-                  CALL cp_fm_release(operator_mo)
                   operator_matrix = operator_matrix + commutator_matrix
                END IF
                velocity_mo(idir, :, :) = CMPLX(0.0_dp, -operator_matrix, KIND=dp)
             ELSE
                operators(ispin)%e1(idir, :, :) = CMPLX(-operator_matrix, 0.0_dp, KIND=dp)
-               CALL cp_fm_create(operator_coeff, coeff_struct, name="ECD magnetic C")
-               CALL cp_fm_create(operator_mo, coeff_struct, nrow=nmo, ncol=nmo, name="ECD C^T magnetic C")
                CALL cp_dbcsr_sm_fm_multiply(magnetic_ao(idir)%matrix, mo_coeff, operator_coeff, ncol=nmo, &
                                             alpha=1.0_dp, beta=0.0_dp)
                CALL parallel_gemm("T", "N", nmo, nmo, nao, &
                                   1.0_dp, mo_coeff, operator_coeff, 0.0_dp, operator_mo)
                CALL cp_fm_get_submatrix(operator_mo, magnetic_matrix)
-               CALL cp_fm_release(operator_coeff)
-               CALL cp_fm_release(operator_mo)
                operators(ispin)%m1(idir, :, :) = CMPLX(0.0_dp, 0.5_dp*magnetic_matrix, KIND=dp)
             END IF
          END DO
+         CALL cp_fm_release(operator_coeff)
+         CALL cp_fm_release(operator_mo)
 
          IF (use_velocity) THEN
             DO column = 1, nmo
@@ -387,5 +385,56 @@ CONTAINS
       END IF
 
    END SUBROUTINE ecd_build_length_ao
+
+! **************************************************************************************************
+!> \brief Open the shared transition-level E1 and M1 output files.
+! **************************************************************************************************
+   SUBROUTINE ecd_open_transition_files(logger, label, write_matrices, e1_unit, m1_unit, &
+                                        e1_filename, m1_filename)
+      TYPE(cp_logger_type), POINTER                      :: logger
+      CHARACTER(LEN=*), INTENT(IN)                       :: label
+      LOGICAL, INTENT(OUT)                               :: write_matrices
+      INTEGER, INTENT(OUT)                               :: e1_unit, m1_unit
+      CHARACTER(LEN=*), INTENT(INOUT)                    :: e1_filename, m1_filename
+
+      CALL cp_logger_generate_filename(logger, e1_filename, logger%iter_info%project_name, &
+                                       "-ecd-e1-transition-matrix.dat", local=.FALSE.)
+      CALL cp_logger_generate_filename(logger, m1_filename, logger%iter_info%project_name, &
+                                       "-ecd-m1-transition-matrix.dat", local=.FALSE.)
+      write_matrices = logger%para_env%is_source()
+      IF (.NOT. write_matrices) RETURN
+
+      CALL open_file(e1_filename, file_status="UNKNOWN", file_action="WRITE", unit_number=e1_unit)
+      CALL open_file(m1_filename, file_status="UNKNOWN", file_action="WRITE", unit_number=m1_unit)
+      WRITE (e1_unit, '(A)') "# "//TRIM(label)//" E1 transition matrix"
+      WRITE (m1_unit, '(A)') "# "//TRIM(label)//" M1 transition matrix"
+      WRITE (e1_unit, '(A)') "# state energy_eV spin occupied virtual component e1_real e1_imag occupation_difference"
+      WRITE (m1_unit, '(A)') "# state energy_eV spin occupied virtual component m1_real m1_imag occupation_difference"
+
+   END SUBROUTINE ecd_open_transition_files
+
+! **************************************************************************************************
+!> \brief Write all Cartesian E1 and M1 components for one transition.
+! **************************************************************************************************
+   SUBROUTINE ecd_write_transition_operators(e1_unit, m1_unit, state, energy, ispin, iocc, ivirt, &
+                                             occupation_difference, e1, m1)
+      INTEGER, INTENT(IN)                                :: e1_unit, m1_unit, state
+      REAL(KIND=dp), INTENT(IN)                          :: energy
+      INTEGER, INTENT(IN)                                :: ispin, iocc, ivirt
+      REAL(KIND=dp), INTENT(IN)                          :: occupation_difference
+      COMPLEX(KIND=dp), DIMENSION(ncart), INTENT(IN)     :: e1, m1
+
+      INTEGER                                            :: idir
+
+      DO idir = 1, ncart
+         WRITE (e1_unit, '(I0,1X,ES24.15E3,4(1X,I0),3(1X,ES24.15E3))') &
+            state, energy*evolt, ispin, iocc, ivirt, idir, REAL(e1(idir), KIND=dp), AIMAG(e1(idir)), &
+            occupation_difference
+         WRITE (m1_unit, '(I0,1X,ES24.15E3,4(1X,I0),3(1X,ES24.15E3))') &
+            state, energy*evolt, ispin, iocc, ivirt, idir, REAL(m1(idir), KIND=dp), AIMAG(m1(idir)), &
+            occupation_difference
+      END DO
+
+   END SUBROUTINE ecd_write_transition_operators
 
 END MODULE qs_ecd_operator_utils
