@@ -11,12 +11,14 @@
 MODULE qs_ecd_methods
    USE cell_types, ONLY: cell_type, &
                          use_perd_none
-   USE commutator_rpnl, ONLY: build_com_mom_nl
+   USE commutator_rpnl, ONLY: build_com_mom_nl, &
+                              build_com_nl_mag
    USE cp_files, ONLY: close_file, &
                        open_file
    USE cp_control_types, ONLY: dft_control_type
    USE cp_dbcsr_api, ONLY: dbcsr_add, &
                            dbcsr_create, &
+                           dbcsr_desymmetrize, &
                            dbcsr_init_p, &
                            dbcsr_p_type, &
                            dbcsr_set, &
@@ -44,7 +46,9 @@ MODULE qs_ecd_methods
                                   section_vals_get_subs_vals, &
                                   section_vals_type, &
                                   section_vals_val_get
-   USE input_constants, ONLY: no_sf_tddfpt, &
+   USE input_constants, ONLY: do_method_gapw, &
+                              do_method_gpw, &
+                              no_sf_tddfpt, &
                               tddfpt_dipole_length, &
                               tddfpt_dipole_velocity, &
                               tddfpt_kernel_full, &
@@ -95,7 +99,7 @@ CONTAINS
 
       INTEGER                                            :: ecd_gauge, handle, ikind, poisson_periodic, spinflip, tddfpt_kernel
       LOGICAL                                            :: do_ecd, do_hfx, do_kpoints, do_soc, ecd_gauge_explicit, &
-                                                            tddfpt_enabled
+                                                            pseudopotential_commutator, tddfpt_enabled
       TYPE(all_potential_type), POINTER                  :: all_potential
       TYPE(cell_type), POINTER                           :: cell
       TYPE(dft_control_type), POINTER                    :: dft_control
@@ -143,16 +147,24 @@ CONTAINS
             CALL get_qs_env(qs_env, dft_control=dft_control, qs_kind_set=qs_kind_set)
             CPASSERT(ASSOCIATED(dft_control))
             CPASSERT(ASSOCIATED(qs_kind_set))
-            IF (.NOT. dft_control%qs_control%gapw) THEN
-               CPABORT("ECD| PERIODIC XYZ GAUGE LENGTH requires METHOD GAPW")
-            END IF
-            DO ikind = 1, SIZE(qs_kind_set)
-               NULLIFY (all_potential)
-               CALL get_qs_kind(qs_kind_set(ikind), all_potential=all_potential)
-               IF (.NOT. ASSOCIATED(all_potential)) THEN
-                  CPABORT("ECD| PERIODIC XYZ GAUGE LENGTH requires POTENTIAL ALL for every KIND")
+            SELECT CASE (dft_control%qs_control%method_id)
+            CASE (do_method_gapw)
+               DO ikind = 1, SIZE(qs_kind_set)
+                  NULLIFY (all_potential)
+                  CALL get_qs_kind(qs_kind_set(ikind), all_potential=all_potential)
+                  IF (.NOT. ASSOCIATED(all_potential)) THEN
+                     CPABORT("ECD| PERIODIC XYZ GAPW GAUGE LENGTH requires POTENTIAL ALL for every KIND")
+                  END IF
+               END DO
+            CASE (do_method_gpw)
+               CALL section_vals_val_get(ecd_section, "PSEUDOPOTENTIAL_COMMUTATOR", &
+                                         l_val=pseudopotential_commutator)
+               IF (.NOT. pseudopotential_commutator) THEN
+                  CPABORT("ECD| PERIODIC XYZ GPW GAUGE LENGTH requires PSEUDOPOTENTIAL_COMMUTATOR T")
                END IF
-            END DO
+            CASE DEFAULT
+               CPABORT("ECD| PERIODIC XYZ GAUGE LENGTH supports METHOD GAPW and METHOD GPW")
+            END SELECT
          END IF
       ELSE
          CPABORT("ECD| Current implementation requires CELL%PERIODIC NONE or XYZ")
@@ -743,13 +755,14 @@ CONTAINS
       INTEGER                                            :: idir
       TYPE(cell_type), POINTER                           :: cell
       TYPE(dft_control_type), POINTER                    :: dft_control
-      TYPE(dbcsr_p_type), DIMENSION(:), POINTER          :: magnetic_nl, matrix_s
+      TYPE(dbcsr_p_type), DIMENSION(:), POINTER          :: magnetic_nl, magnetic_nl_full, matrix_s
       TYPE(neighbor_list_set_p_type), DIMENSION(:), &
          POINTER                                         :: sab_all, sab_orb, sap_ppnl
       TYPE(particle_type), DIMENSION(:), POINTER         :: particle_set
       TYPE(qs_kind_type), DIMENSION(:), POINTER          :: qs_kind_set
 
-      NULLIFY (cell, dft_control, magnetic_nl, matrix_s, particle_set, qs_kind_set, sab_all, sab_orb, sap_ppnl)
+      NULLIFY (cell, dft_control, magnetic_nl, magnetic_nl_full, matrix_s, particle_set, qs_kind_set, sab_all, sab_orb, &
+               sap_ppnl)
       CALL get_qs_env(qs_env, cell=cell, dft_control=dft_control, matrix_s=matrix_s, &
                       particle_set=particle_set, qs_kind_set=qs_kind_set, sab_orb=sab_orb, &
                       sab_all=sab_all, sap_ppnl=sap_ppnl)
@@ -807,13 +820,29 @@ CONTAINS
             CALL dbcsr_set(magnetic_nl(idir)%matrix, 0.0_dp)
 
          END DO
-         ! r_R0 x [r_R0, V_nl] is the non-local contribution required by
-         ! the orbital magnetic dipole.
-         CALL build_com_mom_nl(qs_kind_set, sab_orb, sap_ppnl, dft_control%qs_control%eps_ppnl, &
-                               particle_set, cell, matrix_rxrv=magnetic_nl, ref_point=reference_point)
-         DO idir = 1, ncart
-            CALL dbcsr_add(magnetic_ao(idir)%matrix, magnetic_nl(idir)%matrix, 1.0_dp, 1.0_dp)
-         END DO
+         IF (ALL(cell%perd == 1)) THEN
+            ! build_com_nl_mag returns (R_ps-R0) x [V_nl,r].  Its negative has
+            ! the [r,V_nl] convention of the ECD angular-momentum correction.
+            CALL build_com_nl_mag(qs_kind_set, sab_orb, sap_ppnl, dft_control%qs_control%eps_ppnl, &
+                                  particle_set, magnetic_nl, reference_point, cell)
+            CALL dbcsr_allocate_matrix_set(magnetic_nl_full, ncart)
+            DO idir = 1, ncart
+               CALL dbcsr_init_p(magnetic_nl_full(idir)%matrix)
+               CALL dbcsr_create(magnetic_nl_full(idir)%matrix, template=matrix_s(1)%matrix, &
+                                 matrix_type=dbcsr_type_no_symmetry)
+               CALL dbcsr_desymmetrize(magnetic_nl(idir)%matrix, magnetic_nl_full(idir)%matrix)
+               CALL dbcsr_add(magnetic_ao(idir)%matrix, magnetic_nl_full(idir)%matrix, 1.0_dp, -1.0_dp)
+            END DO
+            CALL dbcsr_deallocate_matrix_set(magnetic_nl_full)
+         ELSE
+            ! r_R0 x [r_R0,V_nl] is the non-local contribution required by
+            ! the orbital magnetic dipole.
+            CALL build_com_mom_nl(qs_kind_set, sab_orb, sap_ppnl, dft_control%qs_control%eps_ppnl, &
+                                  particle_set, cell, matrix_rxrv=magnetic_nl, ref_point=reference_point)
+            DO idir = 1, ncart
+               CALL dbcsr_add(magnetic_ao(idir)%matrix, magnetic_nl(idir)%matrix, 1.0_dp, 1.0_dp)
+            END DO
+         END IF
          CALL dbcsr_deallocate_matrix_set(magnetic_nl)
       END IF
 
