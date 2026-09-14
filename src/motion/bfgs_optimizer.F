@@ -539,7 +539,7 @@ CONTAINS
    SUBROUTINE bfgs_inverse_update(ndf, dx, dg, hess_mat, work)
       INTEGER, INTENT(IN)                                :: ndf
       REAL(KIND=dp), INTENT(IN)                          :: dx(ndf), dg(ndf)
-      TYPE(cp_fm_type), INTENT(IN)                       :: hess_mat
+      TYPE(cp_fm_type), INTENT(INOUT)                    :: hess_mat
       REAL(KIND=dp), INTENT(OUT)                         :: work(ndf)
 
       REAL(KIND=dp), PARAMETER                           :: min_curvature = 0.2_dp
@@ -626,7 +626,7 @@ CONTAINS
 !> \param dr Search direction
 ! **************************************************************************************************
    SUBROUTINE bfgs_inverse_step(hess_mat, g, dr)
-      TYPE(cp_fm_type), INTENT(IN)                       :: hess_mat
+      TYPE(cp_fm_type), INTENT(INOUT)                    :: hess_mat
       REAL(KIND=dp), INTENT(IN)                          :: g(:)
       REAL(KIND=dp), INTENT(OUT)                         :: dr(:)
 
@@ -670,7 +670,7 @@ CONTAINS
 !> \param from_inverse Whether the input already represents the inverse Hessian
 ! **************************************************************************************************
    SUBROUTINE bfgs_invert_matrix(matrix, from_inverse)
-      TYPE(cp_fm_type), INTENT(IN)                       :: matrix
+      TYPE(cp_fm_type), INTENT(INOUT)                    :: matrix
       LOGICAL, INTENT(IN)                                :: from_inverse
 
       INTEGER                                            :: handle, info, ndf
