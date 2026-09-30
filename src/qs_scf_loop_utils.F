@@ -1601,11 +1601,10 @@ CONTAINS
       REAL(KIND=dp)                                      :: symmetry_error, symmetry_scale
       REAL(KIND=dp), ALLOCATABLE, DIMENSION(:, :)        :: dense_im, dense_re, lowdin_response
       TYPE(cp_cfm_type)                                  :: action_cfm, coeff_cfm
-      TYPE(cp_fm_type)                                   :: action_im, action_re, density_im, &
-                                                            density_re, inactive_im, inactive_re, &
-                                                            projected_im, projected_re
+      TYPE(cp_cfm_type), ALLOCATABLE, DIMENSION(:, :)    :: density_kp
+      TYPE(cp_fm_type) :: action_im, action_re, density_im, density_kp_im, density_kp_re, &
+         density_re, inactive_im, inactive_re, projected_im, projected_re
       TYPE(cp_fm_type), ALLOCATABLE, DIMENSION(:, :)     :: operator_im, operator_re
-      TYPE(cp_fm_type), ALLOCATABLE, DIMENSION(:, :, :)  :: density_kp
       TYPE(dbcsr_p_type), DIMENSION(:, :), POINTER       :: density_rs, potential_rs
       TYPE(dbcsr_type), POINTER                          :: matrix_k_im, matrix_k_re, template
       TYPE(dft_control_type), POINTER                    :: dft_control
@@ -1671,7 +1670,7 @@ CONTAINS
          CALL kpoint_operator_context_create(hxc_op_ctx, kpoints, fmwork(1), nspin_ot)
       END IF
       DO response_mode = 1, nmode
-         ALLOCATE (density_kp(nlocal_kpoints, 2, nspin_ot))
+         ALLOCATE (density_kp(nlocal_kpoints, nspin_ot))
          DO local_kpoint = 1, nlocal_kpoints
             kp => kpoints%kp_env(local_kpoint)%kpoint_env
             ikpoint = kp%nkpoint
@@ -1707,19 +1706,25 @@ CONTAINS
                   action_re, action_im, 1.0_dp, 0.0_dp)
                CALL cp_fm_get_info( &
                   local_ot_env(local_channel)%mermin_physical(1)%c0, nrow_global=nao)
-               CALL cp_fm_create(density_kp(local_kpoint, 1, ispin), &
+               CALL cp_cfm_create(density_kp(local_kpoint, ispin), &
+                                  local_ot_env(local_channel)%mermin_physical(1)%c0%matrix_struct, &
+                                  nrow=nao, ncol=nao, set_zero=.TRUE.)
+               CALL cp_fm_create(density_kp_re, &
                                  local_ot_env(local_channel)%mermin_physical(1)%c0%matrix_struct, &
                                  name="hxc_density_k_re", nrow=nao, ncol=nao, set_zero=.TRUE.)
-               CALL cp_fm_create(density_kp(local_kpoint, 2, ispin), &
+               CALL cp_fm_create(density_kp_im, &
                                  local_ot_env(local_channel)%mermin_physical(1)%c0%matrix_struct, &
                                  name="hxc_density_k_im", nrow=nao, ncol=nao, set_zero=.TRUE.)
                CALL multiply_complex_fm_right_adjoint( &
                   action_re, action_im, local_ot_env(local_channel)%mermin_physical(1)%c0, &
                   local_ot_env(local_channel)%mermin_physical(1)%c0_im, &
-                  density_kp(local_kpoint, 1, ispin), density_kp(local_kpoint, 2, ispin), &
+                  density_kp_re, density_kp_im, &
                   1.0_dp, 0.0_dp)
+               CALL cp_fm_to_cfm(density_kp_re, density_kp_im, density_kp(local_kpoint, ispin))
                CALL cp_fm_release(action_re)
                CALL cp_fm_release(action_im)
+               CALL cp_fm_release(density_kp_re)
+               CALL cp_fm_release(density_kp_im)
                CALL cp_fm_release(density_re)
                CALL cp_fm_release(density_im)
             END DO
@@ -1735,12 +1740,11 @@ CONTAINS
             END DO
          END DO
          CALL kpoint_density_transform(kpoints, density_rs, .FALSE., template, sab_nl, fmwork, &
-                                       pmat_ext=density_kp)
+                                       cfm_kp=density_kp)
          IF (ALLOCATED(kpoints%lowdin_v)) CALL lowdin_kp_kernel(qs_env, density_kp, lowdin_response)
          DO local_kpoint = 1, nlocal_kpoints
             DO ispin = 1, nspin_ot
-               CALL cp_fm_release(density_kp(local_kpoint, 1, ispin))
-               CALL cp_fm_release(density_kp(local_kpoint, 2, ispin))
+               CALL cp_cfm_release(density_kp(local_kpoint, ispin))
             END DO
          END DO
          DEALLOCATE (density_kp)

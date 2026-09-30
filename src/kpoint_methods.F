@@ -2203,11 +2203,12 @@ CONTAINS
 !> \param sab_nl ...
 !> \param fmwork  FM work matrices (kpoint group)
 !> \param for_aux_fit ...
-!> \param pmat_ext external real/imaginary full matrices
+!> \param fm_kp external real matrices, indexed by local k-point and spin
 !> \param overlap_rs ...
+!> \param cfm_kp external complex matrices, indexed by local k-point and spin
 ! **************************************************************************************************
    SUBROUTINE kpoint_density_transform(kpoint, denmat, wtype, tempmat, sab_nl, fmwork, for_aux_fit, &
-                                       pmat_ext, overlap_rs)
+                                       fm_kp, overlap_rs, cfm_kp)
 
       TYPE(kpoint_type), POINTER                         :: kpoint
       TYPE(dbcsr_p_type), DIMENSION(:, :)                :: denmat
@@ -2217,22 +2218,23 @@ CONTAINS
          POINTER                                         :: sab_nl
       TYPE(cp_fm_type), DIMENSION(:), INTENT(IN), TARGET :: fmwork
       LOGICAL, OPTIONAL                                  :: for_aux_fit
-      TYPE(cp_fm_type), DIMENSION(:, :, :), INTENT(IN), &
-         OPTIONAL, TARGET                                :: pmat_ext
+      TYPE(cp_fm_type), DIMENSION(:, :), INTENT(IN), &
+         OPTIONAL, TARGET                                :: fm_kp
       TYPE(dbcsr_p_type), DIMENSION(:, :), OPTIONAL, &
          POINTER                                         :: overlap_rs
+      TYPE(cp_cfm_type), DIMENSION(:, :), INTENT(IN), &
+         OPTIONAL, TARGET                                :: cfm_kp
 
       CHARACTER(LEN=*), PARAMETER :: routineN = 'kpoint_density_transform'
 
-      INTEGER                                            :: handle, ic, ik, ikp, ispin, kplocal, nc, &
-                                                            nimg, nkp, nspin
+      INTEGER                                            :: handle, ik, ikp, ispin, kplocal, nimg, &
+                                                            nkp, nspin
       INTEGER, DIMENSION(:, :, :), POINTER               :: cell_to_index
       LOGICAL                                            :: aux_fit, do_symmetric, local, &
                                                             regular_grid_done, &
-                                                            regular_grid_eligible, use_fm
+                                                            regular_grid_eligible
       TYPE(cp_cfm_p_type), ALLOCATABLE, DIMENSION(:, :)  :: source_cfm
-      TYPE(cp_fm_p_type), ALLOCATABLE, &
-         DIMENSION(:, :, :)                              :: source_fm
+      TYPE(cp_fm_p_type), ALLOCATABLE, DIMENSION(:, :)   :: source_fm
       TYPE(dbcsr_p_type), DIMENSION(2)                   :: components
       TYPE(dbcsr_type), POINTER                          :: cpmat, rpmat
       TYPE(kp_transform_plan_type)                       :: transform_plan
@@ -2273,18 +2275,18 @@ CONTAINS
          kp => kpoint%kp_env(1)%kpoint_env
       END IF
       nspin = SIZE(kp%mos)
-      nc = MERGE(1, 2, kpoint%use_real_wfn)
       nimg = SIZE(denmat, 2)
       CALL kp_transform_plan_create(transform_plan, sab_nl, cell_to_index, nimg, &
                                     group_entries=.TRUE.)
 
-      ! Borrow native FM/CFM pointers; legacy external matrices still use split FM storage.
+      ! Borrow native FM/CFM pointers without changing matrix ownership.
       kplocal = kpoint%kp_range(2) - kpoint%kp_range(1) + 1
-      use_fm = kpoint%use_real_wfn .OR. PRESENT(pmat_ext)
-      IF (use_fm) THEN
-         ALLOCATE (source_fm(kplocal, nc, nspin), source_cfm(0, nspin))
+      IF (kpoint%use_real_wfn) THEN
+         CPASSERT(.NOT. PRESENT(cfm_kp))
+         ALLOCATE (source_fm(kplocal, nspin), source_cfm(0, nspin))
       ELSE
-         ALLOCATE (source_fm(0, nc, nspin), source_cfm(kplocal, nspin))
+         CPASSERT(.NOT. PRESENT(fm_kp))
+         ALLOCATE (source_fm(0, nspin), source_cfm(kplocal, nspin))
       END IF
       DO ispin = 1, nspin
          DO ikp = 1, kplocal
@@ -2293,18 +2295,18 @@ CONTAINS
             ELSE
                kp => kpoint%kp_env(ikp)%kpoint_env
             END IF
-            IF (use_fm) THEN
-               DO ic = 1, nc
-                  IF (PRESENT(pmat_ext)) THEN
-                     source_fm(ikp, ic, ispin)%matrix => pmat_ext(ikp, ic, ispin)
-                  ELSE IF (wtype) THEN
-                     source_fm(ikp, ic, ispin)%matrix => kp%wmat(ic, ispin)
-                  ELSE
-                     source_fm(ikp, ic, ispin)%matrix => kp%pmat(ic, ispin)
-                  END IF
-               END DO
+            IF (kpoint%use_real_wfn) THEN
+               IF (PRESENT(fm_kp)) THEN
+                  source_fm(ikp, ispin)%matrix => fm_kp(ikp, ispin)
+               ELSE IF (wtype) THEN
+                  source_fm(ikp, ispin)%matrix => kp%wmat(1, ispin)
+               ELSE
+                  source_fm(ikp, ispin)%matrix => kp%pmat(1, ispin)
+               END IF
             ELSE
-               IF (wtype) THEN
+               IF (PRESENT(cfm_kp)) THEN
+                  source_cfm(ikp, ispin)%matrix => cfm_kp(ikp, ispin)
+               ELSE IF (wtype) THEN
                   source_cfm(ikp, ispin)%matrix => kp%cwmat(ispin)
                ELSE
                   source_cfm(ikp, ispin)%matrix => kp%cpmat(ispin)
@@ -2343,11 +2345,11 @@ CONTAINS
          CALL cp_dbcsr_alloc_block_from_nbl(cpmat, sab_nl)
          CALL dbcsr_set(cpmat, 0.0_dp)
          components(2)%matrix => cpmat
-         CALL kpoint_density_transform_regular_grid(kpoint, source_fm, source_cfm, use_fm, denmat, components, fmwork, &
+         CALL kpoint_density_transform_regular_grid(kpoint, source_fm, source_cfm, denmat, components, fmwork, &
                                                     transform_plan, regular_grid_done)
       END IF
       IF (.NOT. regular_grid_done) THEN
-         CALL kpoint_density_transform_batched(kpoint, source_fm, source_cfm, use_fm, denmat, rpmat, transform_plan)
+         CALL kpoint_density_transform_batched(kpoint, source_fm, source_cfm, denmat, rpmat, transform_plan)
       END IF
 
       CALL dbcsr_deallocate_matrix(rpmat)
@@ -2363,18 +2365,16 @@ CONTAINS
 !>        k-point contraction; only the resulting blocks are reduced to their DBCSR
 !>        owner. This also works when a source AO block spans several MPI ranks.
 !> \param kpoint ...
-!> \param source_fm borrowed real or legacy split-FM matrices
+!> \param source_fm borrowed real matrices
 !> \param source_cfm borrowed complex matrices
-!> \param use_fm use FM storage for this transform
 !> \param denmat real-space output matrices
 !> \param template union of the source AO sparsities
 !> \param plan neighbor-list traversal and storage conventions
 ! **************************************************************************************************
-   SUBROUTINE kpoint_density_transform_batched(kpoint, source_fm, source_cfm, use_fm, denmat, template, plan)
+   SUBROUTINE kpoint_density_transform_batched(kpoint, source_fm, source_cfm, denmat, template, plan)
       TYPE(kpoint_type), POINTER                         :: kpoint
-      TYPE(cp_fm_p_type), DIMENSION(:, :, :), INTENT(IN) :: source_fm
+      TYPE(cp_fm_p_type), DIMENSION(:, :), INTENT(IN)    :: source_fm
       TYPE(cp_cfm_p_type), DIMENSION(:, :), INTENT(IN)   :: source_cfm
-      LOGICAL, INTENT(IN)                                :: use_fm
       TYPE(dbcsr_p_type), DIMENSION(:, :)                :: denmat
       TYPE(dbcsr_type), POINTER                          :: template
       TYPE(kp_transform_plan_type), INTENT(IN)           :: plan
@@ -2383,7 +2383,7 @@ CONTAINS
       INTEGER(KIND=int_8), PARAMETER                     :: max_bytes = 64_int_8*1024*1024
       INTEGER, PARAMETER                                 :: images_per_tile = 8, max_batch = 256
 
-      INTEGER :: a, b, batch, first, handle, i, ic, igroup, ikp, image, ispin, j, kplocal, last, &
+      INTEGER :: a, b, batch, first, handle, i, igroup, ikp, image, ispin, j, kplocal, last, &
          nblock, nc, ncol, njob, nlocal, nrow, nspin, nthreads, ntile, nvalue, orientation, owner, &
          slot, thread, tile
       INTEGER(KIND=int_8)                                :: block_size
@@ -2410,26 +2410,25 @@ CONTAINS
       CALL kp_density_groups_create(kpoint, SIZE(row_size), groups)
       CPASSERT(SIZE(row_size) == SIZE(col_size))
       nc = MERGE(1, 2, kpoint%use_real_wfn)
-      IF (use_fm) THEN
+      IF (kpoint%use_real_wfn) THEN
          kplocal = SIZE(source_fm, 1)
-         nspin = SIZE(source_fm, 3)
+         nspin = SIZE(source_fm, 2)
       ELSE
          kplocal = SIZE(source_cfm, 1)
          nspin = SIZE(source_cfm, 2)
       END IF
       ALLOCATE (tiles(4, SIZE(row_size), kplocal, nc, nspin))
       DO ispin = 1, nspin
-         DO ic = 1, nc
-            DO ikp = 1, kplocal
-               IF (use_fm) THEN
-                  matrix_struct => source_fm(ikp, ic, ispin)%matrix%matrix_struct
-               ELSE
-                  matrix_struct => source_cfm(ikp, ispin)%matrix%matrix_struct
-               END IF
-               CALL kp_density_layout_create(matrix_struct, row_size, col_size, &
-                                             row_offset, col_offset, tiles(:, :, ikp, ic, ispin))
-            END DO
+         DO ikp = 1, kplocal
+            IF (kpoint%use_real_wfn) THEN
+               matrix_struct => source_fm(ikp, ispin)%matrix%matrix_struct
+            ELSE
+               matrix_struct => source_cfm(ikp, ispin)%matrix%matrix_struct
+            END IF
+            CALL kp_density_layout_create(matrix_struct, row_size, col_size, &
+                                          row_offset, col_offset, tiles(:, :, ikp, 1, ispin))
          END DO
+         IF (nc == 2) tiles(:, :, :, 2, ispin) = tiles(:, :, :, 1, ispin)
          DO image = 1, SIZE(denmat, 2)
             CALL dbcsr_set(denmat(ispin, image)%matrix, 0.0_dp)
          END DO
@@ -2512,7 +2511,7 @@ CONTAINS
             DO ispin = 1, nspin
                values(1:nvalue) = 0.0_dp
 !$OMP PARALLEL DEFAULT(NONE) NUM_THREADS(nthreads) &
-!$OMP SHARED(source_fm,source_cfm,use_fm,tiles,groups,jobs,available,plan,row_size,col_size,row_offset,col_offset, &
+!$OMP SHARED(source_fm,source_cfm,tiles,groups,jobs,available,plan,row_size,col_size,row_offset,col_offset, &
 !$OMP        values,offsets,tile_start,ntile,ispin,gemm_ctx) &
 !$OMP PRIVATE(tile,j,last,nrow,ncol,block,packed,phases,sums,rotation_work,thread)
                thread = 1
@@ -2524,7 +2523,7 @@ CONTAINS
                   nrow = row_size(jobs(1, j))
                   ncol = col_size(jobs(2, j))
                   block(1:nrow*ncol, 1:last - j + 1) => values(offsets(j):offsets(last + 1) - 1)
-                  CALL kp_density_contract_tile(source_fm(:, :, ispin), source_cfm(:, ispin), use_fm, &
+                  CALL kp_density_contract_tile(source_fm(:, ispin), source_cfm(:, ispin), &
                                                 tiles(:, :, :, :, ispin), groups, &
                                                 jobs(:, j:last), available(:, :, tile), plan%symmetric, &
                                                 row_size, col_size, row_offset, col_offset, block, &
@@ -2730,9 +2729,8 @@ CONTAINS
 !>        Pack bounded k-point batches once and reuse them across images in GEMM.
 !>        Gauge/Fourier phases remain inside the contraction; AO rotations follow
 !>        the completed local sum. MPI can then reduce the rotated partial blocks.
-!> \param source_fm borrowed real or legacy split-FM matrices
+!> \param source_fm borrowed real matrices
 !> \param source_cfm borrowed complex matrices
-!> \param use_fm use FM storage for this transform
 !> \param tiles local first/last row and column indices by atom, k-point and component
 !> \param groups ...
 !> \param jobs row, col, image, cell, real multiplicity and imaginary sign sum
@@ -2749,12 +2747,11 @@ CONTAINS
 !> \param rotation_work reusable thread-local GEMM buffer
 !> \param gemm_ctx thread-owned local GEMM context
 ! **************************************************************************************************
-   SUBROUTINE kp_density_contract_tile(source_fm, source_cfm, use_fm, tiles, groups, jobs, available, symmetric, &
+   SUBROUTINE kp_density_contract_tile(source_fm, source_cfm, tiles, groups, jobs, available, symmetric, &
                                        row_size, col_size, row_offset, col_offset, TARGET, &
                                        packed, phases, sums, rotation_work, gemm_ctx)
-      TYPE(cp_fm_p_type), INTENT(IN)                     :: source_fm(:, :)
+      TYPE(cp_fm_p_type), INTENT(IN)                     :: source_fm(:)
       TYPE(cp_cfm_p_type), INTENT(IN)                    :: source_cfm(:)
-      LOGICAL, INTENT(IN)                                :: use_fm
       INTEGER, INTENT(IN)                                :: tiles(:, :, :, :)
       TYPE(kp_density_group_type), INTENT(IN)            :: groups(0:)
       INTEGER, INTENT(IN)                                :: jobs(:, :), available(:, 0:)
@@ -2827,8 +2824,8 @@ CONTAINS
                      IF (ifirst > ilast .OR. tiles(3, b, ikp, ic) > tiles(4, b, ikp, ic)) CYCLE
                      contributes = .TRUE.
                      column = (k - first)*nc + ic
-                     IF (use_fm) THEN
-                        matrix_fm => source_fm(ikp, ic)%matrix
+                     IF (real_only) THEN
+                        matrix_fm => source_fm(ikp)%matrix
                         matrix_struct => matrix_fm%matrix_struct
                      ELSE
                         matrix_cfm => source_cfm(ikp)%matrix
@@ -2840,7 +2837,7 @@ CONTAINS
                         ii = matrix_struct%row_indices(ifirst) - row_offset(a) + 1 + jj*row_size(a)
                         IF (matrix_struct%row_indices(ilast) - &
                             matrix_struct%row_indices(ifirst) == nrow - 1) THEN
-                           IF (use_fm) THEN
+                           IF (real_only) THEN
                               packed(ii:ii + nrow - 1, column) = matrix_fm%local_data(ifirst:ilast, j)
                            ELSE IF (ic == 1) THEN
                               packed(ii:ii + nrow - 1, column) = REAL(matrix_cfm%local_data(ifirst:ilast, j), dp)
@@ -2850,7 +2847,7 @@ CONTAINS
                         ELSE
                            DO i = ifirst, ilast
                               ii = matrix_struct%row_indices(i) - row_offset(a) + 1 + jj*row_size(a)
-                              IF (use_fm) THEN
+                              IF (real_only) THEN
                                  packed(ii, column) = matrix_fm%local_data(i, j)
                               ELSE IF (ic == 1) THEN
                                  packed(ii, column) = REAL(matrix_cfm%local_data(i, j), dp)
@@ -2888,22 +2885,20 @@ CONTAINS
 !>        The single-rank case stores directly. Incompatible layouts and cheaper
 !>        local sparse sums return to the common batched transform in the caller.
 !> \param kpoint ...
-!> \param source_fm borrowed real or legacy split-FM matrices
+!> \param source_fm borrowed real matrices
 !> \param source_cfm borrowed complex matrices
-!> \param use_fm use FM storage for this transform
 !> \param denmat ...
 !> \param components real/imaginary DBCSR work matrices
 !> \param fmwork global FM work matrices, unused on one rank
 !> \param plan neighbor-list traversal and storage conventions
 !> \param completed whether all spin/image results were produced
 ! **************************************************************************************************
-   SUBROUTINE kpoint_density_transform_regular_grid(kpoint, source_fm, source_cfm, use_fm, &
+   SUBROUTINE kpoint_density_transform_regular_grid(kpoint, source_fm, source_cfm, &
                                                     denmat, components, fmwork, plan, completed)
 
       TYPE(kpoint_type), POINTER                         :: kpoint
-      TYPE(cp_fm_p_type), DIMENSION(:, :, :), INTENT(IN) :: source_fm
+      TYPE(cp_fm_p_type), DIMENSION(:, :), INTENT(IN)    :: source_fm
       TYPE(cp_cfm_p_type), DIMENSION(:, :), INTENT(IN)   :: source_cfm
-      LOGICAL, INTENT(IN)                                :: use_fm
       TYPE(dbcsr_p_type), DIMENSION(:, :)                :: denmat
       TYPE(dbcsr_p_type), DIMENSION(:), INTENT(IN)       :: components
       TYPE(cp_fm_type), DIMENSION(:), INTENT(IN), TARGET :: fmwork
@@ -2933,10 +2928,10 @@ CONTAINS
       para_env => kpoint%blacs_env_all%para_env
       inter => kpoint%para_env_inter_kp
       local = para_env%num_pe == 1
-      IF (use_fm) THEN
+      IF (kpoint%use_real_wfn) THEN
          kplocal = SIZE(source_fm, 1)
-         nspin = SIZE(source_fm, 3)
-         fms => source_fm(1, 1, 1)%matrix%matrix_struct
+         nspin = SIZE(source_fm, 2)
+         fms => source_fm(1, 1)%matrix%matrix_struct
       ELSE
          kplocal = SIZE(source_cfm, 1)
          nspin = SIZE(source_cfm, 2)
@@ -2946,16 +2941,14 @@ CONTAINS
       CPASSERT(nc >= 1 .AND. nc <= 2)
       same_layout = .TRUE.
       DO ispin = 1, nspin
-         DO ic = 1, nc
-            DO ikp = 1, kplocal
-               IF (use_fm) THEN
-                  matrix_struct => source_fm(ikp, ic, ispin)%matrix%matrix_struct
-               ELSE
-                  matrix_struct => source_cfm(ikp, ispin)%matrix%matrix_struct
-               END IF
-               same_layout = same_layout .AND. cp_fm_struct_equivalent(fms, matrix_struct)
-               same_layout = same_layout .AND. ALL(fms%first_p_pos == matrix_struct%first_p_pos)
-            END DO
+         DO ikp = 1, kplocal
+            IF (kpoint%use_real_wfn) THEN
+               matrix_struct => source_fm(ikp, ispin)%matrix%matrix_struct
+            ELSE
+               matrix_struct => source_cfm(ikp, ispin)%matrix%matrix_struct
+            END IF
+            same_layout = same_layout .AND. cp_fm_struct_equivalent(fms, matrix_struct)
+            same_layout = same_layout .AND. ALL(fms%first_p_pos == matrix_struct%first_p_pos)
          END DO
       END DO
       nrow = fms%nrow_locals(fms%context%mepos(1))
@@ -2989,7 +2982,7 @@ CONTAINS
       CALL timeset(routineN, handle)
       ALLOCATE (phase(kplocal, nc))
       DO ispin = 1, nspin
-         CALL kp_density_fft(kpoint, source_fm(:, :, ispin), source_cfm(:, ispin), use_fm, &
+         CALL kp_density_fft(kpoint, source_fm(:, ispin), source_cfm(:, ispin), &
                              nrow, ncol, SIZE(denmat, 2), &
                              fft_range, fft_density, local)
          IF (ispin == 1) THEN
@@ -3027,14 +3020,14 @@ CONTAINS
                END DO
                ! Keep real/imaginary sums separate for the neighbor-list signs.
 !$OMP PARALLEL DO DEFAULT(NONE) SCHEDULE(STATIC) &
-!$OMP SHARED(partial, source_fm, source_cfm, use_fm, phase, nc, nrow, ncol, kplocal, ispin) PRIVATE(j, ikp, ic)
+!$OMP SHARED(kpoint, partial, source_fm, source_cfm, phase, nc, nrow, ncol, kplocal, ispin) PRIVATE(j, ikp, ic)
                DO j = 1, ncol
                   DO ikp = 1, kplocal
                      DO ic = 1, nc
-                        IF (use_fm) THEN
+                        IF (kpoint%use_real_wfn) THEN
                            partial(ic)%local_data(1:nrow, j) = partial(ic)%local_data(1:nrow, j) + &
                                                                phase(ikp, ic)* &
-                                                               source_fm(ikp, ic, ispin)%matrix%local_data(1:nrow, j)
+                                                               source_fm(ikp, ispin)%matrix%local_data(1:nrow, j)
                         ELSE IF (ic == 1) THEN
                            partial(ic)%local_data(1:nrow, j) = partial(ic)%local_data(1:nrow, j) + &
                                                                phase(ikp, ic)* &
@@ -3089,9 +3082,8 @@ CONTAINS
 !>        are the weighted cosine/real and sine/imaginary sums needed by the DBCSR
 !>        storage convention. Original reduced-grid weights are used without doubling.
 !> \param kpoint ...
-!> \param source_fm borrowed real or legacy split-FM matrices
+!> \param source_fm borrowed real matrices
 !> \param source_cfm borrowed complex matrices
-!> \param use_fm use FM storage for this transform
 !> \param nrow number of valid local FM rows (excluding padding)
 !> \param ncol number of valid local FM columns
 !> \param nimg number of requested real-space images
@@ -3099,12 +3091,11 @@ CONTAINS
 !> \param density allocated on success; unallocated selects the regular-grid direct sum
 !> \param local all k-points and matrix entries are on this rank
 ! **************************************************************************************************
-   SUBROUTINE kp_density_fft(kpoint, source_fm, source_cfm, use_fm, nrow, ncol, nimg, owned, density, local)
+   SUBROUTINE kp_density_fft(kpoint, source_fm, source_cfm, nrow, ncol, nimg, owned, density, local)
 
       TYPE(kpoint_type), POINTER                         :: kpoint
-      TYPE(cp_fm_p_type), DIMENSION(:, :), INTENT(IN)    :: source_fm
+      TYPE(cp_fm_p_type), DIMENSION(:), INTENT(IN)       :: source_fm
       TYPE(cp_cfm_p_type), DIMENSION(:), INTENT(IN)      :: source_cfm
-      LOGICAL, INTENT(IN)                                :: use_fm
       INTEGER, INTENT(IN)                                :: nrow, ncol, nimg
       INTEGER, DIMENSION(2), INTENT(OUT)                 :: owned
       REAL(KIND=dp), ALLOCATABLE, DIMENSION(:, :, :), &
@@ -3153,7 +3144,7 @@ CONTAINS
       inter => kpoint%para_env_inter_kp
       ngroup = inter%num_pe
       mine = inter%mepos + 1
-      IF (use_fm) THEN
+      IF (kpoint%use_real_wfn) THEN
          local_k = SIZE(source_fm, 1)
       ELSE
          local_k = SIZE(source_cfm, 1)
@@ -3219,17 +3210,15 @@ CONTAINS
             ! Pack elements in k-major order; displacements already encode the
             ! unequal k ranges, so neither counts nor indices need an exchange.
 !$OMP PARALLEL DO DEFAULT(NONE) SCHEDULE(STATIC) &
-!$OMP SHARED(source_fm, source_cfm, use_fm, sendbuf, sdispl, group, first, last, nc, nrow, local_k) &
+!$OMP SHARED(kpoint, source_fm, source_cfm, sendbuf, sdispl, group, first, last, nrow, local_k) &
 !$OMP PRIVATE(ikp, element, i, j, pos)
             DO ikp = 1, local_k
                DO element = first, last
                   i = MODULO(element - 1, nrow) + 1
                   j = (element - 1)/nrow + 1
                   pos = sdispl(group) + (ikp - 1)*(last - first + 1) + element - first + 1
-                  IF (use_fm) THEN
-                     sendbuf(pos) = CMPLX(source_fm(ikp, 1)%matrix%local_data(i, j), 0.0_dp, dp)
-                     IF (nc == 2) sendbuf(pos) = CMPLX(REAL(sendbuf(pos), dp), &
-                                                       source_fm(ikp, 2)%matrix%local_data(i, j), dp)
+                  IF (kpoint%use_real_wfn) THEN
+                     sendbuf(pos) = CMPLX(source_fm(ikp)%matrix%local_data(i, j), 0.0_dp, dp)
                   ELSE
                      sendbuf(pos) = source_cfm(ikp)%matrix%local_data(i, j)
                   END IF

@@ -1159,12 +1159,12 @@ CONTAINS
 !> \brief Project and reduce a Bloch density with one accumulator and matrix workspace per worker.
 !> \param kpoints Selected overlap columns and parallel distribution.
 !> \param q Weighted occupations; does not change the ground-state occupation caches.
-!> \param density Optional split-complex response; absent uses the current Bloch density.
+!> \param density Optional complex response; absent uses the current Bloch density.
 ! **************************************************************************************************
    SUBROUTINE lowdin_kp_project(kpoints, q, density)
       TYPE(kpoint_type), POINTER                         :: kpoints
       REAL(KIND=dp), CONTIGUOUS, INTENT(OUT)             :: q(:, :)
-      TYPE(cp_fm_type), INTENT(IN), OPTIONAL             :: density(:, :, :)
+      TYPE(cp_cfm_type), INTENT(IN), OPTIONAL            :: density(:, :)
 
       INTEGER                                            :: handle, ik, ispin, kplocal, m, nspin, &
                                                             nworkers, thread
@@ -1195,7 +1195,7 @@ CONTAINS
          kp => kpoints%kp_env(ik)%kpoint_env
          DO ispin = 1, nspin
             IF (PRESENT(density)) THEN
-               CALL cp_fm_to_cfm(density(ik, 1, ispin), density(ik, 2, ispin), work(thread))
+               CALL cp_cfm_to_cfm(density(ik, ispin), work(thread))
                CALL lowdin_kp_accumulate(kp, q(:, ispin), cpmat=work(thread))
             ELSE IF (kpoints%use_real_wfn) THEN
                CALL lowdin_kp_accumulate(kp, q(:, ispin), pmat=kp%pmat(1, ispin))
@@ -1335,12 +1335,12 @@ CONTAINS
 ! **************************************************************************************************
 !> \brief Project a Bloch density response and return its orbital potential response, including +J.
 !> \param qs_env Quickstep environment with selected Lowdin projectors and current U/J.
-!> \param density Unweighted split-complex Bloch density response (local k point, component, spin).
+!> \param density Unweighted complex Bloch density response (local k point, spin).
 !> \param response Globally summed orbital potential response; ground-state caches are preserved.
 ! **************************************************************************************************
    SUBROUTINE lowdin_kp_kernel(qs_env, density, response)
       TYPE(qs_environment_type), POINTER                 :: qs_env
-      TYPE(cp_fm_type), INTENT(IN)                       :: density(:, :, :)
+      TYPE(cp_cfm_type), INTENT(IN)                      :: density(:, :)
       REAL(KIND=dp), ALLOCATABLE, INTENT(OUT)            :: response(:, :)
 
       INTEGER                                            :: i, iatom, ikind, m, nspin
@@ -1352,7 +1352,7 @@ CONTAINS
 
       CALL get_qs_env(qs_env, kpoints=kpoints, particle_set=particles, qs_kind_set=qs_kinds)
       m = SIZE(kpoints%lowdin_orbitals)
-      nspin = SIZE(density, 3)
+      nspin = SIZE(density, 2)
       ALLOCATE (response(m, nspin))
       response(:, :) = 0.0_dp
       IF (m == 0) RETURN
