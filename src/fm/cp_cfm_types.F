@@ -54,6 +54,20 @@ MODULE cp_cfm_types
              cp_cfm_to_fm, &
              cp_fm_to_cfm
 
+   INTERFACE cp_cfm_release
+      MODULE PROCEDURE cp_cfm_release_aa0, &
+         cp_cfm_release_aa1, &
+         cp_cfm_release_aa2, &
+         cp_cfm_release_aa3, &
+         cp_cfm_release_ap1, &
+         cp_cfm_release_ap2, &
+         cp_cfm_release_pa1, &
+         cp_cfm_release_pa2, &
+         cp_cfm_release_pa3, &
+         cp_cfm_release_pp1, &
+         cp_cfm_release_pp2
+   END INTERFACE cp_cfm_release
+
    INTERFACE cp_cfm_to_cfm
       MODULE PROCEDURE cp_cfm_to_cfm_matrix, & ! a full matrix
          cp_cfm_to_cfm_columns ! just a number of columns
@@ -179,15 +193,223 @@ CONTAINS
 !> \brief Releases a full matrix.
 !> \param matrix the matrix to release
 ! **************************************************************************************************
-   SUBROUTINE cp_cfm_release(matrix)
+   SUBROUTINE cp_cfm_release_aa0(matrix)
       TYPE(cp_cfm_type), INTENT(INOUT)                   :: matrix
 
       IF (ASSOCIATED(matrix%local_data)) THEN
          DEALLOCATE (matrix%local_data)
+         NULLIFY (matrix%local_data)
       END IF
       matrix%name = ""
       CALL cp_fm_struct_release(matrix%matrix_struct)
-   END SUBROUTINE cp_cfm_release
+   END SUBROUTINE cp_cfm_release_aa0
+
+! **************************************************************************************************
+!> \brief Release an owning array of complex full matrices.
+!> \param matrices 1-dimensional allocatable array to release
+! **************************************************************************************************
+   SUBROUTINE cp_cfm_release_aa1(matrices)
+      TYPE(cp_cfm_type), ALLOCATABLE, DIMENSION(:)       :: matrices
+
+      INTEGER                                            :: i
+
+      IF (ALLOCATED(matrices)) THEN
+         DO i = LBOUND(matrices, 1), UBOUND(matrices, 1)
+            CALL cp_cfm_release(matrices(i))
+         END DO
+         DEALLOCATE (matrices)
+      END IF
+   END SUBROUTINE cp_cfm_release_aa1
+
+! **************************************************************************************************
+!> \brief Release an owning array of complex full matrices.
+!> \param matrices 2-dimensional allocatable array to release
+! **************************************************************************************************
+   SUBROUTINE cp_cfm_release_aa2(matrices)
+      TYPE(cp_cfm_type), ALLOCATABLE, DIMENSION(:, :)    :: matrices
+
+      INTEGER                                            :: i, j
+
+      IF (ALLOCATED(matrices)) THEN
+         DO i = LBOUND(matrices, 1), UBOUND(matrices, 1)
+            DO j = LBOUND(matrices, 2), UBOUND(matrices, 2)
+               CALL cp_cfm_release(matrices(i, j))
+            END DO
+         END DO
+         DEALLOCATE (matrices)
+      END IF
+   END SUBROUTINE cp_cfm_release_aa2
+
+! **************************************************************************************************
+!> \brief Release an owning array of complex full matrices.
+!> \param matrices 3-dimensional allocatable array to release
+! **************************************************************************************************
+   SUBROUTINE cp_cfm_release_aa3(matrices)
+      TYPE(cp_cfm_type), ALLOCATABLE, DIMENSION(:, :, :) :: matrices
+
+      INTEGER                                            :: i, j, k
+
+      IF (ALLOCATED(matrices)) THEN
+         DO i = LBOUND(matrices, 1), UBOUND(matrices, 1)
+            DO j = LBOUND(matrices, 2), UBOUND(matrices, 2)
+               DO k = LBOUND(matrices, 3), UBOUND(matrices, 3)
+                  CALL cp_cfm_release(matrices(i, j, k))
+               END DO
+            END DO
+         END DO
+         DEALLOCATE (matrices)
+      END IF
+   END SUBROUTINE cp_cfm_release_aa3
+
+! **************************************************************************************************
+!> \brief Release an owning array of complex full matrices.
+!> \param matrices 1-dimensional pointer array to release
+! **************************************************************************************************
+   SUBROUTINE cp_cfm_release_pa1(matrices)
+      TYPE(cp_cfm_type), DIMENSION(:), POINTER           :: matrices
+
+      INTEGER                                            :: i
+
+      IF (ASSOCIATED(matrices)) THEN
+         DO i = LBOUND(matrices, 1), UBOUND(matrices, 1)
+            CALL cp_cfm_release(matrices(i))
+         END DO
+         DEALLOCATE (matrices)
+         NULLIFY (matrices)
+      END IF
+   END SUBROUTINE cp_cfm_release_pa1
+
+! **************************************************************************************************
+!> \brief Release an owning array of complex full matrices.
+!> \param matrices 2-dimensional pointer array to release
+! **************************************************************************************************
+   SUBROUTINE cp_cfm_release_pa2(matrices)
+      TYPE(cp_cfm_type), DIMENSION(:, :), POINTER        :: matrices
+
+      INTEGER                                            :: i, j
+
+      IF (ASSOCIATED(matrices)) THEN
+         DO i = LBOUND(matrices, 1), UBOUND(matrices, 1)
+            DO j = LBOUND(matrices, 2), UBOUND(matrices, 2)
+               CALL cp_cfm_release(matrices(i, j))
+            END DO
+         END DO
+         DEALLOCATE (matrices)
+         NULLIFY (matrices)
+      END IF
+   END SUBROUTINE cp_cfm_release_pa2
+
+! **************************************************************************************************
+!> \brief Release an owning array of complex full matrices.
+!> \param matrices 3-dimensional pointer array to release
+! **************************************************************************************************
+   SUBROUTINE cp_cfm_release_pa3(matrices)
+      TYPE(cp_cfm_type), DIMENSION(:, :, :), POINTER     :: matrices
+
+      INTEGER                                            :: i, j, k
+
+      IF (ASSOCIATED(matrices)) THEN
+         DO i = LBOUND(matrices, 1), UBOUND(matrices, 1)
+            DO j = LBOUND(matrices, 2), UBOUND(matrices, 2)
+               DO k = LBOUND(matrices, 3), UBOUND(matrices, 3)
+                  CALL cp_cfm_release(matrices(i, j, k))
+               END DO
+            END DO
+         END DO
+         DEALLOCATE (matrices)
+         NULLIFY (matrices)
+      END IF
+   END SUBROUTINE cp_cfm_release_pa3
+
+! **************************************************************************************************
+!> \brief Release an owning array of complex full matrices.
+!> \param matrices 1-dimensional allocatable array to release
+!> \note Associated matrix targets are also released and deallocated.
+! **************************************************************************************************
+   SUBROUTINE cp_cfm_release_ap1(matrices)
+      TYPE(cp_cfm_p_type), ALLOCATABLE, DIMENSION(:)     :: matrices
+
+      INTEGER                                            :: i
+
+      IF (ALLOCATED(matrices)) THEN
+         DO i = LBOUND(matrices, 1), UBOUND(matrices, 1)
+            IF (ASSOCIATED(matrices(i)%matrix)) THEN
+               CALL cp_cfm_release(matrices(i)%matrix)
+               DEALLOCATE (matrices(i)%matrix)
+            END IF
+         END DO
+         DEALLOCATE (matrices)
+      END IF
+   END SUBROUTINE cp_cfm_release_ap1
+
+! **************************************************************************************************
+!> \brief Release an owning array of complex full matrices.
+!> \param matrices 2-dimensional allocatable array to release
+!> \note Associated matrix targets are also released and deallocated.
+! **************************************************************************************************
+   SUBROUTINE cp_cfm_release_ap2(matrices)
+      TYPE(cp_cfm_p_type), ALLOCATABLE, DIMENSION(:, :)  :: matrices
+
+      INTEGER                                            :: i, j
+
+      IF (ALLOCATED(matrices)) THEN
+         DO i = LBOUND(matrices, 1), UBOUND(matrices, 1)
+            DO j = LBOUND(matrices, 2), UBOUND(matrices, 2)
+               IF (ASSOCIATED(matrices(i, j)%matrix)) THEN
+                  CALL cp_cfm_release(matrices(i, j)%matrix)
+                  DEALLOCATE (matrices(i, j)%matrix)
+               END IF
+            END DO
+         END DO
+         DEALLOCATE (matrices)
+      END IF
+   END SUBROUTINE cp_cfm_release_ap2
+
+! **************************************************************************************************
+!> \brief Release an owning array of complex full matrices.
+!> \param matrices 1-dimensional pointer array to release
+!> \note Associated matrix targets are also released and deallocated.
+! **************************************************************************************************
+   SUBROUTINE cp_cfm_release_pp1(matrices)
+      TYPE(cp_cfm_p_type), DIMENSION(:), POINTER         :: matrices
+
+      INTEGER                                            :: i
+
+      IF (ASSOCIATED(matrices)) THEN
+         DO i = LBOUND(matrices, 1), UBOUND(matrices, 1)
+            IF (ASSOCIATED(matrices(i)%matrix)) THEN
+               CALL cp_cfm_release(matrices(i)%matrix)
+               DEALLOCATE (matrices(i)%matrix)
+            END IF
+         END DO
+         DEALLOCATE (matrices)
+         NULLIFY (matrices)
+      END IF
+   END SUBROUTINE cp_cfm_release_pp1
+
+! **************************************************************************************************
+!> \brief Release an owning array of complex full matrices.
+!> \param matrices 2-dimensional pointer array to release
+!> \note Associated matrix targets are also released and deallocated.
+! **************************************************************************************************
+   SUBROUTINE cp_cfm_release_pp2(matrices)
+      TYPE(cp_cfm_p_type), DIMENSION(:, :), POINTER      :: matrices
+
+      INTEGER                                            :: i, j
+
+      IF (ASSOCIATED(matrices)) THEN
+         DO i = LBOUND(matrices, 1), UBOUND(matrices, 1)
+            DO j = LBOUND(matrices, 2), UBOUND(matrices, 2)
+               IF (ASSOCIATED(matrices(i, j)%matrix)) THEN
+                  CALL cp_cfm_release(matrices(i, j)%matrix)
+                  DEALLOCATE (matrices(i, j)%matrix)
+               END IF
+            END DO
+         END DO
+         DEALLOCATE (matrices)
+         NULLIFY (matrices)
+      END IF
+   END SUBROUTINE cp_cfm_release_pp2
 
 ! **************************************************************************************************
 !> \brief Set all elements of the full matrix to alpha. Besides, set all
