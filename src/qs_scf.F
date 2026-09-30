@@ -108,6 +108,7 @@ MODULE qs_scf
    USE kpoint_methods,                  ONLY: kpoint_initialize_mo_set,&
                                               kpoint_initialize_mos
    USE kpoint_types,                    ONLY: get_kpoint_info,&
+                                              kpoint_env_release_density_matrices,&
                                               kpoint_env_type,&
                                               kpoint_type
    USE machine,                         ONLY: m_flush,&
@@ -1233,8 +1234,7 @@ CONTAINS
             DEALLOCATE (kp%mos)
             NULLIFY (kp%mos)
          END IF
-         CALL cp_fm_release(kp%pmat)
-         CALL cp_fm_release(kp%wmat)
+         CALL kpoint_env_release_density_matrices(kp)
       END DO
       CALL mpools_release(kpoints%mpools)
       CALL kpoint_initialize_mos(kpoints, mos)

@@ -1445,7 +1445,7 @@ CONTAINS
 
       CALL get_kpoint_info(kpoints, nkp=nkp)
 
-      matrix_struct => kpoints%kp_env(1)%kpoint_env%wmat(1, 1)%matrix_struct
+      matrix_struct => kpoints%kp_env(1)%kpoint_env%cwmat(1)%matrix_struct
 
       CALL cp_cfm_create(cksmat, matrix_struct)
       CALL cp_cfm_create(csmat, matrix_struct)
@@ -1467,11 +1467,11 @@ CONTAINS
 
          DO ikp = 1, nkp
 
-            CALL copy_dbcsr_to_fm(mat_ks_kp(ikp, 1)%matrix, kpoints%kp_env(ikp)%kpoint_env%wmat(1, ispin))
-            CALL cp_cfm_scale_and_add_fm(z_zero, cksmat, z_one, kpoints%kp_env(ikp)%kpoint_env%wmat(1, ispin))
-
-            CALL copy_dbcsr_to_fm(mat_ks_kp(ikp, 2)%matrix, kpoints%kp_env(ikp)%kpoint_env%wmat(2, ispin))
-            CALL cp_cfm_scale_and_add_fm(z_one, cksmat, gaussi, kpoints%kp_env(ikp)%kpoint_env%wmat(2, ispin))
+            CALL copy_dbcsr_to_fm(mat_ks_kp(ikp, 1)%matrix, fm_work)
+            CALL cp_cfm_scale_and_add_fm(z_zero, cksmat, z_one, fm_work)
+            CALL copy_dbcsr_to_fm(mat_ks_kp(ikp, 2)%matrix, fm_work)
+            CALL cp_cfm_scale_and_add_fm(z_one, cksmat, gaussi, fm_work)
+            CALL cp_cfm_to_cfm(cksmat, kpoints%kp_env(ikp)%kpoint_env%cwmat(ispin))
 
             CALL copy_dbcsr_to_fm(mat_s_kp(ikp, 1)%matrix, fm_work)
             CALL cp_cfm_scale_and_add_fm(z_zero, csmat, z_one, fm_work)

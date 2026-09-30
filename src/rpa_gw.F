@@ -49,9 +49,14 @@ MODULE rpa_gw
    USE cp_fm_struct,                    ONLY: cp_fm_struct_create,&
                                               cp_fm_struct_release,&
                                               cp_fm_struct_type
-   USE cp_fm_types,                     ONLY: &
-        cp_fm_copy_general, cp_fm_create, cp_fm_get_diag, cp_fm_get_info, cp_fm_release, &
-        cp_fm_set_all, cp_fm_to_fm, cp_fm_to_fm_submat, cp_fm_type
+   USE cp_fm_types,                     ONLY: cp_fm_create,&
+                                              cp_fm_get_diag,&
+                                              cp_fm_get_info,&
+                                              cp_fm_release,&
+                                              cp_fm_set_all,&
+                                              cp_fm_to_fm,&
+                                              cp_fm_to_fm_submat,&
+                                              cp_fm_type
    USE cp_log_handling,                 ONLY: cp_get_default_logger,&
                                               cp_logger_get_default_unit_nr,&
                                               cp_logger_type
@@ -6131,8 +6136,7 @@ CONTAINS
                                                             ks_mat_no_xc_ao_ao, vxc_ao_ao, &
                                                             vxc_ao_mo, vxc_mo_mo
       TYPE(cp_fm_struct_type), POINTER                   :: matrix_struct
-      TYPE(cp_fm_type)                                   :: fm_dummy, fm_Sigma_x_minus_vxc_mo_mo, &
-                                                            fm_tmp_im, fm_tmp_re
+      TYPE(cp_fm_type)                                   :: fm_Sigma_x_minus_vxc_mo_mo
       TYPE(dft_control_type), POINTER                    :: dft_control
       TYPE(kpoint_type), POINTER                         :: kpoints_Sigma, kpoints_Sigma_no_xc
       TYPE(mp_para_env_type), POINTER                    :: para_env
@@ -6149,7 +6153,10 @@ CONTAINS
 
       nspins = dft_control%nspins
 
-      matrix_struct => kpoints_Sigma%kp_env(1)%kpoint_env%wmat(1, 1)%matrix_struct
+      ! The band-structure k-point sets are created with the GENERAL scheme.
+      CPASSERT(.NOT. kpoints_Sigma%use_real_wfn)
+      CPASSERT(.NOT. kpoints_Sigma_no_xc%use_real_wfn)
+      matrix_struct => kpoints_Sigma%kp_env(1)%kpoint_env%cwmat(1)%matrix_struct
 
       CALL cp_cfm_create(ks_mat_ao_ao, matrix_struct)
       CALL cp_cfm_create(ks_mat_no_xc_ao_ao, matrix_struct)
@@ -6158,8 +6165,6 @@ CONTAINS
       CALL cp_cfm_create(vxc_mo_mo, matrix_struct)
       CALL cp_cfm_create(cfm_mo_coeff, matrix_struct)
       CALL cp_fm_create(fm_Sigma_x_minus_vxc_mo_mo, matrix_struct)
-      CALL cp_fm_create(fm_tmp_re, matrix_struct)
-      CALL cp_fm_create(fm_tmp_im, matrix_struct)
 
       CALL cp_cfm_get_info(cfm_mo_coeff, nrow_global=nmo)
       ALLOCATE (diag_Sigma_x_minus_vxc_mo_mo(nmo))
@@ -6173,39 +6178,26 @@ CONTAINS
          DO ispin = 1, nspins
 
             ASSOCIATE (mo_set => kpoints_Sigma%kp_env(ikp)%kpoint_env%mos(ispin))
-            IF (kpoints_Sigma%use_real_wfn) THEN
-               IF (ASSOCIATED(mo_set%mo_coeff)) THEN
-                  CALL cp_fm_copy_general(mo_set%mo_coeff, fm_tmp_re, para_env)
-               ELSE
-                  CALL cp_fm_copy_general(fm_dummy, fm_tmp_re, para_env)
-               END IF
-               CALL cp_fm_set_all(fm_tmp_im, 0.0_dp)
-               CALL cp_fm_to_cfm(fm_tmp_re, fm_tmp_im, cfm_mo_coeff)
+            IF (ASSOCIATED(mo_set%cmo_coeff)) THEN
+               CALL cp_cfm_copy_general(mo_set%cmo_coeff, cfm_mo_coeff, para_env)
             ELSE
-               IF (ASSOCIATED(mo_set%cmo_coeff)) THEN
-                  CALL cp_cfm_copy_general(mo_set%cmo_coeff, cfm_mo_coeff, para_env)
-               ELSE
-                  CALL cp_cfm_copy_general(cfm_dummy, cfm_mo_coeff, para_env)
-               END IF
+               CALL cp_cfm_copy_general(cfm_dummy, cfm_mo_coeff, para_env)
             END IF
             END ASSOCIATE
 
-            CALL cp_fm_to_cfm(kpoints_Sigma%kp_env(ikp)%kpoint_env%wmat(1, ispin), &
-                              kpoints_Sigma%kp_env(ikp)%kpoint_env%wmat(2, ispin), ks_mat_ao_ao)
-            ASSOCIATE (wmat => kpoints_Sigma_no_xc%kp_env(ikp)%kpoint_env%wmat)
-            IF (ASSOCIATED(wmat(1, ispin)%matrix_struct)) THEN
-               CALL cp_fm_copy_general(wmat(1, ispin), fm_tmp_re, para_env)
+            CALL cp_cfm_to_cfm(kpoints_Sigma%kp_env(ikp)%kpoint_env%cwmat(ispin), ks_mat_ao_ao)
+
+            ASSOCIATE (kp_no_xc => kpoints_Sigma_no_xc%kp_env(ikp)%kpoint_env)
+            IF (ASSOCIATED(kp_no_xc%cwmat)) THEN
+               IF (ASSOCIATED(kp_no_xc%cwmat(ispin)%matrix_struct)) THEN
+                  CALL cp_cfm_copy_general(kp_no_xc%cwmat(ispin), vxc_ao_ao, para_env)
+               ELSE
+                  CALL cp_cfm_copy_general(cfm_dummy, vxc_ao_ao, para_env)
+               END IF
             ELSE
-               CALL cp_fm_copy_general(fm_dummy, fm_tmp_re, para_env)
-            END IF
-            IF (ASSOCIATED(wmat(2, ispin)%matrix_struct)) THEN
-               CALL cp_fm_copy_general(wmat(2, ispin), fm_tmp_im, para_env)
-            ELSE
-               CALL cp_fm_copy_general(fm_dummy, fm_tmp_im, para_env)
+               CALL cp_cfm_copy_general(cfm_dummy, vxc_ao_ao, para_env)
             END IF
             END ASSOCIATE
-
-            CALL cp_fm_to_cfm(fm_tmp_re, fm_tmp_im, vxc_ao_ao)
 
             CALL parallel_gemm('N', 'N', nmo, nmo, nmo, z_one, vxc_ao_ao, cfm_mo_coeff, z_zero, vxc_ao_mo)
             CALL parallel_gemm('C', 'N', nmo, nmo, nmo, z_one, cfm_mo_coeff, vxc_ao_mo, z_zero, vxc_mo_mo)
@@ -6227,8 +6219,6 @@ CONTAINS
       CALL cp_cfm_release(vxc_mo_mo)
       CALL cp_cfm_release(cfm_mo_coeff)
       CALL cp_fm_release(fm_Sigma_x_minus_vxc_mo_mo)
-      CALL cp_fm_release(fm_tmp_re)
-      CALL cp_fm_release(fm_tmp_im)
 
       DEALLOCATE (diag_Sigma_x_minus_vxc_mo_mo)
 

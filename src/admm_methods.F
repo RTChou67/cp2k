@@ -544,8 +544,7 @@ CONTAINS
                   CALL parallel_gemm('N', 'C', nao_aux_fit, nao_aux_fit, nao_orb, z_one, cwork_aux_orb, &
                                      kp%camat, z_zero, cwork_aux_aux)
 
-                  CALL cp_cfm_to_fm(cwork_aux_aux, mtargetr=kpoints%kp_aux_env(ikp)%kpoint_env%pmat(1, ispin), &
-                                    mtargeti=kpoints%kp_aux_env(ikp)%kpoint_env%pmat(2, ispin))
+                  CALL cp_cfm_to_cfm(cwork_aux_aux, kpoints%kp_aux_env(ikp)%kpoint_env%cpmat(ispin))
                END IF
             END IF
 
@@ -2992,9 +2991,7 @@ CONTAINS
                CALL cp_cfm_uplo_to_full(cS_inv, cwork_aux_aux)
 
                !Take the ORB density matrix from the kp_env
-               CALL cp_fm_to_cfm(kpoints%kp_env(ikp)%kpoint_env%pmat(1, ispin), &
-                                 kpoints%kp_env(ikp)%kpoint_env%pmat(2, ispin), &
-                                 cpmatrix)
+               CALL cp_cfm_to_cfm(kpoints%kp_env(ikp)%kpoint_env%cpmat(ispin), cpmatrix)
 
                !Do the same thing as in the real case
                !We need to calculate S^-1*K*A*P and S^-1*K*A*P*A^T

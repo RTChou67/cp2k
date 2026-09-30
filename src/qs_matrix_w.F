@@ -15,7 +15,6 @@ MODULE qs_matrix_w
    USE cp_cfm_types,                    ONLY: cp_cfm_create,&
                                               cp_cfm_get_info,&
                                               cp_cfm_release,&
-                                              cp_cfm_to_fm,&
                                               cp_cfm_type
    USE cp_control_types,                ONLY: dft_control_type
    USE cp_dbcsr_api,                    ONLY: dbcsr_p_type,&
@@ -228,7 +227,7 @@ CONTAINS
       INTEGER                                            :: handle, ikpgr, ispin, kplocal, kpmax, &
                                                             nao, nmo, nspin
       REAL(KIND=dp), DIMENSION(:), POINTER               :: occupation
-      TYPE(cp_cfm_type)                                  :: h_k, hc, wmat
+      TYPE(cp_cfm_type)                                  :: h_k, hc
       TYPE(cp_fm_pool_p_type), DIMENSION(:), POINTER     :: ao_ao_fm_pools
       TYPE(cp_fm_struct_type), POINTER                   :: h_k_struct
       TYPE(kpoint_env_type), POINTER                     :: kp
@@ -273,13 +272,9 @@ CONTAINS
                                           kp%mos(ispin)%cmo_coeff, hc)
                END IF
 
-               CALL cp_cfm_create(wmat, kp%wmat(1, ispin)%matrix_struct)
                CALL kpoint_ot_energy_weighted_density( &
-                  kp%mos(ispin)%cmo_coeff, hc, occupation, wmat)
-               ! wmat remains split-FM storage; keep that conversion at its boundary.
-               CALL cp_cfm_to_fm(wmat, kp%wmat(1, ispin), kp%wmat(2, ispin))
+                  kp%mos(ispin)%cmo_coeff, hc, occupation, kp%cwmat(ispin))
 
-               CALL cp_cfm_release(wmat)
                CALL cp_cfm_release(hc)
             END IF
          END DO

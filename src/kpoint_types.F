@@ -63,7 +63,7 @@ MODULE kpoint_types
    PUBLIC :: read_kpoint_section, write_kpoint_info
    PUBLIC :: kpoint_clear_scf_smat
    PUBLIC :: kpoint_env_type, kpoint_env_p_type
-   PUBLIC :: kpoint_env_create, get_kpoint_env
+   PUBLIC :: kpoint_env_create, kpoint_env_release_density_matrices, get_kpoint_env
    PUBLIC :: kind_rotmat_type
    PUBLIC :: kpoint_sym_type
    PUBLIC :: kpoint_sym_create, find_kpoint_rotation_slot
@@ -78,8 +78,10 @@ MODULE kpoint_types
 !> \param mos_prefilled the MOS hold meaningful coefficients (refilled and
 !>                     reorthogonalized by wavefunction extrapolation for the
 !>                     current geometry) rather than being only allocated
-!> \param pmat      associated density matrix (r/i,spin)
-!> \param wmat      associated energy weighted density matrix (r/i,spin)
+!> \param pmat      real density matrix (spin), for real wavefunctions
+!> \param cpmat     complex density matrix (spin), for complex wavefunctions
+!> \param wmat      real energy weighted density matrix (spin), for real wavefunctions
+!> \param cwmat     complex energy weighted density matrix (spin), for complex wavefunctions
 !> \param smat      real ADMM auxiliary overlap matrix
 !> \param amat      real ADMM basis projection matrix
 !> \param csmat     complex ADMM auxiliary overlap matrix
@@ -100,6 +102,8 @@ MODULE kpoint_types
       LOGICAL                                           :: mos_prefilled = .FALSE.
       TYPE(cp_fm_type), DIMENSION(:, :), POINTER        :: pmat => NULL()
       TYPE(cp_fm_type), DIMENSION(:, :), POINTER        :: wmat => NULL()
+      TYPE(cp_cfm_type), DIMENSION(:), POINTER          :: cpmat => NULL()
+      TYPE(cp_cfm_type), DIMENSION(:), POINTER          :: cwmat => NULL()
       TYPE(cp_fm_type)                                  :: smat, amat
       TYPE(cp_cfm_type)                                 :: csmat, camat
       TYPE(cp_fm_type), DIMENSION(:, :), POINTER        :: ot_hmat => NULL()
@@ -1112,6 +1116,8 @@ CONTAINS
       NULLIFY (kp_env%mos)
       NULLIFY (kp_env%pmat)
       NULLIFY (kp_env%wmat)
+      NULLIFY (kp_env%cpmat)
+      NULLIFY (kp_env%cwmat)
       NULLIFY (kp_env%ot_hmat)
       NULLIFY (kp_env%ot_smat)
       NULLIFY (kp_env%ot_tmat)
@@ -1137,8 +1143,7 @@ CONTAINS
             DEALLOCATE (kp_env%mos)
          END IF
 
-         CALL cp_fm_release(kp_env%pmat)
-         CALL cp_fm_release(kp_env%wmat)
+         CALL kpoint_env_release_density_matrices(kp_env)
          CALL cp_fm_release(kp_env%smat)
          CALL cp_fm_release(kp_env%amat)
          CALL cp_cfm_release(kp_env%csmat)
@@ -1161,6 +1166,19 @@ CONTAINS
       END IF
 
    END SUBROUTINE kpoint_env_release
+
+! **************************************************************************************************
+!> \brief Release the density and energy-weighted density matrices of a k-point environment.
+!> \param kp_env k-point environment
+! **************************************************************************************************
+   SUBROUTINE kpoint_env_release_density_matrices(kp_env)
+      TYPE(kpoint_env_type), INTENT(INOUT)               :: kp_env
+
+      CALL cp_fm_release(kp_env%pmat)
+      CALL cp_fm_release(kp_env%wmat)
+      CALL cp_cfm_release(kp_env%cpmat)
+      CALL cp_cfm_release(kp_env%cwmat)
+   END SUBROUTINE kpoint_env_release_density_matrices
 
 ! **************************************************************************************************
 !> \brief Get information from a single kpoint environment

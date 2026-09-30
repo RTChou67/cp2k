@@ -1179,15 +1179,16 @@ CONTAINS
       kp => kpoints%kp_env(1)%kpoint_env
       nworkers = 1
 !$    IF (kpoints%para_env_kp%num_pe == 1) nworkers = MIN(omp_get_max_threads(), kplocal)
-      ALLOCATE (work(nworkers))
-      q(:, :) = 0.0_dp
-      IF (PRESENT(density) .OR. .NOT. kpoints%use_real_wfn) THEN
+      IF (PRESENT(density)) THEN
+         CPASSERT(.NOT. kpoints%use_real_wfn)
+         ALLOCATE (work(nworkers))
          DO thread = 1, nworkers
-            CALL cp_cfm_create(work(thread), kp%pmat(1, 1)%matrix_struct)
+            CALL cp_cfm_create(work(thread), kp%cpmat(1)%matrix_struct)
          END DO
       END IF
+      q(:, :) = 0.0_dp
 !$OMP PARALLEL DO DEFAULT(NONE) SCHEDULE(STATIC) NUM_THREADS(nworkers) IF(nworkers > 1) &
-!$OMP SHARED(kpoints,density,work,nspin,kplocal,nworkers) PRIVATE(ik,ispin,kp,thread) REDUCTION(+:q)
+!$OMP SHARED(kpoints,density,nspin,kplocal,nworkers,work) PRIVATE(ik,ispin,kp,thread) REDUCTION(+:q)
       DO ik = 1, kplocal
          thread = 1
 !$       thread = omp_get_thread_num() + 1
@@ -1199,17 +1200,18 @@ CONTAINS
             ELSE IF (kpoints%use_real_wfn) THEN
                CALL lowdin_kp_accumulate(kp, q(:, ispin), pmat=kp%pmat(1, ispin))
             ELSE
-               CALL cp_fm_to_cfm(kp%pmat(1, ispin), kp%pmat(2, ispin), work(thread))
-               CALL lowdin_kp_accumulate(kp, q(:, ispin), cpmat=work(thread))
+               CALL lowdin_kp_accumulate(kp, q(:, ispin), cpmat=kp%cpmat(ispin))
             END IF
          END DO
       END DO
 !$OMP END PARALLEL DO
       ! Each entry is a local tile contraction: reduce once across groups AND group ranks.
       CALL kpoints%para_env%sum(q)
-      DO thread = 1, nworkers
-         CALL cp_cfm_release(work(thread))
-      END DO
+      IF (PRESENT(density)) THEN
+         DO thread = 1, nworkers
+            CALL cp_cfm_release(work(thread))
+         END DO
+      END IF
       CALL timestop(handle)
    END SUBROUTINE lowdin_kp_project
 
@@ -1394,7 +1396,11 @@ CONTAINS
       kp => kpoints%kp_env(1)%kpoint_env
       DO thread = 1, nworkers
          DO iw = 1, 2
-            CALL cp_cfm_create(work(iw, thread), kp%pmat(1, 1)%matrix_struct)
+            IF (ASSOCIATED(kp%cpmat)) THEN
+               CALL cp_cfm_create(work(iw, thread), kp%cpmat(1)%matrix_struct)
+            ELSE
+               CALL cp_cfm_create(work(iw, thread), kp%pmat(1, 1)%matrix_struct)
+            END IF
          END DO
          CALL cp_cfm_create(work(3, thread), kp%lowdin_cb%matrix_struct)
          CALL gemm(thread)%create(LOCAL_GEMM_PU_GPU, timing=.FALSE.)
@@ -1443,16 +1449,16 @@ CONTAINS
       IF (ALL(v == 0.0_dp)) RETURN
       CPASSERT(ALLOCATED(kp%lowdin_sqrt))
       CPASSERT(ASSOCIATED(kp%lowdin_evec%local_data))
-      CPASSERT(ASSOCIATED(kp%wmat))
+      CPASSERT(ASSOCIATED(kp%wmat) .OR. ASSOCIATED(kp%cwmat))
       CALL cp_cfm_get_info(work(1), nrow_global=n, nrow_local=nr, ncol_local=nc, &
                            row_indices=rows, col_indices=columns)
       m = SIZE(orbitals)
       local = PRODUCT(work(1)%matrix_struct%context%num_pe) == 1
-      real_only = SIZE(kp%pmat, 1) == 1
+      real_only = ASSOCIATED(kp%pmat)
       IF (real_only) THEN
          CALL cp_fm_to_cfm(kp%pmat(1, ispin), mtarget=work(1))
       ELSE
-         CALL cp_fm_to_cfm(kp%pmat(1, ispin), kp%pmat(2, ispin), work(1))
+         CALL cp_cfm_to_cfm(kp%cpmat(ispin), work(1))
       END IF
       ! U**H * P * A * V * U = (U**H * P * B) * diag(v) * U(orbitals,:).
       ! Keep these products thin: only the final backtransform needs square GEMMs.
@@ -1489,9 +1495,10 @@ CONTAINS
             ELSE
                value = work(2)%local_data(i, j) + work(1)%local_data(i, j)
             END IF
-            kp%wmat(1, ispin)%local_data(i, j) = kp%wmat(1, ispin)%local_data(i, j) - REAL(value, dp)
-            IF (.NOT. real_only) THEN
-               kp%wmat(2, ispin)%local_data(i, j) = kp%wmat(2, ispin)%local_data(i, j) - AIMAG(value)
+            IF (real_only) THEN
+               kp%wmat(1, ispin)%local_data(i, j) = kp%wmat(1, ispin)%local_data(i, j) - REAL(value, dp)
+            ELSE
+               kp%cwmat(ispin)%local_data(i, j) = kp%cwmat(ispin)%local_data(i, j) - value
             END IF
          END DO
       END DO
