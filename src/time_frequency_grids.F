@@ -32,9 +32,11 @@ MODULE time_frequency_grids
       REAL(KIND=dp), DIMENSION(:), ALLOCATABLE :: frequency_weights
       REAL(KIND=dp), DIMENSION(:), ALLOCATABLE :: imaginary_time
       REAL(KIND=dp), DIMENSION(:), ALLOCATABLE :: time_weights_at_zero_frequency
-      REAL(KIND=dp), DIMENSION(:, :), ALLOCATABLE :: cosine_time_to_frequency_weights
-      REAL(KIND=dp), DIMENSION(:, :), ALLOCATABLE :: cosine_frequency_to_time_weights
-      REAL(KIND=dp), DIMENSION(:, :), ALLOCATABLE :: sine_time_to_frequency_weights
+      ! Complete discrete transforms, including cosine/sine factors.
+      ! Matrix rows index output grid points, columns index input grid points.
+      REAL(KIND=dp), DIMENSION(:, :), ALLOCATABLE :: cosine_time_to_frequency
+      REAL(KIND=dp), DIMENSION(:, :), ALLOCATABLE :: cosine_frequency_to_time
+      REAL(KIND=dp), DIMENSION(:, :), ALLOCATABLE :: sine_time_to_frequency
    END TYPE time_frequency_grid_type
 
    INTEGER, PARAMETER :: cosine_time_to_frequency = 1, &
@@ -59,16 +61,16 @@ CONTAINS
       IF (ALLOCATED(grid%frequency_weights)) DEALLOCATE (grid%frequency_weights)
       IF (ALLOCATED(grid%imaginary_time)) DEALLOCATE (grid%imaginary_time)
       IF (ALLOCATED(grid%time_weights_at_zero_frequency)) DEALLOCATE (grid%time_weights_at_zero_frequency)
-      IF (ALLOCATED(grid%cosine_time_to_frequency_weights)) DEALLOCATE (grid%cosine_time_to_frequency_weights)
-      IF (ALLOCATED(grid%cosine_frequency_to_time_weights)) DEALLOCATE (grid%cosine_frequency_to_time_weights)
-      IF (ALLOCATED(grid%sine_time_to_frequency_weights)) DEALLOCATE (grid%sine_time_to_frequency_weights)
+      IF (ALLOCATED(grid%cosine_time_to_frequency)) DEALLOCATE (grid%cosine_time_to_frequency)
+      IF (ALLOCATED(grid%cosine_frequency_to_time)) DEALLOCATE (grid%cosine_frequency_to_time)
+      IF (ALLOCATED(grid%sine_time_to_frequency)) DEALLOCATE (grid%sine_time_to_frequency)
 
    END SUBROUTINE time_frequency_grid_release
 
 ! **************************************************************************************************
 !> \brief Transform real positive/negative-time samples to complex positive-frequency values.
 !>        The even part uses the cosine transform and the odd part the sine transform.
-!> \param grid Time/frequency nodes and fitted cosine/sine transform weights.
+!> \param grid Time/frequency nodes and complete cosine/sine transform matrices.
 !> \param samples_tau Real samples indexed (state, time, branch), with branches
 !>        positive_time and negative_time. The samples include their physical signs.
 !> \param values_omega Complex output indexed (state, frequency), evaluated at the leading
@@ -95,10 +97,10 @@ CONTAINS
       CPASSERT(SIZE(values_omega, 1) == nstate)
       CPASSERT(ntime == SIZE(grid%imaginary_time))
       CPASSERT(nfreq <= SIZE(grid%frequency))
-      CPASSERT(nfreq <= SIZE(grid%cosine_time_to_frequency_weights, 1))
-      CPASSERT(ntime == SIZE(grid%cosine_time_to_frequency_weights, 2))
-      CPASSERT(nfreq <= SIZE(grid%sine_time_to_frequency_weights, 1))
-      CPASSERT(ntime == SIZE(grid%sine_time_to_frequency_weights, 2))
+      CPASSERT(nfreq <= SIZE(grid%cosine_time_to_frequency, 1))
+      CPASSERT(ntime == SIZE(grid%cosine_time_to_frequency, 2))
+      CPASSERT(nfreq <= SIZE(grid%sine_time_to_frequency, 1))
+      CPASSERT(ntime == SIZE(grid%sine_time_to_frequency, 2))
 
       ALLOCATE (samples_even(nstate), samples_odd(nstate))
       values_omega = z_zero
@@ -106,10 +108,8 @@ CONTAINS
          samples_even = 0.5_dp*(samples_tau(:, itime, positive_time) + samples_tau(:, itime, negative_time))
          samples_odd = 0.5_dp*(samples_tau(:, itime, positive_time) - samples_tau(:, itime, negative_time))
          DO ifreq = 1, nfreq
-            weight_cos = grid%cosine_time_to_frequency_weights(ifreq, itime)* &
-                         COS(grid%frequency(ifreq)*grid%imaginary_time(itime))
-            weight_sin = grid%sine_time_to_frequency_weights(ifreq, itime)* &
-                         SIN(grid%frequency(ifreq)*grid%imaginary_time(itime))
+            weight_cos = grid%cosine_time_to_frequency(ifreq, itime)
+            weight_sin = grid%sine_time_to_frequency(ifreq, itime)
             values_omega(:, ifreq) = values_omega(:, ifreq) + &
                                      CMPLX(weight_cos*samples_even, weight_sin*samples_odd, KIND=dp)
          END DO
@@ -163,8 +163,8 @@ CONTAINS
 !> \param grid Grid object to fill.
 !> \param build_frequency Whether to construct the frequency components.
 !> \param build_time Whether to construct the imaginary-time components.
-!> \param build_transforms Whether to construct the time/frequency transform weights.
-!> \param build_sine Whether to construct the sine time-to-frequency weights.
+!> \param build_transforms Whether to construct the complete time/frequency transform matrices.
+!> \param build_sine Whether to construct the sine time-to-frequency matrix.
 !> \param time_scaling Scaling applied to the imaginary-time abscissas.
 !> \param time_weight_scaling Scaling applied to the imaginary-time weights.
 !> \param max_fit_error Maximum fitting error across all requested transforms.
@@ -194,25 +194,26 @@ CONTAINS
 
       CHARACTER(LEN=*), PARAMETER :: routineN = 'build_minimax_time_frequency_grid'
 
-      INTEGER                                            :: external_ierr, handle, ierr
+      INTEGER                                            :: external_ierr, handle, ierr, itime
       REAL(KIND=dp)                                      :: e_range, max_error
       REAL(KIND=dp), ALLOCATABLE, DIMENSION(:)           :: points_and_weights
+      REAL(KIND=dp), DIMENSION(num_points)               :: cos_factors
 
       CALL timeset(routineN, handle)
 
       IF (PRESENT(used_external_backend)) used_external_backend = .FALSE.
+      grid_build: BLOCK
       IF (prefer_external_backend) THEN
          CALL greenx_get_minimax_grid(unit_nr, num_points, energy_min, energy_max, regularization, &
                                       grid%imaginary_time, grid%time_weights_at_zero_frequency, &
                                       grid%frequency, grid%frequency_weights, &
-                                      grid%cosine_time_to_frequency_weights, &
-                                      grid%cosine_frequency_to_time_weights, &
-                                      grid%sine_time_to_frequency_weights, external_ierr)
+                                      grid%cosine_time_to_frequency, &
+                                      grid%cosine_frequency_to_time, &
+                                      grid%sine_time_to_frequency, external_ierr)
          IF (external_ierr == 0) THEN
             max_fit_error = 0.0_dp
             IF (PRESENT(used_external_backend)) used_external_backend = .TRUE.
-            CALL timestop(handle)
-            RETURN
+            EXIT grid_build
          END IF
          CALL time_frequency_grid_release(grid)
       END IF
@@ -256,20 +257,20 @@ CONTAINS
          grid%time_weights_at_zero_frequency(:) = points_and_weights(num_points + 1:)/time_weight_scaling/energy_min
 
          IF (build_transforms) THEN
-            ALLOCATE (grid%cosine_time_to_frequency_weights(num_points, num_points))
+            ALLOCATE (grid%cosine_time_to_frequency(num_points, num_points))
             CALL fit_l_sq_weights(cosine_time_to_frequency, num_points, grid%imaginary_time, &
-                                  grid%cosine_time_to_frequency_weights, grid%frequency, energy_min, energy_max, &
+                                  grid%cosine_time_to_frequency, grid%frequency, energy_min, energy_max, &
                                   max_error, num_points_per_magnitude, regularization)
 
-            ALLOCATE (grid%cosine_frequency_to_time_weights(num_points, num_points))
+            ALLOCATE (grid%cosine_frequency_to_time(num_points, num_points))
             CALL fit_l_sq_weights(cosine_frequency_to_time, num_points, grid%imaginary_time, &
-                                  grid%cosine_frequency_to_time_weights, grid%frequency, energy_min, energy_max, &
+                                  grid%cosine_frequency_to_time, grid%frequency, energy_min, energy_max, &
                                   max_error, num_points_per_magnitude, regularization)
 
             IF (build_sine) THEN
-               ALLOCATE (grid%sine_time_to_frequency_weights(num_points, num_points))
+               ALLOCATE (grid%sine_time_to_frequency(num_points, num_points))
                CALL fit_l_sq_weights(sine_time_to_frequency, num_points, grid%imaginary_time, &
-                                     grid%sine_time_to_frequency_weights, grid%frequency, energy_min, energy_max, &
+                                     grid%sine_time_to_frequency, grid%frequency, energy_min, energy_max, &
                                      max_error, num_points_per_magnitude, regularization)
             END IF
          END IF
@@ -278,6 +279,28 @@ CONTAINS
       max_fit_error = max_error
 
       DEALLOCATE (points_and_weights)
+      END BLOCK grid_build
+
+      ! Both backends supply bare fitted weights. Store each complete discrete
+      ! transform once, so every storage backend applies the same coefficients.
+      IF (ALLOCATED(grid%cosine_time_to_frequency) .OR. &
+          ALLOCATED(grid%cosine_frequency_to_time) .OR. ALLOCATED(grid%sine_time_to_frequency)) THEN
+         CPASSERT(ALLOCATED(grid%frequency) .AND. ALLOCATED(grid%imaginary_time))
+         CPASSERT(SIZE(grid%frequency) == num_points)
+         DO itime = 1, SIZE(grid%imaginary_time)
+            cos_factors = COS(grid%frequency*grid%imaginary_time(itime))
+            IF (ALLOCATED(grid%cosine_time_to_frequency)) THEN
+               grid%cosine_time_to_frequency(:, itime) = grid%cosine_time_to_frequency(:, itime)*cos_factors
+            END IF
+            IF (ALLOCATED(grid%cosine_frequency_to_time)) THEN
+               grid%cosine_frequency_to_time(itime, :) = grid%cosine_frequency_to_time(itime, :)*cos_factors
+            END IF
+            IF (ALLOCATED(grid%sine_time_to_frequency)) THEN
+               grid%sine_time_to_frequency(:, itime) = grid%sine_time_to_frequency(:, itime)* &
+                                                       SIN(grid%frequency*grid%imaginary_time(itime))
+            END IF
+         END DO
+      END IF
 
       CALL timestop(handle)
 
