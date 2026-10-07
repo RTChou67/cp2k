@@ -27,6 +27,7 @@ MODULE qs_tddfpt2_eigensolver
         cp_fm_release, cp_fm_set_all, cp_fm_set_submatrix, cp_fm_to_fm, cp_fm_type
    USE cp_log_handling,                 ONLY: cp_logger_type
    USE cp_output_handling,              ONLY: cp_iterate
+   USE ieee_arithmetic,                 ONLY: ieee_is_finite
    USE input_constants,                 ONLY: no_sf_tddfpt,&
                                               tddfpt_kernel_full,&
                                               tddfpt_kernel_none,&
@@ -181,24 +182,26 @@ CONTAINS
 !> \param max_norm  the largest possible overlap between the ground state and
 !>                  excited state wave functions
 !> \param spinflip ...
+!> \param max_overlap optional largest occupied-space overlap over all trial vectors
 !> \return true if trial vectors are non-orthogonal to occupied molecular orbitals
 !> \par History
 !>    * 07.2016 created [Sergey Chulkov]
 !>    * 05.2019 use temporary work matrices [JHU]
 ! **************************************************************************************************
-   FUNCTION tddfpt_is_nonorthogonal_psi1_psi0(evects, S_C0, max_norm, spinflip) &
+   FUNCTION tddfpt_is_nonorthogonal_psi1_psi0(evects, S_C0, max_norm, spinflip, max_overlap) &
       RESULT(is_nonortho)
       TYPE(cp_fm_type), DIMENSION(:, :), INTENT(in)      :: evects
       TYPE(cp_fm_type), DIMENSION(:), INTENT(in)         :: S_C0
       REAL(kind=dp), INTENT(in)                          :: max_norm
       INTEGER, INTENT(in)                                :: spinflip
+      REAL(kind=dp), INTENT(OUT), OPTIONAL               :: max_overlap
       LOGICAL                                            :: is_nonortho
 
       CHARACTER(LEN=*), PARAMETER :: routineN = 'tddfpt_is_nonorthogonal_psi1_psi0'
 
       INTEGER                                            :: handle, ispin, ivect, nactive, nao, &
                                                             nocc, nspins, nvects, spin
-      REAL(kind=dp)                                      :: maxabs_val
+      REAL(kind=dp)                                      :: largest_overlap, maxabs_val
       TYPE(cp_fm_struct_type), POINTER                   :: matrix_struct, matrix_struct_tmp
       TYPE(cp_fm_type)                                   :: aortho
 
@@ -208,8 +211,9 @@ CONTAINS
       nvects = SIZE(evects, 2)
 
       is_nonortho = .FALSE.
+      largest_overlap = 0.0_dp
 
-      loop: DO ispin = 1, nspins
+      DO ispin = 1, nspins
 
          IF (spinflip == no_sf_tddfpt) THEN
             spin = ispin
@@ -229,14 +233,13 @@ CONTAINS
             CALL parallel_gemm('T', 'N', nocc, nactive, nao, 1.0_dp, S_C0(spin), &
                                evects(ispin, ivect), 0.0_dp, aortho)
             CALL cp_fm_maxabsval(aortho, maxabs_val)
-            is_nonortho = maxabs_val > max_norm
-            IF (is_nonortho) THEN
-               CALL cp_fm_release(aortho)
-               EXIT loop
-            END IF
+            largest_overlap = MAX(largest_overlap, maxabs_val)
          END DO
          CALL cp_fm_release(aortho)
-      END DO loop
+      END DO
+
+      is_nonortho = largest_overlap > max_norm
+      IF (PRESENT(max_overlap)) max_overlap = largest_overlap
 
       CALL timestop(handle)
 
@@ -248,6 +251,9 @@ CONTAINS
 !> \param nvects_new  number of new trial vectors to orthogonalise
 !> \param S_evects    set of matrices to store matrix product S * evects (modified on exit)
 !> \param matrix_s    overlap matrix
+!> \param success optional status; false if any new direction cannot be safely normalized
+!> \param log_unit optional unit for orthogonalization diagnostics
+!> \param iteration optional Davidson iteration that generated the new directions
 !> \par History
 !>    * 05.2016 created [Sergey Chulkov]
 !>    * 02.2017 caching the matrix product S * evects [Sergey Chulkov]
@@ -276,18 +282,23 @@ CONTAINS
 !>       when the trace Tr(C3^T * S * C1) is large enough.
 !>       \endparblock
 ! **************************************************************************************************
-   SUBROUTINE tddfpt_orthonormalize_psi1_psi1(evects, nvects_new, S_evects, matrix_s)
+   SUBROUTINE tddfpt_orthonormalize_psi1_psi1(evects, nvects_new, S_evects, matrix_s, &
+                                              success, log_unit, iteration)
       TYPE(cp_fm_type), DIMENSION(:, :), INTENT(in)      :: evects
       INTEGER, INTENT(in)                                :: nvects_new
       TYPE(cp_fm_type), DIMENSION(:, :), INTENT(INOUT)   :: S_evects
       TYPE(dbcsr_type), POINTER                          :: matrix_s
+      LOGICAL, INTENT(OUT), OPTIONAL                     :: success
+      INTEGER, INTENT(IN), OPTIONAL                      :: log_unit, iteration
 
       CHARACTER(LEN=*), PARAMETER :: routineN = 'tddfpt_orthonormalize_psi1_psi1'
+      REAL(kind=dp), PARAMETER :: orthogonal_tol = SQRT(EPSILON(1.0_dp))
 
-      INTEGER                                            :: handle, ispin, ivect, jvect, nspins, &
-                                                            nvects_old, nvects_total
+      INTEGER                                            :: handle, ipass, ispin, istep, ivect, &
+                                                            jvect, nspins, nvects_old, nvects_total
       INTEGER, DIMENSION(maxspins)                       :: nactive
-      REAL(kind=dp)                                      :: norm
+      LOGICAL                                            :: accepted
+      REAL(kind=dp)                                      :: max_overlap, norm, norms(0:2), ratio
       REAL(kind=dp), DIMENSION(maxspins)                 :: weights
 
       CALL timeset(routineN, handle)
@@ -295,6 +306,9 @@ CONTAINS
       nspins = SIZE(evects, 1)
       nvects_total = SIZE(evects, 2)
       nvects_old = nvects_total - nvects_new
+      IF (PRESENT(success)) success = .TRUE.
+      istep = 0
+      IF (PRESENT(iteration)) istep = iteration
 
       IF (debug_this_module) THEN
          CPASSERT(SIZE(S_evects, 1) == nspins)
@@ -307,31 +321,85 @@ CONTAINS
       END DO
 
       DO jvect = nvects_old + 1, nvects_total
-         ! Orthogonalization <psi1_i | psi1_j>
-         DO ivect = 1, jvect - 1
-            CALL cp_fm_trace(evects(:, jvect), S_evects(:, ivect), weights(1:nspins), accurate=.FALSE.)
-            norm = SUM(weights(1:nspins))
-
+         accepted = .FALSE.
+         norms = 0.0_dp
+         ratio = 0.0_dp
+         max_overlap = 0.0_dp
+         orthogonalize: BLOCK
+            ! Measure the incoming direction before subtracting the Krylov components.
             DO ispin = 1, nspins
-               CALL cp_fm_scale_and_add(1.0_dp, evects(ispin, jvect), -norm, evects(ispin, ivect))
+               CALL cp_dbcsr_sm_fm_multiply(matrix_s, evects(ispin, jvect), S_evects(ispin, jvect), &
+                                            ncol=nactive(ispin), alpha=1.0_dp, beta=0.0_dp)
             END DO
-         END DO
+            CALL cp_fm_trace(evects(:, jvect), S_evects(:, jvect), weights(1:nspins), accurate=.TRUE.)
+            norm = SUM(weights(1:nspins))
+            IF (.NOT. ieee_is_finite(norm)) EXIT orthogonalize
+            IF (norm <= 0.0_dp) EXIT orthogonalize
+            norms(0) = SQRT(norm)
 
-         ! Normalization <psi1_j | psi1_j> = 1
-         DO ispin = 1, nspins
-            CALL cp_dbcsr_sm_fm_multiply(matrix_s, evects(ispin, jvect), S_evects(ispin, jvect), &
-                                         ncol=nactive(ispin), alpha=1.0_dp, beta=0.0_dp)
-         END DO
+            ! A second MGS pass removes Krylov components left by cancellation in the first pass.
+            DO ipass = 1, 2
+               DO ivect = 1, jvect - 1
+                  CALL cp_fm_trace(evects(:, jvect), S_evects(:, ivect), weights(1:nspins), accurate=.TRUE.)
+                  norm = SUM(weights(1:nspins))
+                  IF (.NOT. ieee_is_finite(norm)) EXIT orthogonalize
+                  DO ispin = 1, nspins
+                     CALL cp_fm_scale_and_add(1.0_dp, evects(ispin, jvect), -norm, evects(ispin, ivect))
+                  END DO
+               END DO
 
-         CALL cp_fm_trace(evects(:, jvect), S_evects(:, jvect), weights(1:nspins), accurate=.FALSE.)
+               DO ispin = 1, nspins
+                  CALL cp_dbcsr_sm_fm_multiply(matrix_s, evects(ispin, jvect), S_evects(ispin, jvect), &
+                                               ncol=nactive(ispin), alpha=1.0_dp, beta=0.0_dp)
+               END DO
+               CALL cp_fm_trace(evects(:, jvect), S_evects(:, jvect), weights(1:nspins), accurate=.TRUE.)
+               norm = SUM(weights(1:nspins))
+               IF (.NOT. ieee_is_finite(norm)) EXIT orthogonalize
+               IF (norm <= 0.0_dp) EXIT orthogonalize
+               norms(ipass) = SQRT(norm)
+            END DO
 
-         norm = SUM(weights(1:nspins))
-         norm = 1.0_dp/SQRT(norm)
+            ratio = norms(2)/norms(0)
+            IF (.NOT. ieee_is_finite(ratio)) EXIT orthogonalize
+            ! Use a relative norm cutoff to avoid amplifying cancellation noise.
+            IF (ratio <= orthogonal_tol) EXIT orthogonalize
 
-         DO ispin = 1, nspins
-            CALL cp_fm_scale(norm, evects(ispin, jvect))
-            CALL cp_fm_scale(norm, S_evects(ispin, jvect))
-         END DO
+            DO ivect = 1, jvect - 1
+               CALL cp_fm_trace(evects(:, jvect), S_evects(:, ivect), weights(1:nspins), accurate=.TRUE.)
+               norm = SUM(weights(1:nspins))
+               IF (.NOT. ieee_is_finite(norm)) EXIT orthogonalize
+               max_overlap = MAX(max_overlap, ABS(norm)/norms(2))
+            END DO
+            IF (.NOT. ieee_is_finite(max_overlap)) EXIT orthogonalize
+            IF (max_overlap > orthogonal_tol) EXIT orthogonalize
+
+            norm = 1.0_dp/norms(2)
+            IF (.NOT. ieee_is_finite(norm)) EXIT orthogonalize
+            DO ispin = 1, nspins
+               CALL cp_fm_scale(norm, evects(ispin, jvect))
+               CALL cp_fm_scale(norm, S_evects(ispin, jvect))
+            END DO
+            accepted = .TRUE.
+         END BLOCK orthogonalize
+
+         IF (PRESENT(log_unit)) THEN
+            IF (log_unit > 0) THEN
+               WRITE (log_unit, '(T2,A,I6,A,I6,6(A,ES12.4),A,L1)') &
+                  'TDDFPT_ORTHO| Step ', istep, ' vector ', jvect, &
+                  ' S_in=', norms(0), ' S_mgs1=', norms(1), ' S_mgs2=', norms(2), &
+                  ' ratio=', ratio, ' Krylov_overlap=', max_overlap, &
+                  ' cutoff=', orthogonal_tol, ' accepted=', accepted
+            END IF
+         END IF
+
+         IF (.NOT. accepted) THEN
+            IF (PRESENT(success)) THEN
+               success = .FALSE.
+               EXIT
+            ELSE
+               CPABORT("Invalid or linearly dependent TDDFPT trial vector")
+            END IF
+         END IF
       END DO
 
       CALL timestop(handle)
@@ -849,10 +917,13 @@ CONTAINS
                                                             max_krylov_vects, nspins, nstates, &
                                                             nstates_conv, nvects_exist, nvects_new
       INTEGER(kind=int_8)                                :: nstates_total
-      LOGICAL                                            :: is_nonortho
-      REAL(kind=dp)                                      :: t1, t2
+      INTEGER, DIMENSION(maxspins)                       :: nactive
+      LOGICAL                                            :: is_nonortho, orthonormalized
+      REAL(kind=dp)                                      :: occupied_overlap, residual_norm, t1, t2, &
+                                                            weights(maxspins)
       REAL(kind=dp), ALLOCATABLE, DIMENSION(:)           :: evals_last
       REAL(kind=dp), DIMENSION(:, :), POINTER            :: Atilde
+      TYPE(cp_fm_type), ALLOCATABLE, DIMENSION(:)        :: residual_work
       TYPE(cp_fm_type), ALLOCATABLE, DIMENSION(:, :)     :: Aop_krylov, Aop_ritz, krylov_vects, &
                                                             S_krylov
       TYPE(dbcsr_p_type), DIMENSION(:), POINTER          :: matrix_s
@@ -875,6 +946,11 @@ CONTAINS
       max_krylov_vects = MIN(MAX(tddfpt_control%nkvs, nstates), INT(nstates_total))
 
       ALLOCATE (Aop_ritz(nspins, nstates))
+      ALLOCATE (residual_work(nspins))
+      DO ispin = 1, nspins
+         CALL cp_fm_get_info(evects(ispin, 1), ncol_global=nactive(ispin))
+         CALL fm_pool_create_fm(work_matrices%fm_pool_ao_mo_active(ispin)%pool, residual_work(ispin))
+      END DO
       DO istate = 1, nstates
          DO ispin = 1, nspins
             CALL fm_pool_create_fm(work_matrices%fm_pool_ao_mo_active(ispin)%pool, Aop_ritz(ispin, istate))
@@ -925,6 +1001,23 @@ CONTAINS
                                         Aop_krylov=Aop_krylov(:, 1:nvects_exist + nvects_new), &
                                         Atilde=Atilde, nkvo=nvects_exist, nkvn=nvects_new)
 
+         ! Diagnose the algebraic Ritz residual from the cached operator action.
+         ! This AO Frobenius norm is separate from the energy-change convergence criterion.
+         DO istate = 1, nstates
+            DO ispin = 1, nspins
+               CALL cp_dbcsr_sm_fm_multiply(matrix_s(1)%matrix, evects(ispin, istate), S_evects(ispin, istate), &
+                                            ncol=nactive(ispin), alpha=1.0_dp, beta=0.0_dp)
+               CALL cp_fm_to_fm(Aop_ritz(ispin, istate), residual_work(ispin))
+               CALL cp_fm_scale_and_add(1.0_dp, residual_work(ispin), -evals_last(istate), S_evects(ispin, istate))
+            END DO
+            CALL cp_fm_trace(residual_work, residual_work, weights(1:nspins), accurate=.TRUE.)
+            residual_norm = SQRT(SUM(weights(1:nspins)))
+            IF (iter_unit > 0) THEN
+               WRITE (iter_unit, '(T2,A,I6,A,I6,A,ES12.4)') &
+                  'TDDFPT_RESIDUAL| Step ', iter, ' state ', istate, ' AO_F=', residual_norm
+            END IF
+         END DO
+
          CALL tddfpt_write_restart(evects=evects, evals=evals_last(1:nstates), gs_mos=gs_mos, &
                                    logger=logger, tddfpt_print_section=tddfpt_print_section)
 
@@ -959,11 +1052,24 @@ CONTAINS
                                                 gs_mos, evals(1:nstates), tddfpt_control, work_matrices%S_C0)
 
             CALL tddfpt_orthonormalize_psi1_psi1(krylov_vects(:, 1:nvects_exist + nvects_new), nvects_new, &
-                                                 S_krylov(:, 1:nvects_exist + nvects_new), matrix_s(1)%matrix)
+                                                 S_krylov(:, 1:nvects_exist + nvects_new), matrix_s(1)%matrix, &
+                                                 success=orthonormalized, log_unit=iter_unit, iteration=iter)
 
-            is_nonortho = tddfpt_is_nonorthogonal_psi1_psi0(krylov_vects(:, nvects_exist + 1:nvects_exist + nvects_new), &
-                                                            work_matrices%S_C0, tddfpt_control%orthogonal_eps, &
-                                                            tddfpt_control%spinflip)
+            IF (orthonormalized) THEN
+               is_nonortho = tddfpt_is_nonorthogonal_psi1_psi0(krylov_vects(:, nvects_exist + 1:nvects_exist + nvects_new), &
+                                                               work_matrices%S_C0, tddfpt_control%orthogonal_eps, &
+                                                               tddfpt_control%spinflip, max_overlap=occupied_overlap)
+               IF (iter_unit > 0) THEN
+                  WRITE (iter_unit, '(T2,A,I6,2(A,ES12.4),A,L1)') &
+                     'TDDFPT_ORTHO| Step ', iter, ' occupied_overlap=', occupied_overlap, &
+                     ' limit=', tddfpt_control%orthogonal_eps, ' restart=', is_nonortho
+               END IF
+            ELSE
+               is_nonortho = .TRUE.
+               IF (iter_unit > 0) THEN
+                  WRITE (iter_unit, '(T2,A,I6,A)') 'TDDFPT_RESTART| Step ', iter, ' correction rejected'
+               END IF
+            END IF
          ELSE
             ! convergence or the maximum number of Krylov vectors have been achieved
             nvects_new = 0
@@ -1026,6 +1132,10 @@ CONTAINS
          END DO
       END DO
       DEALLOCATE (Aop_ritz)
+      DO ispin = 1, nspins
+         CALL fm_pool_give_back_fm(work_matrices%fm_pool_ao_mo_active(ispin)%pool, residual_work(ispin))
+      END DO
+      DEALLOCATE (residual_work)
 
       CALL timestop(handle)
 
