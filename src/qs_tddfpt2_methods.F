@@ -108,7 +108,6 @@ MODULE qs_tddfpt2_methods
    USE qs_tddfpt2_densities,            ONLY: tddfpt_construct_aux_fit_density,&
                                               tddfpt_construct_ground_state_orb_density
    USE qs_tddfpt2_eigensolver,          ONLY: tddfpt_davidson_solver,&
-                                              tddfpt_orthogonalize_psi1_psi0,&
                                               tddfpt_orthonormalize_psi1_psi1
    USE qs_tddfpt2_forces,               ONLY: tddfpt_forces_main
    USE qs_tddfpt2_fprint,               ONLY: tddfpt_print_forces
@@ -1547,9 +1546,8 @@ CONTAINS
       CALL cp_print_key_finished_output(log_unit, logger, &
                                         tddfpt_print_section, "GUESS_VECTORS")
 
-      CALL tddfpt_orthogonalize_psi1_psi0(evects, work_matrices%S_C0_C0T, qs_env, &
-                                          gs_mos, evals, tddfpt_control, work_matrices%S_C0)
-      CALL tddfpt_orthonormalize_psi1_psi1(evects, nstates, S_evects, matrix_s(1)%matrix)
+      CALL tddfpt_orthonormalize_psi1_psi1(evects, nstates, S_evects, matrix_s(1)%matrix, &
+                                           qs_env, gs_mos, evals, tddfpt_control, work_matrices)
 
       niters = tddfpt_control%niters
       IF (niters > 0) THEN
