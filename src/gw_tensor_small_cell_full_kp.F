@@ -19,6 +19,8 @@ MODULE gw_tensor_small_cell_full_kp
                                               cp_cfm_release,&
                                               cp_cfm_to_cfm,&
                                               cp_cfm_type
+   USE cp_fm_redistribution,            ONLY: cp_fm_to_replicated_array,&
+                                              cp_replicated_array_to_fm
    USE cp_fm_types,                     ONLY: cp_fm_set_all,&
                                               cp_fm_type
    USE dbt_api,                         ONLY: dbt_clear,&
@@ -32,9 +34,7 @@ MODULE gw_tensor_small_cell_full_kp
                                               de_init_bs_env,&
                                               get_V_tr_R,&
                                               is_cell_in_index_to_cell
-   USE gw_utils_communication,          ONLY: fm_to_local_array,&
-                                              fm_to_local_tensor,&
-                                              local_array_to_fm,&
+   USE gw_utils_communication,          ONLY: fm_to_local_tensor,&
                                               local_dbt_to_global_fm
    USE gw_utils_fm,                     ONLY: cfm_contract_ABA,&
                                               local_add_on_diag,&
@@ -608,7 +608,7 @@ CONTAINS
          DO i_t = 1, bs_env%num_time_freq_points
             weight_ij = bs_env%time_frequency_grid%cosine_time_to_frequency(j_w, i_t)
 
-            CALL fm_to_local_array(bs_env%fm_chi_R_t(:, i_t), chi_R, weight_ij, add=.TRUE.)
+            CALL cp_fm_to_replicated_array(bs_env%fm_chi_R_t(:, i_t), chi_R, weight_ij, add=.TRUE.)
          END DO
 
          ikp_local = 0
@@ -662,7 +662,7 @@ CONTAINS
          ! 7. Ŵ^R(iω) -> Ŵ^R(iτ) and to fully distributed fm matrix bs_env%fm_MWM_R_t
          DO i_t = 1, bs_env%num_time_freq_points
             weight_ij = bs_env%time_frequency_grid%cosine_frequency_to_time(i_t, j_w)
-            CALL local_array_to_fm(MWM_R, bs_env%fm_MWM_R_t(:, i_t), weight_ij, add=.TRUE.)
+            CALL cp_replicated_array_to_fm(MWM_R, bs_env%fm_MWM_R_t(:, i_t), weight_ij, add=.TRUE.)
          END DO ! i_t
 
       END DO ! j_w
@@ -1043,7 +1043,7 @@ CONTAINS
       CALL bs_env%para_env%sum(Mi_Vtr_Mi_R_arr)
 
       ! use bs_env%fm_chi_R_t for temporary storage
-      CALL local_array_to_fm(Mi_Vtr_Mi_R_arr, bs_env%fm_chi_R_t(:, 1))
+      CALL cp_replicated_array_to_fm(Mi_Vtr_Mi_R_arr, bs_env%fm_chi_R_t(:, 1))
 
       ! communicate Mi_Vtr_Mi_R to tensor format; full replication in tensor group
       DO i_cell_R = 1, nimages_scf
