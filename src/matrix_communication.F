@@ -10,109 +10,109 @@
 ! **************************************************************************************************
 MODULE matrix_communication
    USE kinds,                           ONLY: dp
-   USE message_passing,                 ONLY: mp_para_env_type,&
-                                              mp_request_type,&
-                                              mp_waitall
+   USE message_passing,                 ONLY: mp_para_env_type
 #include "./base/base_uses.f90"
 
    IMPLICIT NONE
    PRIVATE
    CHARACTER(len=*), PARAMETER, PRIVATE :: moduleN = 'matrix_communication'
-   PUBLIC :: matrix_buffer_type, exchange_matrix_buffers
+   PUBLIC :: matrix_buffer_type, allocate_matrix_buffers, exchange_matrix_buffers
 
    TYPE matrix_buffer_type
       REAL(KIND=dp), DIMENSION(:), ALLOCATABLE           :: msg
-      INTEGER, DIMENSION(:), ALLOCATABLE                 :: sizes
+      ! Metadata records are columns, contiguous within each rank's segment.
       INTEGER, DIMENSION(:, :), ALLOCATABLE              :: indx
-      INTEGER                                            :: proc = -1
-      TYPE(mp_request_type)                              :: msg_req = mp_request_type()
+      ! Zero-based segment offsets, including the final total at index nprocs.
+      INTEGER, DIMENSION(:), ALLOCATABLE                 :: msg_offset, indx_offset
    END TYPE matrix_buffer_type
 
 CONTAINS
 
 ! **************************************************************************************************
-!> \brief Synchronously exchange per-rank buffers.
+!> \brief Allocate flat, rank-grouped matrix buffers and their zero-based offsets.
+!> \param send_count numerical payload length sent to each rank
+!> \param recv_count numerical payload length received from each rank
+!> \param n_index number of integer coordinates per metadata record
+!> \param buffer_send output send buffer
+!> \param buffer_rec output receive buffer
+!> \param send_blocks optional metadata-record counts, distinct from payload counts
+!> \param recv_blocks optional received metadata-record counts
+! **************************************************************************************************
+   SUBROUTINE allocate_matrix_buffers(send_count, recv_count, n_index, buffer_send, buffer_rec, &
+                                      send_blocks, recv_blocks)
+      INTEGER, DIMENSION(0:), INTENT(IN)                 :: send_count, recv_count
+      INTEGER, INTENT(IN)                                :: n_index
+      TYPE(matrix_buffer_type), INTENT(OUT)              :: buffer_send, buffer_rec
+      INTEGER, DIMENSION(0:), INTENT(IN), OPTIONAL       :: send_blocks, recv_blocks
+
+      INTEGER                                            :: nprocs, peer
+
+      CPASSERT(PRESENT(send_blocks) .EQV. PRESENT(recv_blocks))
+      nprocs = SIZE(send_count)
+      ALLOCATE (buffer_send%msg_offset(0:nprocs), buffer_rec%msg_offset(0:nprocs), &
+                buffer_send%indx_offset(0:nprocs), buffer_rec%indx_offset(0:nprocs))
+      buffer_send%msg_offset(0) = 0
+      buffer_rec%msg_offset(0) = 0
+      buffer_send%indx_offset(0) = 0
+      buffer_rec%indx_offset(0) = 0
+      DO peer = 0, nprocs - 1
+         buffer_send%msg_offset(peer + 1) = buffer_send%msg_offset(peer) + send_count(peer)
+         buffer_rec%msg_offset(peer + 1) = buffer_rec%msg_offset(peer) + recv_count(peer)
+         buffer_send%indx_offset(peer + 1) = buffer_send%indx_offset(peer) + send_count(peer)
+         buffer_rec%indx_offset(peer + 1) = buffer_rec%indx_offset(peer) + recv_count(peer)
+         IF (PRESENT(send_blocks)) THEN
+            buffer_send%indx_offset(peer + 1) = buffer_send%indx_offset(peer) + send_blocks(peer)
+            buffer_rec%indx_offset(peer + 1) = buffer_rec%indx_offset(peer) + recv_blocks(peer)
+         END IF
+      END DO
+      ALLOCATE (buffer_send%msg(buffer_send%msg_offset(nprocs)), &
+                buffer_rec%msg(buffer_rec%msg_offset(nprocs)), &
+                buffer_send%indx(n_index, buffer_send%indx_offset(nprocs)), &
+                buffer_rec%indx(n_index, buffer_rec%indx_offset(nprocs)))
+   END SUBROUTINE allocate_matrix_buffers
+
+! **************************************************************************************************
+!> \brief Synchronously exchange flat matrix buffers using variable-count all-to-all.
 !> \param para_env communicator covering all sending and receiving ranks
-!> \param num_entries_rec payload lengths received from each rank, indexed from zero
-!> \param num_entries_send payload lengths sent to each rank, indexed from zero
-!> \param buffer_rec preallocated receive buffers
-!> \param buffer_send populated send buffers
+!> \param num_entries_rec numerical payload lengths received from each rank
+!> \param num_entries_send numerical payload lengths sent to each rank
+!> \param buffer_rec preallocated receive buffer
+!> \param buffer_send populated send buffer
 !> \param do_indx whether to exchange integer metadata (default: true)
 !> \param do_msg whether to exchange numerical payloads (default: true)
 ! **************************************************************************************************
    SUBROUTINE exchange_matrix_buffers(para_env, num_entries_rec, num_entries_send, buffer_rec, buffer_send, &
                                       do_indx, do_msg)
-
       TYPE(mp_para_env_type), INTENT(IN)                 :: para_env
-      INTEGER, ALLOCATABLE, DIMENSION(:), INTENT(IN)     :: num_entries_rec, num_entries_send
-      TYPE(matrix_buffer_type), ALLOCATABLE, &
-         DIMENSION(:), INTENT(INOUT)                     :: buffer_rec, buffer_send
+      INTEGER, DIMENSION(0:), INTENT(IN)                 :: num_entries_rec, num_entries_send
+      TYPE(matrix_buffer_type), INTENT(INOUT)            :: buffer_rec, buffer_send
       LOGICAL, INTENT(IN), OPTIONAL                      :: do_indx, do_msg
 
       CHARACTER(LEN=*), PARAMETER :: routineN = 'exchange_matrix_buffers'
 
-      INTEGER                                            :: handle, imepos, rec_counter, send_counter
+      INTEGER                                            :: handle, n_index, nprocs
       LOGICAL                                            :: my_do_indx, my_do_msg
-      TYPE(mp_request_type), ALLOCATABLE, &
-         DIMENSION(:, :)                                 :: req_array
 
       CALL timeset(routineN, handle)
-
-      ALLOCATE (req_array(para_env%num_pe, 4))
-
+      nprocs = para_env%num_pe
       my_do_indx = .TRUE.
       IF (PRESENT(do_indx)) my_do_indx = do_indx
       my_do_msg = .TRUE.
       IF (PRESENT(do_msg)) my_do_msg = do_msg
 
-      IF (para_env%num_pe > 1) THEN
-
-         send_counter = 0
-         rec_counter = 0
-
-         DO imepos = 0, para_env%num_pe - 1
-            IF (num_entries_rec(imepos) > 0) THEN
-               rec_counter = rec_counter + 1
-               IF (my_do_indx) THEN
-                  CALL para_env%irecv(buffer_rec(imepos)%indx, imepos, req_array(rec_counter, 3), tag=4)
-               END IF
-               IF (my_do_msg) THEN
-                  CALL para_env%irecv(buffer_rec(imepos)%msg, imepos, req_array(rec_counter, 4), tag=7)
-               END IF
-            END IF
-         END DO
-
-         DO imepos = 0, para_env%num_pe - 1
-            IF (num_entries_send(imepos) > 0) THEN
-               send_counter = send_counter + 1
-               IF (my_do_indx) THEN
-                  CALL para_env%isend(buffer_send(imepos)%indx, imepos, req_array(send_counter, 1), tag=4)
-               END IF
-               IF (my_do_msg) THEN
-                  CALL para_env%isend(buffer_send(imepos)%msg, imepos, req_array(send_counter, 2), tag=7)
-               END IF
-            END IF
-         END DO
-
-         IF (my_do_indx) THEN
-            CALL mp_waitall(req_array(1:send_counter, 1))
-            CALL mp_waitall(req_array(1:rec_counter, 3))
-         END IF
-
-         IF (my_do_msg) THEN
-            CALL mp_waitall(req_array(1:send_counter, 2))
-            CALL mp_waitall(req_array(1:rec_counter, 4))
-         END IF
-
-      ELSE
-
-         IF (my_do_indx) buffer_rec(0)%indx(:, :) = buffer_send(0)%indx
-         IF (my_do_msg) buffer_rec(0)%msg(:) = buffer_send(0)%msg
-
+      IF (my_do_indx) THEN
+         n_index = SIZE(buffer_send%indx, 1)
+         CALL para_env%alltoall(buffer_send%indx, &
+                                n_index*(buffer_send%indx_offset(1:) - buffer_send%indx_offset(:nprocs - 1)), &
+                                n_index*buffer_send%indx_offset(:nprocs - 1), buffer_rec%indx, &
+                                n_index*(buffer_rec%indx_offset(1:) - buffer_rec%indx_offset(:nprocs - 1)), &
+                                n_index*buffer_rec%indx_offset(:nprocs - 1))
       END IF
-
+      IF (my_do_msg) THEN
+         CALL para_env%alltoall(buffer_send%msg, num_entries_send, buffer_send%msg_offset(:nprocs - 1), &
+                                buffer_rec%msg, num_entries_rec, buffer_rec%msg_offset(:nprocs - 1))
+      END IF
       CALL timestop(handle)
-
    END SUBROUTINE exchange_matrix_buffers
 
 END MODULE matrix_communication
