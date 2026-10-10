@@ -12,6 +12,7 @@ MODULE cp_fm_redistribution
    USE cp_fm_struct,                    ONLY: cp_fm_struct_type
    USE cp_fm_types,                     ONLY: cp_fm_create,&
                                               cp_fm_get_info,&
+                                              cp_fm_release,&
                                               cp_fm_type
    USE kinds,                           ONLY: dp
    USE matrix_communication,            ONLY: exchange_matrix_buffers,&
@@ -23,7 +24,7 @@ MODULE cp_fm_redistribution
    PRIVATE
    CHARACTER(len=*), PARAMETER, PRIVATE :: moduleN = 'cp_fm_redistribution'
    PUBLIC :: cp_array_to_fm, &
-             prepare_subgroup_redistribution, &
+             cp_fm_to_array, &
              cp_fm_permute
 
 CONTAINS
@@ -220,48 +221,83 @@ CONTAINS
    END SUBROUTINE cp_array_to_fm
 
 ! **************************************************************************************************
-!> \brief prepare array for redistribution
-!> \param para_env ...
-!> \param para_env_sub ...
-!> \param ngroup ...
-!> \param group_grid_2_mepos ...
-!> \param mepos_2_grid_group ...
-!> \param pos_info ...
+!> \brief Extract distributed rectangular array tiles from a full matrix.
+!> \param mat2D output tile, allocated here
+!> \param my_start_row first global row requested by this rank
+!> \param my_end_row last global row requested by this rank
+!> \param my_start_col first global column requested by this rank
+!> \param my_end_col last global column requested by this rank
+!> \param fm_mat source, released on return
 ! **************************************************************************************************
-   SUBROUTINE prepare_subgroup_redistribution(para_env, para_env_sub, ngroup, &
-                                              group_grid_2_mepos, mepos_2_grid_group, &
-                                              pos_info)
-      TYPE(mp_para_env_type), INTENT(IN)                 :: para_env, para_env_sub
-      INTEGER, INTENT(IN)                                :: ngroup
-      INTEGER, ALLOCATABLE, DIMENSION(:, :), INTENT(OUT) :: group_grid_2_mepos, mepos_2_grid_group
-      INTEGER, ALLOCATABLE, DIMENSION(:), INTENT(OUT), &
-         OPTIONAL                                        :: pos_info
+   SUBROUTINE cp_fm_to_array(mat2D, my_start_row, my_end_row, my_start_col, my_end_col, fm_mat)
+      REAL(KIND=dp), ALLOCATABLE, DIMENSION(:, :), &
+         INTENT(OUT)                                     :: mat2D
+      INTEGER, INTENT(IN)                                :: my_start_row, my_end_row, my_start_col, &
+                                                            my_end_col
+      TYPE(cp_fm_type), INTENT(INOUT)                    :: fm_mat
 
-      INTEGER                                            :: i, pos_group, pos_sub
-      INTEGER, ALLOCATABLE, DIMENSION(:)                 :: my_pos_info
+      CHARACTER(LEN=*), PARAMETER                        :: routineN = 'cp_fm_to_array'
 
-      ALLOCATE (my_pos_info(0:para_env%num_pe - 1))
-      CALL para_env%allgather(para_env_sub%mepos, my_pos_info)
+      INTEGER                                            :: handle, i, ientry, ii, j, jj, nc, ncols, &
+                                                            nr, nrows, peer
+      INTEGER, ALLOCATABLE                               :: bounds(:, :), local_cols(:), &
+                                                            local_rows(:), recv_count(:), &
+                                                            send_count(:)
+      INTEGER, POINTER                                   :: col_indices(:), row_indices(:)
+      TYPE(matrix_buffer_type), ALLOCATABLE              :: buffer_rec(:), buffer_send(:)
+      TYPE(mp_para_env_type), POINTER                    :: para_env
 
-      ALLOCATE (group_grid_2_mepos(0:para_env_sub%num_pe - 1, 0:ngroup - 1))
-      group_grid_2_mepos = 0
-      ALLOCATE (mepos_2_grid_group(2, 0:para_env%num_pe - 1))
-      mepos_2_grid_group = 0
+      CALL timeset(routineN, handle)
+      CALL cp_fm_get_info(fm_mat, nrow_local=nrows, ncol_local=ncols, row_indices=row_indices, &
+                          col_indices=col_indices, para_env=para_env)
+      ALLOCATE (mat2D(my_end_row - my_start_row + 1, my_end_col - my_start_col + 1))
+      mat2D = 0.0_dp
+      ALLOCATE (bounds(4, 0:para_env%num_pe - 1), send_count(0:para_env%num_pe - 1), &
+                recv_count(0:para_env%num_pe - 1))
+      CALL para_env%allgather([my_start_row, my_end_row, my_start_col, my_end_col], bounds)
 
-      DO i = 0, para_env%num_pe - 1
-         ! calculate position of the group
-         pos_group = i/para_env_sub%num_pe
-         ! calculate position in the subgroup
-         pos_sub = my_pos_info(i)
-         ! fill the map from the grid of groups to process
-         group_grid_2_mepos(pos_sub, pos_group) = i
-         ! and the opposite, from the global pos to the grid pos
-         mepos_2_grid_group(1, i) = pos_sub
-         mepos_2_grid_group(2, i) = pos_group
+      ! Intersect each requested rectangle with the local FM row/column lists.
+      ! Only the matching Cartesian products are packed; no per-element rank search.
+      DO peer = 0, para_env%num_pe - 1
+         nr = COUNT(row_indices(:nrows) >= bounds(1, peer) .AND. row_indices(:nrows) <= bounds(2, peer))
+         nc = COUNT(col_indices(:ncols) >= bounds(3, peer) .AND. col_indices(:ncols) <= bounds(4, peer))
+         send_count(peer) = nr*nc
       END DO
-
-      IF (PRESENT(pos_info)) CALL move_alloc(my_pos_info, pos_info)
-
-   END SUBROUTINE prepare_subgroup_redistribution
+      CALL para_env%alltoall(send_count, recv_count, 1)
+      ALLOCATE (buffer_send(0:para_env%num_pe - 1), buffer_rec(0:para_env%num_pe - 1))
+      DO peer = 0, para_env%num_pe - 1
+         ALLOCATE (buffer_send(peer)%msg(send_count(peer)), buffer_send(peer)%indx(send_count(peer), 2), &
+                   buffer_rec(peer)%msg(recv_count(peer)), buffer_rec(peer)%indx(recv_count(peer), 2))
+         IF (send_count(peer) == 0) CYCLE
+         nr = COUNT(row_indices(:nrows) >= bounds(1, peer) .AND. row_indices(:nrows) <= bounds(2, peer))
+         nc = COUNT(col_indices(:ncols) >= bounds(3, peer) .AND. col_indices(:ncols) <= bounds(4, peer))
+         ALLOCATE (local_rows(nr), local_cols(nc))
+         local_rows(:) = PACK([(i, i=1, nrows)], &
+                              row_indices(:nrows) >= bounds(1, peer) .AND. row_indices(:nrows) <= bounds(2, peer))
+         local_cols(:) = PACK([(j, j=1, ncols)], &
+                              col_indices(:ncols) >= bounds(3, peer) .AND. col_indices(:ncols) <= bounds(4, peer))
+         ientry = 0
+         DO jj = 1, nc
+            j = local_cols(jj)
+            DO ii = 1, nr
+               i = local_rows(ii)
+               ientry = ientry + 1
+               buffer_send(peer)%indx(ientry, :) = [row_indices(i), col_indices(j)]
+               buffer_send(peer)%msg(ientry) = fm_mat%local_data(i, j)
+            END DO
+         END DO
+         DEALLOCATE (local_rows, local_cols)
+      END DO
+      CALL exchange_matrix_buffers(para_env, recv_count, send_count, buffer_rec, buffer_send)
+      DO peer = 0, para_env%num_pe - 1
+         DO ientry = 1, recv_count(peer)
+            i = buffer_rec(peer)%indx(ientry, 1) - my_start_row + 1
+            j = buffer_rec(peer)%indx(ientry, 2) - my_start_col + 1
+            mat2D(i, j) = buffer_rec(peer)%msg(ientry)
+         END DO
+      END DO
+      CALL cp_fm_release(fm_mat)
+      CALL timestop(handle)
+   END SUBROUTINE cp_fm_to_array
 
 END MODULE cp_fm_redistribution
