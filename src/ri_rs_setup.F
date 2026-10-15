@@ -34,7 +34,6 @@ MODULE ri_rs_setup
    USE gw_auto_ri_types,                ONLY: auto_ri_type
    USE ri_rs_fitting,     ONLY: solve_ri_rs_fit,&
                                               store_Z_lP_columns
-   USE ri_rs_utils,                  ONLY: evaluate_ao_on_points
    USE gw_utils_compute_integrals,      ONLY: build_3c_integral_block_ctx,&
                                               gw_3c_ctx_create,&
                                               gw_3c_ctx_release,&
@@ -56,6 +55,7 @@ MODULE ri_rs_setup
    USE qs_environment_types,            ONLY: get_qs_env,&
                                               qs_environment_type
    USE qs_kind_types,                   ONLY: qs_kind_type
+   USE ri_rs_utils,                     ONLY: evaluate_ao_on_points
    USE util,                            ONLY: sort
 #include "./base/base_uses.f90"
 
