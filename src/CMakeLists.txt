@@ -231,6 +231,7 @@ list(
   group_dist_types.F
   grrm_utils.F
   gapw_1c_basis_set.F
+  mbpt_screening.F
   gw_auto_ri_generate_RI_basis.F
   gw_auto_ri_types.F
   gw_utils_dbcsr.F

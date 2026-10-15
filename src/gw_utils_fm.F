@@ -11,26 +11,30 @@
 !>      09.2026 created Jan Wilhelm
 ! **************************************************************************************************
 MODULE gw_utils_fm
-   USE cp_cfm_types,                    ONLY: cp_cfm_create,&
-                                              cp_cfm_get_info,&
-                                              cp_cfm_release,&
-                                              cp_cfm_type
-   USE cp_fm_basic_linalg,              ONLY: cp_fm_uplo_to_full
-   USE cp_fm_cholesky,                  ONLY: cp_fm_cholesky_decompose,&
-                                              cp_fm_cholesky_invert
-   USE cp_fm_diag,                      ONLY: cp_fm_power
-   USE cp_fm_struct,                    ONLY: cp_fm_struct_equivalent
-   USE cp_fm_types,                     ONLY: cp_fm_create,&
-                                              cp_fm_get_info,&
-                                              cp_fm_release,&
-                                              cp_fm_to_fm,&
-                                              cp_fm_type
-   USE kinds,                           ONLY: dp
-   USE mathconstants,                   ONLY: z_one,&
-                                              z_zero
-   USE mathlib,                         ONLY: diag_complex,&
-                                              gemm_square
-   USE parallel_gemm_api,               ONLY: parallel_gemm
+   USE cp_cfm_basic_linalg, ONLY: cp_cfm_uplo_to_full
+   USE cp_cfm_cholesky, ONLY: cp_cfm_cholesky_decompose, cp_cfm_cholesky_invert
+   USE cp_cfm_diag, ONLY: cp_cfm_power
+   USE cp_cfm_types, ONLY: cp_cfm_create, &
+                           cp_cfm_get_info, &
+                           cp_cfm_release, &
+                           cp_cfm_to_cfm, &
+                           cp_cfm_type
+   USE cp_fm_basic_linalg, ONLY: cp_fm_uplo_to_full
+   USE cp_fm_cholesky, ONLY: cp_fm_cholesky_decompose, &
+                             cp_fm_cholesky_invert
+   USE cp_fm_diag, ONLY: cp_fm_power
+   USE cp_fm_struct, ONLY: cp_fm_struct_equivalent
+   USE cp_fm_types, ONLY: cp_fm_create, &
+                          cp_fm_get_info, &
+                          cp_fm_release, &
+                          cp_fm_to_fm, &
+                          cp_fm_type
+   USE kinds, ONLY: dp
+   USE mathconstants, ONLY: z_one, &
+                            z_zero
+   USE mathlib, ONLY: diag_complex, &
+                      gemm_square
+   USE parallel_gemm_api, ONLY: parallel_gemm
 #include "./base/base_uses.f90"
 
    IMPLICIT NONE
@@ -38,7 +42,7 @@ MODULE gw_utils_fm
 
    CHARACTER(len=*), PARAMETER, PRIVATE :: moduleN = 'gw_utils_fm'
 
-   PUBLIC :: cfm_contract_ABA, fm_contract_ABA, fm_invert, fm_sqrt, &
+   PUBLIC :: cfm_contract_ABA, fm_contract_ABA, fm_invert, fm_sqrt, cfm_invert, cfm_sqrt, &
              local_add_on_diag, local_complex_power
 
    INTERFACE fm_contract_ABA
@@ -174,105 +178,129 @@ CONTAINS
 
    END SUBROUTINE local_complex_power
 
+   #:for matrix_kind, matrix_prefix in [('fm', 'cp_fm'), ('cfm', 'cp_cfm')]
 ! **************************************************************************************************
 !> \brief Inverts a symmetric matrix. First, Cholesky decomposition is tried.
 !>        If it fails, the matrix is diagonalized and inverted by taking
 !>        inverse eigenvalues.
 !> \param matrix_A input A; output inverse or filtered pseudoinverse
-!> \param eigenvalue_threshold optional relative eigenvalue threshold
+!> \param eigenvalue_threshold optional nonnegative eigenvalue cutoff
 !> \param unit_nr optional output unit for a failed Cholesky decomposition
+!> \param workspace optional same-layout scratch matrix; must not alias the input or output
 ! **************************************************************************************************
-   SUBROUTINE fm_invert(matrix_A, eigenvalue_threshold, unit_nr)
-      TYPE(cp_fm_type), INTENT(INOUT)                    :: matrix_A
-      REAL(KIND=dp), INTENT(IN), OPTIONAL                :: eigenvalue_threshold
-      INTEGER, INTENT(IN), OPTIONAL                      :: unit_nr
+      SUBROUTINE ${matrix_kind}$_invert(matrix_A, eigenvalue_threshold, unit_nr, workspace)
+         TYPE(${matrix_prefix}$_type), INTENT(INOUT)                    :: matrix_A
+         REAL(KIND=dp), INTENT(IN), OPTIONAL                :: eigenvalue_threshold
+         INTEGER, INTENT(IN), OPTIONAL                      :: unit_nr
+         TYPE(${matrix_prefix}$_type), INTENT(INOUT), OPTIONAL, TARGET :: workspace
 
-      INTEGER                                            :: info, n_dependent
-      LOGICAL                                            :: cholesky_successful
-      REAL(KIND=dp)                                      :: threshold
-      TYPE(cp_fm_type)                                   :: work
+         INTEGER                                            :: info, n_dependent
+         LOGICAL                                            :: cholesky_successful
+         REAL(KIND=dp)                                      :: threshold
+         TYPE(${matrix_prefix}$_type), POINTER :: work
+         TYPE(${matrix_prefix}$_type), TARGET :: local_work
 
-      threshold = 0.0_dp
-      IF (PRESENT(eigenvalue_threshold)) threshold = eigenvalue_threshold
-      CALL cp_fm_create(work, matrix_A%matrix_struct)
+         threshold = 0.0_dp
+         IF (PRESENT(eigenvalue_threshold)) threshold = eigenvalue_threshold
+         IF (PRESENT(workspace)) THEN
+            work => workspace
+            CPASSERT(cp_fm_struct_equivalent(matrix_A%matrix_struct, work%matrix_struct))
+            CPASSERT(.NOT. ASSOCIATED(work%local_data, matrix_A%local_data))
+         ELSE
+            CALL ${matrix_prefix}$_create(local_work, matrix_A%matrix_struct)
+            work => local_work
+         END IF
 
-      ! Preserve A because a failed Cholesky decomposition overwrites it.
-      CALL cp_fm_to_fm(matrix_A, work)
-      CALL cp_fm_cholesky_decompose(matrix_A, info_out=info)
-      cholesky_successful = info == 0
-      n_dependent = 0
-      IF (cholesky_successful) THEN
-         CALL cp_fm_cholesky_invert(matrix_A)
-         CALL cp_fm_uplo_to_full(matrix_A, work)
-      ELSE
-         CALL cp_fm_to_fm(work, matrix_A)
-         CALL cp_fm_power(matrix_A, work, -1.0_dp, threshold, n_dependent)
-         IF (PRESENT(unit_nr)) THEN
-            IF (unit_nr > 0) THEN
-               WRITE (unit_nr, '(T2,A)') &
-                  'Cholesky decomposition failed; matrix inverted by diagonalization.'
-               WRITE (unit_nr, '(T2,A,T72,I9)') 'Discarded eigenmodes:', n_dependent
+         ! Preserve A because a failed Cholesky decomposition overwrites it.
+         CALL ${matrix_prefix}$_to_${matrix_kind}$ (matrix_A, work)
+         CALL ${matrix_prefix}$_cholesky_decompose(matrix_A, info_out=info)
+         cholesky_successful = info == 0
+         n_dependent = 0
+         IF (cholesky_successful) THEN
+            CALL ${matrix_prefix}$_cholesky_invert(matrix_A)
+            CALL ${matrix_prefix}$_uplo_to_full(matrix_A, work)
+         ELSE
+            CALL ${matrix_prefix}$_to_${matrix_kind}$ (work, matrix_A)
+            CALL ${matrix_prefix}$_power(matrix_A, work, -1.0_dp, threshold, n_dependent)
+            IF (PRESENT(unit_nr)) THEN
+               IF (unit_nr > 0) THEN
+                  WRITE (unit_nr, '(T2,A)') &
+                     'Cholesky decomposition failed; matrix inverted by diagonalization.'
+                  WRITE (unit_nr, '(T2,A,T72,I9)') 'Discarded eigenmodes:', n_dependent
+               END IF
             END IF
          END IF
-      END IF
-      CALL cp_fm_release(work)
+         IF (.NOT. PRESENT(workspace)) CALL ${matrix_prefix}$_release(local_work)
 
-   END SUBROUTINE fm_invert
+      END SUBROUTINE ${matrix_kind}$_invert
 
 ! **************************************************************************************************
-!> \brief For input A, computes B such that B^T B=A.
+!> \brief For input A, computes B such that B^H B=A, with H denoting T for real matrices
+!>        and conjugate transpose for complex matrices.
 !>        First, Cholesky decomposition is tried. If it fails, B is computed
 !>        by diagonalizing A.
-!> \param matrix_A symmetric input matrix A, retained unchanged
+!> \param matrix_A real symmetric or complex Hermitian input matrix A, retained unchanged
 !> \param matrix_B output matrix B
-!> \param eigenvalue_threshold optional relative eigenvalue threshold
+!> \param eigenvalue_threshold optional nonnegative eigenvalue cutoff
 !> \param unit_nr optional output unit for a failed Cholesky decomposition
+!> \param workspace optional same-layout scratch matrix; must not alias the input or output
 ! **************************************************************************************************
-   SUBROUTINE fm_sqrt(matrix_A, matrix_B, eigenvalue_threshold, unit_nr)
-      TYPE(cp_fm_type), INTENT(IN)                       :: matrix_A
-      TYPE(cp_fm_type), INTENT(INOUT)                    :: matrix_B
-      REAL(KIND=dp), INTENT(IN), OPTIONAL                :: eigenvalue_threshold
-      INTEGER, INTENT(IN), OPTIONAL                      :: unit_nr
+      SUBROUTINE ${matrix_kind}$_sqrt(matrix_A, matrix_B, eigenvalue_threshold, unit_nr, workspace)
+         TYPE(${matrix_prefix}$_type), INTENT(IN)                       :: matrix_A
+         TYPE(${matrix_prefix}$_type), INTENT(INOUT)                    :: matrix_B
+         REAL(KIND=dp), INTENT(IN), OPTIONAL                :: eigenvalue_threshold
+         INTEGER, INTENT(IN), OPTIONAL                      :: unit_nr
+         TYPE(${matrix_prefix}$_type), INTENT(INOUT), OPTIONAL, TARGET :: workspace
 
-      INTEGER                                            :: i_row, info, j_col, n_dependent, &
-                                                            ncol_local, nrow_local
-      INTEGER, DIMENSION(:), POINTER                     :: col_indices, row_indices
-      LOGICAL                                            :: cholesky_successful
-      REAL(KIND=dp)                                      :: threshold
-      TYPE(cp_fm_type)                                   :: work
+         INTEGER                                            :: i_row, info, j_col, n_dependent, &
+                                                               ncol_local, nrow_local
+         INTEGER, DIMENSION(:), POINTER                     :: col_indices, row_indices
+         LOGICAL                                            :: cholesky_successful
+         REAL(KIND=dp)                                      :: threshold
+         TYPE(${matrix_prefix}$_type), POINTER :: work
+         TYPE(${matrix_prefix}$_type), TARGET :: local_work
 
-      threshold = 0.0_dp
-      IF (PRESENT(eigenvalue_threshold)) threshold = eigenvalue_threshold
-      CALL cp_fm_create(work, matrix_A%matrix_struct)
+         threshold = 0.0_dp
+         IF (PRESENT(eigenvalue_threshold)) threshold = eigenvalue_threshold
+         IF (PRESENT(workspace)) THEN
+            work => workspace
+            CPASSERT(cp_fm_struct_equivalent(matrix_A%matrix_struct, work%matrix_struct))
+            CPASSERT(.NOT. ASSOCIATED(work%local_data, matrix_A%local_data))
+            CPASSERT(.NOT. ASSOCIATED(work%local_data, matrix_B%local_data))
+         ELSE
+            CALL ${matrix_prefix}$_create(local_work, matrix_A%matrix_struct)
+            work => local_work
+         END IF
 
-      CALL cp_fm_to_fm(matrix_A, matrix_B)
-      CALL cp_fm_cholesky_decompose(matrix_B, info_out=info)
-      cholesky_successful = info == 0
-      IF (cholesky_successful) THEN
-         n_dependent = 0
-         CALL cp_fm_get_info(matrix=matrix_B, nrow_local=nrow_local, ncol_local=ncol_local, &
-                             row_indices=row_indices, col_indices=col_indices)
-         DO j_col = 1, ncol_local
-            DO i_row = 1, nrow_local
-               IF (row_indices(i_row) > col_indices(j_col)) THEN
-                  matrix_B%local_data(i_row, j_col) = 0.0_dp
-               END IF
+         CALL ${matrix_prefix}$_to_${matrix_kind}$ (matrix_A, matrix_B)
+         CALL ${matrix_prefix}$_cholesky_decompose(matrix_B, info_out=info)
+         cholesky_successful = info == 0
+         IF (cholesky_successful) THEN
+            n_dependent = 0
+            CALL ${matrix_prefix}$_get_info(matrix=matrix_B, nrow_local=nrow_local, ncol_local=ncol_local, &
+                                            row_indices=row_indices, col_indices=col_indices)
+            DO j_col = 1, ncol_local
+               DO i_row = 1, nrow_local
+                  IF (row_indices(i_row) > col_indices(j_col)) THEN
+                     matrix_B%local_data(i_row, j_col) = 0.0_dp
+                  END IF
+               END DO
             END DO
-         END DO
-      ELSE
-         CALL cp_fm_to_fm(matrix_A, matrix_B)
-         CALL cp_fm_power(matrix_B, work, 0.5_dp, threshold, n_dependent)
-         IF (PRESENT(unit_nr)) THEN
-            IF (unit_nr > 0) THEN
-               WRITE (unit_nr, '(T2,A)') &
-                  'Cholesky decomposition failed, using diagonalization.'
-               WRITE (unit_nr, '(T2,A,T72,I9)') 'Discarded eigenmodes:', n_dependent
+         ELSE
+            CALL ${matrix_prefix}$_to_${matrix_kind}$ (matrix_A, matrix_B)
+            CALL ${matrix_prefix}$_power(matrix_B, work, 0.5_dp, threshold, n_dependent)
+            IF (PRESENT(unit_nr)) THEN
+               IF (unit_nr > 0) THEN
+                  WRITE (unit_nr, '(T2,A)') &
+                     'Cholesky decomposition failed, using diagonalization.'
+                  WRITE (unit_nr, '(T2,A,T72,I9)') 'Discarded eigenmodes:', n_dependent
+               END IF
             END IF
          END IF
-      END IF
-      CALL cp_fm_release(work)
+         IF (.NOT. PRESENT(workspace)) CALL ${matrix_prefix}$_release(local_work)
 
-   END SUBROUTINE fm_sqrt
+      END SUBROUTINE ${matrix_kind}$_sqrt
+   #:endfor
 
 ! **************************************************************************************************
 !> \brief Computes A^T B A.
