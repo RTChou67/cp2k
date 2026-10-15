@@ -20,17 +20,15 @@
 !> \author Maximilian Graml (05.26)
 ! **************************************************************************************************
 MODULE rt_bse_ri_rs
-   USE cp_cfm_basic_linalg,             ONLY: cp_cfm_scale_and_add
-   USE cp_cfm_types,                    ONLY: cp_cfm_create,&
-                                              cp_cfm_release,&
-                                              cp_cfm_to_fm,&
+   USE cp_cfm_basic_linalg,             ONLY: cp_cfm_scale_and_add_fm
+   USE cp_cfm_types,                    ONLY: cp_cfm_to_fm,&
                                               cp_cfm_type,&
                                               cp_fm_to_cfm
    USE cp_dbcsr_api,                    ONLY: &
         dbcsr_add, dbcsr_copy, dbcsr_create, dbcsr_distribution_type, dbcsr_filter, &
         dbcsr_get_info, dbcsr_get_occupation, dbcsr_iterator_blocks_left, &
         dbcsr_iterator_next_block, dbcsr_iterator_start, dbcsr_iterator_stop, dbcsr_iterator_type, &
-        dbcsr_multiply, dbcsr_release, dbcsr_scale, dbcsr_set, dbcsr_type, dbcsr_type_no_symmetry
+        dbcsr_multiply, dbcsr_release, dbcsr_scale, dbcsr_type, dbcsr_type_no_symmetry
    USE cp_dbcsr_contrib,                ONLY: dbcsr_frobenius_norm,&
                                               dbcsr_get_diag
    USE cp_dbcsr_operations,             ONLY: copy_dbcsr_to_fm,&
@@ -38,18 +36,20 @@ MODULE rt_bse_ri_rs
    USE cp_fm_types,                     ONLY: cp_fm_create,&
                                               cp_fm_release,&
                                               cp_fm_type
-   USE gw_utils_dbcsr,                  ONLY: dbcsr_contract_ABA,&
-                                              hadamard_product_inplace
-   USE gw_utils_fm,                     ONLY: fm_contract_ABA
+   USE gw_utils_dbcsr,                  ONLY: dbcsr_contract_ABA
    USE kinds,                           ONLY: dp
    USE machine,                         ONLY: m_walltime
+   USE mathconstants,                   ONLY: gaussi,&
+                                              z_one
    USE message_passing,                 ONLY: mp_para_env_type
-   USE mp2_ri_2c,                       ONLY: RI_2c_integral_mat
    USE physcon,                         ONLY: angstrom
    USE post_scf_bandstructure_types,    ONLY: post_scf_bandstructure_type
    USE qs_environment_types,            ONLY: qs_environment_type
-   USE ri_rs_matrices,                  ONLY: release_dbcsr_topology_and_matrices,&
+   USE ri_rs_matrices,                  ONLY: build_ri_rs_bare_aux_interaction,&
+                                              contract_grid_panels,&
+                                              release_dbcsr_topology_and_matrices,&
                                               reserve_blocks_within_radius,&
+                                              resolve_grid_panels,&
                                               setup_square_topology
    USE ri_rs_setup,                     ONLY: ensure_ri_rs_representation
 #include "../base/base_uses.f90"
@@ -88,10 +88,7 @@ CONTAINS
       CHARACTER(LEN=*), PARAMETER :: routineN = 'rt_bse_ri_rs_ensure_V_grid'
 
       INTEGER                                            :: handle
-      INTEGER, DIMENSION(:), POINTER                     :: blk_aux, dist_row_aux
       REAL(KIND=dp)                                      :: t1
-      TYPE(cp_fm_type), ALLOCATABLE, DIMENSION(:, :)     :: fm_Vtr_Gamma
-      TYPE(dbcsr_distribution_type)                      :: dist_aux_aux
 
       CALL timeset(routineN, handle)
 
@@ -103,19 +100,9 @@ CONTAINS
       CALL ensure_ri_rs_representation(qs_env, bs_env)
       t1 = m_walltime()
 
-      CALL setup_square_topology(bs_env%ri_rs%mat_Z_lP, 'COL', dist_aux_aux, blk_aux, dist_row_aux)
-
-      CALL RI_2c_integral_mat(qs_env, fm_Vtr_Gamma, bs_env%fm_RI_RI%matrix_struct, bs_env%n_RI, &
-                              bs_env%trunc_coulomb)
-      ! Apply M^-1 sandwich to match the W^MIC convention; same scale as W^c when both used.
-      ! M^-1(k=0) V^tr M^-1(k=0) -> fm_Vtr_Gamma
-      CALL fm_contract_ABA(bs_env%fm_Minv_Gamma, fm_Vtr_Gamma(:, 1))
-
-      ! Store the M^-1-sandwiched RI-basis Coulomb; the grid kernel Z V Z^T is applied factorized.
-      CALL dbcsr_create(bs_env%ri_rs%mat_V_aux_rtbse, "V_aux_rtbse", dist_aux_aux, &
-                        dbcsr_type_no_symmetry, blk_aux, blk_aux)
-      CALL copy_fm_to_dbcsr(fm_Vtr_Gamma(1, 1), bs_env%ri_rs%mat_V_aux_rtbse, &
-                            keep_sparsity=.FALSE.)
+      CALL build_ri_rs_bare_aux_interaction(qs_env, bs_env%fm_Minv_Gamma, bs_env%trunc_coulomb, &
+                                            bs_env%auto_ri, bs_env%ri_rs%mat_Z_lP, &
+                                            bs_env%ri_rs%mat_V_aux_rtbse)
 
       bs_env%ri_rs%V_grid_built = .TRUE.
 
@@ -125,9 +112,6 @@ CONTAINS
             m_walltime() - t1, ' s'
          WRITE (bs_env%unit_nr, '(A)') ' '
       END IF
-
-      CALL release_dbcsr_topology_and_matrices(dist=dist_aux_aux, mapped_dist=dist_row_aux)
-      CALL cp_fm_release(fm_Vtr_Gamma)
 
       CALL timestop(handle)
 
@@ -156,9 +140,8 @@ CONTAINS
                                                             dist_row_aux
       LOGICAL                                            :: use_cutoff_w0
       REAL(KIND=dp)                                      :: fnorm_w0, occ_w0, t1
-      TYPE(cp_fm_type), ALLOCATABLE, DIMENSION(:, :)     :: fm_Vtr_Gamma
       TYPE(dbcsr_distribution_type)                      :: dist_aux_aux, dist_grid_grid
-      TYPE(dbcsr_type)                                   :: matrix_V_aux, matrix_W_aux
+      TYPE(dbcsr_type)                                   :: matrix_W_aux
 
       CALL timeset(routineN, handle)
 
@@ -176,26 +159,19 @@ CONTAINS
                        "'&RTBSE RTBSE', not '&RTBSE TDDFT'.")
       END IF
 
-      CALL ensure_ri_rs_representation(qs_env, bs_env)
+      CALL rt_bse_ri_rs_ensure_V_grid(bs_env, qs_env)
       t1 = m_walltime()
 
       CALL setup_square_topology(bs_env%ri_rs%mat_phi_mu_l, 'ROW', dist_grid_grid, blk_grid, &
                                  dist_col_grid)
       CALL setup_square_topology(bs_env%ri_rs%mat_Z_lP, 'COL', dist_aux_aux, blk_aux, dist_row_aux)
 
-      CALL RI_2c_integral_mat(qs_env, fm_Vtr_Gamma, bs_env%fm_RI_RI%matrix_struct, bs_env%n_RI, &
-                              bs_env%trunc_coulomb)
-      ! M^-1(k=0) V^tr M^-1(k=0) -> fm_Vtr_Gamma
-      CALL fm_contract_ABA(bs_env%fm_Minv_Gamma, fm_Vtr_Gamma(:, 1))
-
-      CALL dbcsr_create(matrix_V_aux, "V_aux_rtbse_W0", dist_aux_aux, dbcsr_type_no_symmetry, &
-                        blk_aux, blk_aux)
-      CALL copy_fm_to_dbcsr(fm_Vtr_Gamma(1, 1), matrix_V_aux, keep_sparsity=.FALSE.)
+      ! The bare RI interaction M^-1 V^tr M^-1 is already cached for the Hartree kernel.
 
       CALL dbcsr_create(matrix_W_aux, "W_aux_rtbse", dist_aux_aux, dbcsr_type_no_symmetry, &
                         blk_aux, blk_aux)
       CALL copy_fm_to_dbcsr(bs_env%fm_W_MIC_freq_zero, matrix_W_aux, keep_sparsity=.FALSE.)
-      CALL dbcsr_add(matrix_W_aux, matrix_V_aux, 1.0_dp, 1.0_dp)
+      CALL dbcsr_add(matrix_W_aux, bs_env%ri_rs%mat_V_aux_rtbse, 1.0_dp, 1.0_dp)
 
       CALL dbcsr_create(bs_env%ri_rs%mat_W0_grid_rtbse, "W0_grid_rtbse", dist_grid_grid, &
                         dbcsr_type_no_symmetry, blk_grid, blk_grid)
@@ -251,8 +227,7 @@ CONTAINS
 
       CALL release_dbcsr_topology_and_matrices(dist=dist_grid_grid, mapped_dist=dist_col_grid)
       CALL release_dbcsr_topology_and_matrices(dist=dist_aux_aux, mapped_dist=dist_row_aux, &
-                                               m1=matrix_V_aux, m2=matrix_W_aux)
-      CALL cp_fm_release(fm_Vtr_Gamma)
+                                               m1=matrix_W_aux)
 
       CALL timestop(handle)
 
@@ -282,12 +257,11 @@ CONTAINS
 
       CHARACTER(LEN=*), PARAMETER :: routineN = 'compute_sigma_ri_rs'
 
-      INTEGER                                            :: handle, n_grid
+      INTEGER                                            :: handle
+      INTEGER, ALLOCATABLE                               :: pan_first(:), pan_last(:)
       INTEGER, DIMENSION(:), POINTER                     :: blk_ao, dist_row_ao
-      REAL(KIND=dp), ALLOCATABLE                         :: diag_local(:)
       TYPE(dbcsr_distribution_type)                      :: dist_ao_ao
-      TYPE(dbcsr_type)                                   :: matrix_rho_AO, matrix_rho_grid, &
-                                                            matrix_Sigma_AO
+      TYPE(dbcsr_type)                                   :: matrix_rho_AO, matrix_Sigma_AO
 
       CALL timeset(routineN, handle)
 
@@ -305,50 +279,22 @@ CONTAINS
          CALL dbcsr_filter(matrix_rho_AO, bs_env%ri_rs%eps_filter_rho)
       END IF
 
-      ! ρ^grid_ll' = sum_µν φ_lµ Δρ_µν φ_l'ν   (the SEX-intrinsic grid×grid transient),
-      ! built directly into W^0's block pattern. Exact: the Hadamard below zeroes every block
-      ! without a W^0 partner anyway, so restricting the multiply drops only computed zeros.
-      ! No eps_filter on the SEX projections either -- a Δρ-dependent block drop breaks kernel
-      ! self-adjointness (L non-Hermitian); W^0's pattern is symmetric and Δρ-independent.
-      ! TODO: seeds the pattern by copying W0's values and discarding them every RK4 substep --
-      ! unquantified overhead, paid even when no cut is set. Cache the zeroed pattern instead.
-      CALL dbcsr_create(matrix_rho_grid, template=bs_env%ri_rs%mat_W0_grid_rtbse)
-      CALL dbcsr_copy(matrix_rho_grid, bs_env%ri_rs%mat_W0_grid_rtbse)
-      CALL dbcsr_set(matrix_rho_grid, 0.0_dp)
-      CALL dbcsr_contract_ABA("N", "T", bs_env%ri_rs%mat_phi_mu_l, matrix_rho_AO, &
-                              matrix_rho_grid, 0.0_dp, retain_sparsity=.TRUE.)
-
-      ! Harvest n_l = diag(ρ^grid) BEFORE the in-place Hadamard destroys it; the Hartree reuses it
-      ! (compute_hartree_ri_rs_from_diag) instead of rebuilding φρφ^T. Bare accumulate (caller
-      ! pre-zeroes): the cross-spin Hartree density is the spin SUM of these, and spin_degeneracy is
-      ! applied to the V_H OUTPUT (post-filter, bit-identical) -- never to the diagonal, which would
-      ! shift the stage-3 eps_filter cut (coarse-filter sensitivity).
-      IF (PRESENT(grid_diag_accum)) THEN
-         n_grid = SIZE(grid_diag_accum)
-         ALLOCATE (diag_local(n_grid))
-         diag_local = 0.0_dp
-         CALL dbcsr_get_diag(matrix_rho_grid, diag_local)
-         CALL bs_env%para_env%sum(diag_local)
-         grid_diag_accum(:) = grid_diag_accum(:) + diag_local(:)
-         DEALLOCATE (diag_local)
-      END IF
-
-      ! ρ^grid_ll' <- ρ^grid_ll' * W^0_ll'   (in place; blocks without a W^0 partner zeroed)
-      CALL hadamard_product_inplace(matrix_rho_grid, bs_env%ri_rs%mat_W0_grid_rtbse, &
-                                    1.0_dp)
-
-      ! Σ_µν = sum_ll' φ_lµ [ρ^grid ∘ W^0]_ll' φ_l'ν
+      ! Stream the density through the fixed W0 support; retain the unscaled grid diagonal
+      ! for the cross-spin Hartree before applying the SEX Hadamard kernel.
+      CALL resolve_grid_panels(bs_env%ri_rs, bs_env%para_env, bs_env%dbcsr_msg_elem_limit, &
+                               pan_first, pan_last, 0.0_dp)
       CALL dbcsr_create(matrix_Sigma_AO, template=matrix_rho_AO)
-      ! Unfiltered for self-adjointness (see the forward projection above; PERF note there).
-      CALL dbcsr_contract_ABA("T", "N", bs_env%ri_rs%mat_phi_mu_l, matrix_rho_grid, &
-                              matrix_Sigma_AO, 0.0_dp)
-
+      CALL contract_grid_panels(L_A=bs_env%ri_rs%mat_phi_mu_l, M_A=matrix_rho_AO, &
+                                L_out=bs_env%ri_rs%mat_phi_mu_l, mat_out=matrix_Sigma_AO, &
+                                scale=1.0_dp, eps=0.0_dp, para_env=bs_env%para_env, &
+                                pan_first=pan_first, pan_last=pan_last, lb_eq_la=.FALSE., &
+                                lout_eq_la=.TRUE., zero_out=.TRUE., B_grid=bs_env%ri_rs%mat_W0_grid_rtbse, &
+                                grid_diag_accum=grid_diag_accum)
       CALL dbcsr_scale(matrix_Sigma_AO, prefactor)
       CALL copy_dbcsr_to_fm(matrix_Sigma_AO, sigma_AO_fm)
 
       CALL release_dbcsr_topology_and_matrices(dist=dist_ao_ao, mapped_dist=dist_row_ao, &
                                                m1=matrix_rho_AO, m2=matrix_Sigma_AO)
-      CALL release_dbcsr_topology_and_matrices(m1=matrix_rho_grid)
 
       CALL timestop(handle)
 
@@ -378,32 +324,26 @@ CONTAINS
       CHARACTER(LEN=*), PARAMETER :: routineN = 'compute_sigma_ri_rs_complex'
 
       INTEGER                                            :: handle
-      TYPE(cp_cfm_type)                                  :: cfm_real_part
       TYPE(cp_fm_type)                                   :: fm_rho, fm_sigma
 
       CALL timeset(routineN, handle)
 
       CALL cp_fm_create(fm_rho, bs_env%fm_s_Gamma%matrix_struct)
       CALL cp_fm_create(fm_sigma, bs_env%fm_s_Gamma%matrix_struct)
-      CALL cp_cfm_create(cfm_real_part, bs_env%fm_s_Gamma%matrix_struct)
 
       ! Re/Im each harvest into their own accumulator; absent optionals propagate as absent.
       CALL cp_cfm_to_fm(msource=rho_AO_cfm, mtargetr=fm_rho)
       CALL compute_sigma_ri_rs(bs_env, fm_sigma, prefactor, fm_rho, &
                                grid_diag_accum=grid_diag_re_accum)
-      CALL cp_fm_to_cfm(msourcer=fm_sigma, mtarget=cfm_real_part)
-
+      ! Read both input components before writing the output.
       CALL cp_cfm_to_fm(msource=rho_AO_cfm, mtargeti=fm_rho)
+      CALL cp_fm_to_cfm(msourcer=fm_sigma, mtarget=sigma_AO_cfm)
       CALL compute_sigma_ri_rs(bs_env, fm_sigma, prefactor, fm_rho, &
                                grid_diag_accum=grid_diag_im_accum)
-      CALL cp_fm_to_cfm(msourcei=fm_sigma, mtarget=sigma_AO_cfm)
-
-      CALL cp_cfm_scale_and_add(CMPLX(1.0_dp, 0.0_dp, kind=dp), sigma_AO_cfm, &
-                                CMPLX(1.0_dp, 0.0_dp, kind=dp), cfm_real_part)
+      CALL cp_cfm_scale_and_add_fm(z_one, sigma_AO_cfm, gaussi, fm_sigma)
 
       CALL cp_fm_release(fm_rho)
       CALL cp_fm_release(fm_sigma)
-      CALL cp_cfm_release(cfm_real_part)
 
       CALL timestop(handle)
 
@@ -563,7 +503,6 @@ CONTAINS
       CHARACTER(LEN=*), PARAMETER :: routineN = 'compute_hartree_ri_rs_from_diag'
 
       INTEGER                                            :: handle
-      TYPE(cp_cfm_type)                                  :: cfm_real_part
       TYPE(cp_fm_type)                                   :: fm_v
 
       CALL timeset(routineN, handle)
@@ -571,16 +510,10 @@ CONTAINS
       CALL cp_fm_create(fm_v, bs_env%fm_s_Gamma%matrix_struct)
 
       CALL hartree_potential_from_diag_ri_rs(bs_env, n_re, fm_v)
+      CALL cp_fm_to_cfm(msourcer=fm_v, mtarget=V_H_AO_cfm)
       IF (PRESENT(n_im)) THEN
-         CALL cp_cfm_create(cfm_real_part, bs_env%fm_s_Gamma%matrix_struct)
-         CALL cp_fm_to_cfm(msourcer=fm_v, mtarget=cfm_real_part)
          CALL hartree_potential_from_diag_ri_rs(bs_env, n_im, fm_v)
-         CALL cp_fm_to_cfm(msourcei=fm_v, mtarget=V_H_AO_cfm)
-         CALL cp_cfm_scale_and_add(CMPLX(1.0_dp, 0.0_dp, kind=dp), V_H_AO_cfm, &
-                                   CMPLX(1.0_dp, 0.0_dp, kind=dp), cfm_real_part)
-         CALL cp_cfm_release(cfm_real_part)
-      ELSE
-         CALL cp_fm_to_cfm(msourcer=fm_v, mtarget=V_H_AO_cfm)
+         CALL cp_cfm_scale_and_add_fm(z_one, V_H_AO_cfm, gaussi, fm_v)
       END IF
 
       CALL cp_fm_release(fm_v)
@@ -606,29 +539,22 @@ CONTAINS
       CHARACTER(LEN=*), PARAMETER :: routineN = 'compute_hartree_ri_rs_complex'
 
       INTEGER                                            :: handle
-      TYPE(cp_cfm_type)                                  :: cfm_real_part
       TYPE(cp_fm_type)                                   :: fm_rho, fm_v
 
       CALL timeset(routineN, handle)
 
       CALL cp_fm_create(fm_rho, bs_env%fm_s_Gamma%matrix_struct)
       CALL cp_fm_create(fm_v, bs_env%fm_s_Gamma%matrix_struct)
-      CALL cp_cfm_create(cfm_real_part, bs_env%fm_s_Gamma%matrix_struct)
 
       CALL cp_cfm_to_fm(msource=rho_AO_cfm, mtargetr=fm_rho)
       CALL compute_hartree_ri_rs(bs_env, fm_rho, fm_v)
-      CALL cp_fm_to_cfm(msourcer=fm_v, mtarget=cfm_real_part)
-
       CALL cp_cfm_to_fm(msource=rho_AO_cfm, mtargeti=fm_rho)
+      CALL cp_fm_to_cfm(msourcer=fm_v, mtarget=V_H_AO_cfm)
       CALL compute_hartree_ri_rs(bs_env, fm_rho, fm_v)
-      CALL cp_fm_to_cfm(msourcei=fm_v, mtarget=V_H_AO_cfm)
-
-      CALL cp_cfm_scale_and_add(CMPLX(1.0_dp, 0.0_dp, kind=dp), V_H_AO_cfm, &
-                                CMPLX(1.0_dp, 0.0_dp, kind=dp), cfm_real_part)
+      CALL cp_cfm_scale_and_add_fm(z_one, V_H_AO_cfm, gaussi, fm_v)
 
       CALL cp_fm_release(fm_rho)
       CALL cp_fm_release(fm_v)
-      CALL cp_cfm_release(cfm_real_part)
 
       CALL timestop(handle)
 
