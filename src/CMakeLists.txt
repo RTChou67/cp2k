@@ -232,6 +232,7 @@ list(
   grrm_utils.F
   gapw_1c_basis_set.F
   gw_ri_rs_kernels.F
+  gw_screening.F
   mbpt_screening.F
   gw_auto_ri_generate_RI_basis.F
   gw_auto_ri_types.F

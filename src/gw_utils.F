@@ -32,8 +32,9 @@ MODULE gw_utils
                                               cp_cfm_type
    USE cp_control_types,                ONLY: dft_control_type
    USE cp_dbcsr_api,                    ONLY: &
-        dbcsr_create, dbcsr_distribution_release, dbcsr_distribution_type, dbcsr_p_type, &
-        dbcsr_release, dbcsr_set, dbcsr_type, dbcsr_type_no_symmetry, dbcsr_type_symmetric
+        dbcsr_add, dbcsr_create, dbcsr_distribution_release, dbcsr_distribution_type, &
+        dbcsr_p_type, dbcsr_release, dbcsr_set, dbcsr_type, dbcsr_type_no_symmetry, &
+        dbcsr_type_symmetric
    USE cp_dbcsr_operations,             ONLY: copy_dbcsr_to_fm,&
                                               copy_fm_to_dbcsr,&
                                               cp_dbcsr_dist2d_to_dist,&
@@ -46,16 +47,15 @@ MODULE gw_utils
    USE cp_fm_struct,                    ONLY: cp_fm_struct_create,&
                                               cp_fm_struct_release,&
                                               cp_fm_struct_type
-   USE cp_fm_types,                     ONLY: cp_fm_create,&
-                                              cp_fm_get_diag,&
-                                              cp_fm_get_info,&
-                                              cp_fm_release,&
-                                              cp_fm_set_all,&
-                                              cp_fm_to_fm,&
-                                              cp_fm_type
+   USE cp_fm_types,                     ONLY: &
+        cp_fm_create, cp_fm_get_diag, cp_fm_get_info, cp_fm_read_unformatted, cp_fm_release, &
+        cp_fm_set_all, cp_fm_to_fm, cp_fm_type, cp_fm_write_unformatted
    USE cp_log_handling,                 ONLY: cp_get_default_logger,&
                                               cp_logger_type
-   USE cp_output_handling,              ONLY: cp_print_key_generate_filename
+   USE cp_output_handling,              ONLY: cp_p_file,&
+                                              cp_print_key_generate_filename,&
+                                              cp_print_key_should_output,&
+                                              cp_print_key_unit_nr
    USE dbt_api,                         ONLY: &
         dbt_clear, dbt_create, dbt_destroy, dbt_filter, dbt_iterator_blocks_left, &
         dbt_iterator_next_block, dbt_iterator_start, dbt_iterator_stop, dbt_iterator_type, &
@@ -141,11 +141,247 @@ MODULE gw_utils
    PUBLIC :: create_and_init_bs_env_for_gw, de_init_bs_env, &
              compute_xkp, analyt_conti_and_print, &
              add_R, is_cell_in_index_to_cell, get_V_tr_R, &
-             rtbse_resolve_rirs_flag, G_occ_vir, fill_fm_Sigma_c_Gamma_time
+             rtbse_resolve_rirs_flag, G_occ_vir, fill_fm_Sigma_c_Gamma_time, &
+             fm_read, fm_write, compute_fm_chi_Gamma_freq, create_fm_W_MIC_time, &
+             Fourier_transform_w_to_t, sum_W_MIC_freq_zero
 
    CHARACTER(len=*), PARAMETER, PRIVATE :: moduleN = 'gw_utils'
 
 CONTAINS
+
+! **************************************************************************************************
+!> \brief ...
+!> \param fm ...
+!> \param bs_env ...
+!> \param mat_name ...
+!> \param idx ...
+! **************************************************************************************************
+   SUBROUTINE fm_read(fm, bs_env, mat_name, idx)
+      TYPE(cp_fm_type)                                   :: fm
+      TYPE(post_scf_bandstructure_type), POINTER         :: bs_env
+      CHARACTER(LEN=*)                                   :: mat_name
+      INTEGER                                            :: idx
+
+      CHARACTER(LEN=*), PARAMETER                        :: routineN = 'fm_read'
+
+      CHARACTER(LEN=default_path_length)                 :: f_chi
+      INTEGER                                            :: handle, unit_nr
+
+      CALL timeset(routineN, handle)
+
+      unit_nr = -1
+      IF (bs_env%para_env%is_source()) THEN
+
+         IF (idx < 10) THEN
+            WRITE (f_chi, '(3A,I1,A)') TRIM(bs_env%prefix), TRIM(mat_name), "_0", idx, ".matrix"
+         ELSE IF (idx < 100) THEN
+            WRITE (f_chi, '(3A,I2,A)') TRIM(bs_env%prefix), TRIM(mat_name), "_", idx, ".matrix"
+         ELSE
+            CPABORT('Please implement more than 99 time/frequency points.')
+         END IF
+
+         CALL open_file(file_name=TRIM(f_chi), file_action="READ", file_form="UNFORMATTED", &
+                        file_position="REWIND", file_status="OLD", unit_number=unit_nr)
+
+      END IF
+
+      CALL cp_fm_read_unformatted(fm, unit_nr)
+
+      IF (bs_env%para_env%is_source()) CALL close_file(unit_number=unit_nr)
+
+      CALL timestop(handle)
+
+   END SUBROUTINE fm_read
+
+! **************************************************************************************************
+!> \brief Write a GW restart matrix when requested by the print key.
+!> \param fm Matrix to write, or reusable conversion buffer when matrix is supplied.
+!> \param matrix_index ...
+!> \param matrix_name ...
+!> \param qs_env ...
+!> \param matrix Optional DBCSR source, converted to fm only when output is enabled.
+! **************************************************************************************************
+   SUBROUTINE fm_write(fm, matrix_index, matrix_name, qs_env, matrix)
+      TYPE(cp_fm_type)                                   :: fm
+      INTEGER                                            :: matrix_index
+      CHARACTER(LEN=*)                                   :: matrix_name
+      TYPE(qs_environment_type), POINTER                 :: qs_env
+      TYPE(dbcsr_type), INTENT(IN), OPTIONAL             :: matrix
+
+      CHARACTER(LEN=*), PARAMETER :: key = 'PROPERTIES%BANDSTRUCTURE%GW%PRINT%RESTART', &
+         routineN = 'fm_write'
+
+      CHARACTER(LEN=default_path_length)                 :: filename
+      INTEGER                                            :: handle, unit_nr
+      TYPE(cp_logger_type), POINTER                      :: logger
+      TYPE(section_vals_type), POINTER                   :: input
+
+      CALL timeset(routineN, handle)
+
+      CALL get_qs_env(qs_env, input=input)
+
+      logger => cp_get_default_logger()
+
+      IF (BTEST(cp_print_key_should_output(logger%iter_info, input, key), cp_p_file)) THEN
+
+         IF (PRESENT(matrix)) THEN
+            CALL cp_fm_set_all(fm, 0.0_dp)
+            CALL copy_dbcsr_to_fm(matrix, fm)
+         END IF
+
+         IF (matrix_index < 10) THEN
+            WRITE (filename, '(3A,I1)') "RESTART_", matrix_name, "_0", matrix_index
+         ELSE IF (matrix_index < 100) THEN
+            WRITE (filename, '(3A,I2)') "RESTART_", matrix_name, "_", matrix_index
+         ELSE
+            CPABORT('Please implement more than 99 time/frequency points.')
+         END IF
+
+         unit_nr = cp_print_key_unit_nr(logger, input, key, extension=".matrix", &
+                                        file_form="UNFORMATTED", middle_name=TRIM(filename), &
+                                        file_position="REWIND", file_action="WRITE")
+
+         CALL cp_fm_write_unformatted(fm, unit_nr)
+         IF (unit_nr > 0) THEN
+            CALL close_file(unit_nr)
+         END IF
+      END IF
+
+      CALL timestop(handle)
+
+   END SUBROUTINE fm_write
+
+! **************************************************************************************************
+!> \brief ...
+!> \param bs_env ...
+!> \param fm_chi_Gamma_freq ...
+!> \param j_w ...
+!> \param mat_chi_Gamma_tau ...
+! **************************************************************************************************
+   SUBROUTINE compute_fm_chi_Gamma_freq(bs_env, fm_chi_Gamma_freq, j_w, mat_chi_Gamma_tau)
+      TYPE(post_scf_bandstructure_type), POINTER         :: bs_env
+      TYPE(cp_fm_type)                                   :: fm_chi_Gamma_freq
+      INTEGER                                            :: j_w
+      TYPE(dbcsr_p_type), DIMENSION(:), POINTER          :: mat_chi_Gamma_tau
+
+      CHARACTER(LEN=*), PARAMETER :: routineN = 'compute_fm_chi_Gamma_freq'
+
+      INTEGER                                            :: handle, i_t
+      REAL(KIND=dp)                                      :: weight_ij
+
+      CALL timeset(routineN, handle)
+
+      CALL dbcsr_set(bs_env%mat_RI_RI%matrix, 0.0_dp)
+
+      DO i_t = 1, bs_env%num_time_freq_points
+
+         weight_ij = bs_env%time_frequency_grid%cosine_time_to_frequency(j_w, i_t)
+
+         ! Fourier transform
+         CALL dbcsr_add(bs_env%mat_RI_RI%matrix, mat_chi_Gamma_tau(i_t)%matrix, &
+                        1.0_dp, weight_ij)
+
+      END DO
+
+      CALL copy_dbcsr_to_fm(bs_env%mat_RI_RI%matrix, fm_chi_Gamma_freq)
+
+      CALL timestop(handle)
+
+   END SUBROUTINE compute_fm_chi_Gamma_freq
+
+! **************************************************************************************************
+!> \brief W^MIC_PQ(iω=0) = sum_j w_j W^MIC_PQ(iτ_j) with the time weights w_j of the grid at zero
+!>        frequency, into bs_env%fm_W_MIC_freq_zero
+!> \param bs_env time grid and its weights; receives fm_W_MIC_freq_zero
+!> \param fm_W_MIC_time W^MIC_PQ(iτ_j) for every time point j
+! **************************************************************************************************
+   SUBROUTINE sum_W_MIC_freq_zero(bs_env, fm_W_MIC_time)
+      TYPE(post_scf_bandstructure_type), POINTER         :: bs_env
+      TYPE(cp_fm_type), DIMENSION(:)                     :: fm_W_MIC_time
+
+      CHARACTER(LEN=*), PARAMETER :: routineN = 'sum_W_MIC_freq_zero'
+
+      INTEGER                                            :: handle, i_t
+      REAL(KIND=dp)                                      :: t_start
+
+      CALL timeset(routineN, handle)
+
+      t_start = m_walltime()
+      CALL cp_fm_create(bs_env%fm_W_MIC_freq_zero, bs_env%fm_W_MIC_freq%matrix_struct)
+      CALL cp_fm_set_all(bs_env%fm_W_MIC_freq_zero, 0.0_dp)
+      DO i_t = 1, bs_env%num_time_freq_points
+         CALL cp_fm_scale_and_add(1.0_dp, bs_env%fm_W_MIC_freq_zero, &
+                                  bs_env%time_frequency_grid%time_weights_at_zero_frequency(i_t), &
+                                  fm_W_MIC_time(i_t))
+      END DO
+      IF (bs_env%unit_nr > 0) THEN
+         WRITE (bs_env%unit_nr, '(T2,A,I11,A,I3,A,F10.1,A)') &
+            'Computed W(ω=0,k) for k-point batch', &
+            1, ' /', 1, &
+            ', Execution time', m_walltime() - t_start, ' s'
+      END IF
+
+      CALL timestop(handle)
+
+   END SUBROUTINE sum_W_MIC_freq_zero
+
+! **************************************************************************************************
+!> \brief ...
+!> \param bs_env ...
+!> \param fm_W_MIC_time ...
+! **************************************************************************************************
+   SUBROUTINE create_fm_W_MIC_time(bs_env, fm_W_MIC_time)
+      TYPE(post_scf_bandstructure_type), POINTER         :: bs_env
+      TYPE(cp_fm_type), ALLOCATABLE, DIMENSION(:)        :: fm_W_MIC_time
+
+      CHARACTER(LEN=*), PARAMETER :: routineN = 'create_fm_W_MIC_time'
+
+      INTEGER                                            :: handle, i_t
+
+      CALL timeset(routineN, handle)
+
+      ALLOCATE (fm_W_MIC_time(bs_env%num_time_freq_points))
+      DO i_t = 1, bs_env%num_time_freq_points
+         CALL cp_fm_create(fm_W_MIC_time(i_t), bs_env%fm_RI_RI%matrix_struct, set_zero=.TRUE.)
+      END DO
+
+      CALL timestop(handle)
+
+   END SUBROUTINE create_fm_W_MIC_time
+
+! **************************************************************************************************
+!> \brief ...
+!> \param bs_env ...
+!> \param fm_W_MIC_time ...
+!> \param fm_W_MIC_freq_j ...
+!> \param j_w ...
+! **************************************************************************************************
+   SUBROUTINE Fourier_transform_w_to_t(bs_env, fm_W_MIC_time, fm_W_MIC_freq_j, j_w)
+      TYPE(post_scf_bandstructure_type), POINTER         :: bs_env
+      TYPE(cp_fm_type), ALLOCATABLE, DIMENSION(:)        :: fm_W_MIC_time
+      TYPE(cp_fm_type)                                   :: fm_W_MIC_freq_j
+      INTEGER                                            :: j_w
+
+      CHARACTER(LEN=*), PARAMETER :: routineN = 'Fourier_transform_w_to_t'
+
+      INTEGER                                            :: handle, i_t
+      REAL(KIND=dp)                                      :: weight_ij
+
+      CALL timeset(routineN, handle)
+
+      DO i_t = 1, bs_env%num_time_freq_points
+
+         weight_ij = bs_env%time_frequency_grid%cosine_frequency_to_time(i_t, j_w)
+
+         ! actual Fourier transform
+         CALL cp_fm_scale_and_add(alpha=1.0_dp, matrix_a=fm_W_MIC_time(i_t), &
+                                  beta=weight_ij, matrix_b=fm_W_MIC_freq_j)
+
+      END DO
+
+      CALL timestop(handle)
+
+   END SUBROUTINE Fourier_transform_w_to_t
 
 ! **************************************************************************************************
 !> \brief Build the real Gamma occupied or virtual one-particle propagator.

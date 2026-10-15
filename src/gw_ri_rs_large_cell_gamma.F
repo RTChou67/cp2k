@@ -13,17 +13,17 @@
 MODULE gw_ri_rs_large_cell_Gamma
    USE cp_fm_types,                     ONLY: cp_fm_release,&
                                               cp_fm_type
-   USE ri_rs_setup,           ONLY: ensure_ri_rs_representation
    USE gw_ri_rs_kernels,                ONLY: compute_Sigma_c,&
                                               compute_Sigma_x,&
                                               get_mat_chi_Gamma_tau
+   USE gw_screening,                    ONLY: get_W_MIC
    USE gw_tensor_large_cell_Gamma,      ONLY: compute_QP_energies,&
-                                              delete_unnecessary_files,&
-                                              get_W_MIC
+                                              delete_unnecessary_files
    USE gw_utils,                        ONLY: de_init_bs_env
    USE kinds,                           ONLY: dp
    USE post_scf_bandstructure_types,    ONLY: post_scf_bandstructure_type
    USE qs_environment_types,            ONLY: qs_environment_type
+   USE ri_rs_setup,                     ONLY: ensure_ri_rs_representation
 #include "./base/base_uses.f90"
 
    IMPLICIT NONE
