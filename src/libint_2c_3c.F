@@ -377,17 +377,13 @@ CONTAINS
 
       INTEGER :: a_mysize(1), a_offset, a_start, b_offset, b_start, c_offset, c_start, i, i_deriv, &
          ipgf, j, jpgf, k, kpgf, li, lj, lk, ncoa, ncob, ncoc, op, p1, p2, p3
-      INTEGER, DIMENSION(3)                              :: permute_1, permute_2
       LOGICAL                                            :: do_ext
       REAL(dp)                                           :: dr_ab, dr_ac, dr_bc, zeti, zetj, zetk
+      REAL(dp), ALLOCATABLE, DIMENSION(:, :)             :: deriv_work
       REAL(dp), DIMENSION(3)                             :: der_abc_1_ext_prv, der_abc_2_ext_prv
-      REAL(dp), DIMENSION(:, :), POINTER                 :: p_deriv
       TYPE(eri_primitive_data_type)                      :: params
 
-      NULLIFY (p_deriv)
-
-      permute_1 = [4, 5, 6]
-      permute_2 = [7, 8, 9]
+      ALLOCATE (deriv_work(nco(la_max)*nco(lb_max)*nco(lc_max), 6))
 
       dr_ab = 0.0_dp
       dr_bc = 0.0_dp
@@ -452,7 +448,7 @@ CONTAINS
 
                         a_mysize(1) = ncoa*ncob*ncoc
 
-                        CALL cp_libint_get_3eri_derivs(li, lj, lk, lib, p_deriv, a_mysize)
+                        CALL cp_libint_get_3eri_derivs(li, lj, lk, lib, deriv_work, a_mysize)
 
                         IF (do_ext) THEN
                            DO i_deriv = 1, 3
@@ -464,14 +460,14 @@ CONTAINS
                                        p3 = p2 + i
 
                                        der_abc_1(a_offset + i, b_offset + j, c_offset + k, i_deriv) = &
-                                          p_deriv(p3, permute_2(i_deriv))
+                                          deriv_work(p3, i_deriv + 3)
                                        der_abc_1_ext_prv(i_deriv) = MAX(der_abc_1_ext_prv(i_deriv), &
-                                                                        ABS(p_deriv(p3, permute_2(i_deriv))))
+                                                                        ABS(deriv_work(p3, i_deriv + 3)))
 
                                        der_abc_2(a_offset + i, b_offset + j, c_offset + k, i_deriv) = &
-                                          p_deriv(p3, permute_1(i_deriv))
+                                          deriv_work(p3, i_deriv)
                                        der_abc_2_ext_prv(i_deriv) = MAX(der_abc_2_ext_prv(i_deriv), &
-                                                                        ABS(p_deriv(p3, permute_1(i_deriv))))
+                                                                        ABS(deriv_work(p3, i_deriv)))
 
                                     END DO
                                  END DO
@@ -487,17 +483,15 @@ CONTAINS
                                        p3 = p2 + i
 
                                        der_abc_1(a_offset + i, b_offset + j, c_offset + k, i_deriv) = &
-                                          p_deriv(p3, permute_2(i_deriv))
+                                          deriv_work(p3, i_deriv + 3)
 
                                        der_abc_2(a_offset + i, b_offset + j, c_offset + k, i_deriv) = &
-                                          p_deriv(p3, permute_1(i_deriv))
+                                          deriv_work(p3, i_deriv)
                                     END DO
                                  END DO
                               END DO
                            END DO
                         END IF
-
-                        DEALLOCATE (p_deriv)
                      END DO !lk
                   END DO !lj
                END DO !li
@@ -516,7 +510,7 @@ CONTAINS
                         ncoc = nco(lk)
 
                         a_mysize(1) = ncoa*ncob*ncoc
-                        CALL cp_libint_get_3eri_derivs(lj, li, lk, lib, p_deriv, a_mysize)
+                        CALL cp_libint_get_3eri_derivs(lj, li, lk, lib, deriv_work, a_mysize)
 
                         IF (do_ext) THEN
                            DO i_deriv = 1, 3
@@ -528,16 +522,16 @@ CONTAINS
                                        p3 = p2 + j
 
                                        der_abc_1(a_offset + i, b_offset + j, c_offset + k, i_deriv) = &
-                                          p_deriv(p3, permute_1(i_deriv))
+                                          deriv_work(p3, i_deriv)
 
                                        der_abc_1_ext_prv(i_deriv) = MAX(der_abc_1_ext_prv(i_deriv), &
-                                                                        ABS(p_deriv(p3, permute_1(i_deriv))))
+                                                                        ABS(deriv_work(p3, i_deriv)))
 
                                        der_abc_2(a_offset + i, b_offset + j, c_offset + k, i_deriv) = &
-                                          p_deriv(p3, permute_2(i_deriv))
+                                          deriv_work(p3, i_deriv + 3)
 
                                        der_abc_2_ext_prv(i_deriv) = MAX(der_abc_2_ext_prv(i_deriv), &
-                                                                        ABS(p_deriv(p3, permute_2(i_deriv))))
+                                                                        ABS(deriv_work(p3, i_deriv + 3)))
                                     END DO
                                  END DO
                               END DO
@@ -552,17 +546,15 @@ CONTAINS
                                        p3 = p2 + j
 
                                        der_abc_1(a_offset + i, b_offset + j, c_offset + k, i_deriv) = &
-                                          p_deriv(p3, permute_1(i_deriv))
+                                          deriv_work(p3, i_deriv)
 
                                        der_abc_2(a_offset + i, b_offset + j, c_offset + k, i_deriv) = &
-                                          p_deriv(p3, permute_2(i_deriv))
+                                          deriv_work(p3, i_deriv + 3)
                                     END DO
                                  END DO
                               END DO
                            END DO
                         END IF
-
-                        DEALLOCATE (p_deriv)
                      END DO !lk
                   END DO !li
                END DO !lj
@@ -777,14 +769,11 @@ CONTAINS
       INTEGER                                            :: a_mysize(1), a_offset, a_start, &
                                                             b_offset, b_start, i, i_deriv, ipgf, &
                                                             j, jpgf, li, lj, ncoa, ncob, p1, p2
-      INTEGER, DIMENSION(3)                              :: permute
       REAL(dp)                                           :: dr_ab, zeti, zetj
-      REAL(dp), DIMENSION(:, :), POINTER                 :: p_deriv
+      REAL(dp), ALLOCATABLE, DIMENSION(:, :)             :: deriv_work
       TYPE(eri_primitive_data_type)                      :: params
 
-      NULLIFY (p_deriv)
-
-      permute = [4, 5, 6]
+      ALLOCATE (deriv_work(nco(la_max)*nco(lb_max), 3))
 
       dr_ab = 0.0_dp
 
@@ -820,19 +809,17 @@ CONTAINS
                   ncob = nco(lj)
 
                   a_mysize(1) = ncoa*ncob
-                  CALL cp_libint_get_2eri_derivs(li, lj, lib, p_deriv, a_mysize)
+                  CALL cp_libint_get_2eri_derivs(li, lj, lib, deriv_work, a_mysize)
 
                   DO i_deriv = 1, 3
                      DO j = 1, ncob
                         p1 = (j - 1)*ncoa
                         DO i = 1, ncoa
                            p2 = p1 + i
-                           der_ab(a_offset + i, b_offset + j, i_deriv) = p_deriv(p2, permute(i_deriv))
+                           der_ab(a_offset + i, b_offset + j, i_deriv) = deriv_work(p2, i_deriv)
                         END DO
                      END DO
                   END DO
-
-                  DEALLOCATE (p_deriv)
                END DO
             END DO
 
