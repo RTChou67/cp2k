@@ -1165,7 +1165,6 @@ list(
   APPEND
   CP2K_SRCS_F
   minimax/minimax_exp.F
-  minimax/minimax_exp_gw.F
   minimax/minimax_exp_data.F
   minimax/minimax_rpa.F)
 
