@@ -621,8 +621,9 @@ CONTAINS
       nneighbors = SIZE(actual_x_data%neighbor_cells)
       ALLOCATE (pgf_list_ij(max_pgf**2))
       ALLOCATE (pgf_list_kl(max_pgf**2))
-!$OMP     ATOMIC READ
+!$OMP     CRITICAL (eri4_product_capacity)
       tmp_i4 = pgf_product_list_size
+!$OMP     END CRITICAL (eri4_product_capacity)
       ALLOCATE (pgf_product_list(tmp_i4))
       ALLOCATE (nimages(max_pgf**2))
 

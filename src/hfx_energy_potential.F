@@ -597,8 +597,9 @@ CONTAINS
       ALLOCATE (pgf_list_ij(max_pgf**2))
       ALLOCATE (pgf_list_kl(max_pgf**2))
       ! the size of pgf_product_list is allocated and resized as needed. The initial guess grows as needed
-!$OMP     ATOMIC READ
+!$OMP     CRITICAL (eri4_product_capacity)
       tmp_i4 = pgf_product_list_size
+!$OMP     END CRITICAL (eri4_product_capacity)
       ALLOCATE (pgf_product_list(tmp_i4))
       ALLOCATE (nimages(max_pgf**2))
 

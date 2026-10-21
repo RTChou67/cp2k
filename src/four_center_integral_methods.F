@@ -168,11 +168,10 @@ CONTAINS
                ! allocate size as needed,
                ! updating the global size estimate to make this a rare event in longer simulations
                IF (nproducts > SIZE(product_list)) THEN
-!$OMP              ATOMIC READ
+!$OMP              CRITICAL (eri4_product_capacity)
+                  pgf_product_list_size = MAX(pgf_product_list_size, (3*nproducts + 1)/2)
                   tmp_i4 = pgf_product_list_size
-                  tmp_i4 = MAX(pgf_product_list_size, (3*nproducts + 1)/2)
-!$OMP              ATOMIC WRITE
-                  pgf_product_list_size = tmp_i4
+!$OMP              END CRITICAL (eri4_product_capacity)
                   ALLOCATE (tmp_product_list(SIZE(product_list)))
                   tmp_product_list(:) = product_list
                   DEALLOCATE (product_list)
