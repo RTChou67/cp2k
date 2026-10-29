@@ -23,6 +23,13 @@ typedef struct {
   int *first_sgf;
   double *sphi;
   double *zet;
+  // Exact angular/radial factors; ncart == NULL selects the sphi fallback.
+  int ncgf;
+  int *ncart;      // [nset], contracted Cartesian counts per set
+  int *first_cart; // [nset], zero-based offsets into cart
+  int *cart;       // [ncgf], zero-based primitive Cartesian coset indices
+  double *angular; // row-major [nsgf][ncgf]
+  double *radial;  // row-major [ncgf][maxpgf], includes Cartesian normalization
 } grid_basis_set;
 
 #ifndef __cplusplus
@@ -45,6 +52,16 @@ typedef struct {
  * \param sphi            Transformation matrix for (de-)contracting the basis.
  * \param zet             Exponents of primitive Gaussians.
  *
+ *      Optional exact angular/radial factors, copied only when they reconstruct
+ *      every used sphi entry exactly. Pass zero and NULL pointers to use sphi.
+ *
+ * \param ncgf            Total number of contracted Cartesian functions.
+ * \param ncart           Contracted Cartesian counts per set, or NULL.
+ * \param cart            Primitive coset index per Cartesian function,
+ * zero-based.
+ * \param angular         Row-major angular transform [nsgf][ncgf].
+ * \param radial          Row-major radial coefficients [ncgf][maxpgf].
+ *
  * \param basis_set       Handle to the created basis set.
  *
  * \author Ole Schuett
@@ -54,7 +71,9 @@ void grid_create_basis_set(const int nset, const int nsgf, const int maxco,
                            const int lmax[nset], const int npgf[nset],
                            const int nsgf_set[nset], const int first_sgf[nset],
                            const double sphi[nsgf][maxco],
-                           const double zet[nset][maxpgf],
+                           const double zet[nset][maxpgf], const int ncgf,
+                           const int ncart[nset], const int *cart,
+                           const double *angular, const double *radial,
                            grid_basis_set **basis_set);
 
 /*******************************************************************************

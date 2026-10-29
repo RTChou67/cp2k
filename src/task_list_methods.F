@@ -520,17 +520,13 @@ CONTAINS
       TYPE(realspace_grid_type), DIMENSION(:), POINTER :: rs_grids
 
       TYPE(gto_basis_set_type), POINTER                  :: orb_basis_set
-      INTEGER                                            :: nset, natoms, nkinds, ntasks, &
-                                                            ikind, iatom, itask, nsgf
+      INTEGER                                            :: natoms, nkinds, ntasks, ikind, iatom, itask
       INTEGER, DIMENSION(:), ALLOCATABLE                 :: atom_kinds, level_list, iatom_list, jatom_list, &
                                                             iset_list, jset_list, ipgf_list, jpgf_list, &
                                                             border_mask_list, block_num_list
       REAL(KIND=dp), DIMENSION(:), ALLOCATABLE           :: radius_list
       REAL(KIND=dp), DIMENSION(:, :), ALLOCATABLE        :: rab_list, atom_positions
       TYPE(task_type), DIMENSION(:), POINTER             :: tasks
-      INTEGER, DIMENSION(:, :), POINTER                  :: first_sgf
-      REAL(KIND=dp), DIMENSION(:, :), POINTER            :: sphi, zet
-      INTEGER, DIMENSION(:), POINTER                     :: lmax, lmin, npgf, nsgf_set
 
       nkinds = SIZE(qs_kind_set)
       natoms = SIZE(particle_set)
@@ -542,27 +538,7 @@ CONTAINS
          ALLOCATE (task_list%grid_basis_sets(nkinds))
          DO ikind = 1, nkinds
             CALL get_qs_kind(qs_kind_set(ikind), basis_type=basis_type, basis_set=orb_basis_set)
-            CALL get_gto_basis_set(gto_basis_set=orb_basis_set, &
-                                   nset=nset, &
-                                   nsgf=nsgf, &
-                                   nsgf_set=nsgf_set, &
-                                   npgf=npgf, &
-                                   first_sgf=first_sgf, &
-                                   lmax=lmax, &
-                                   lmin=lmin, &
-                                   sphi=sphi, &
-                                   zet=zet)
-            CALL grid_create_basis_set(nset=nset, &
-                                       nsgf=nsgf, &
-                                       maxco=SIZE(sphi, 1), &
-                                       maxpgf=SIZE(zet, 1), &
-                                       lmin=lmin, &
-                                       lmax=lmax, &
-                                       npgf=npgf, &
-                                       nsgf_set=nsgf_set, &
-                                       first_sgf=first_sgf, &
-                                       sphi=sphi, &
-                                       zet=zet, &
+            CALL grid_create_basis_set(gto_basis_set=orb_basis_set, &
                                        basis_set=task_list%grid_basis_sets(ikind))
          END DO
       END IF

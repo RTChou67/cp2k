@@ -12,9 +12,14 @@
 MODULE grid_api
    USE ISO_C_BINDING,                   ONLY: &
         C_ASSOCIATED, C_BOOL, C_CHAR, C_DOUBLE, C_FUNLOC, C_FUNPTR, C_INT, C_LOC, C_NULL_PTR, C_PTR
+   USE basis_set_types,                 ONLY: get_gto_basis_set,&
+                                              gto_basis_set_type
    USE kinds,                           ONLY: dp
    USE message_passing,                 ONLY: mp_comm_type
    USE offload_api,                     ONLY: offload_buffer_type
+   USE orbital_pointers,                ONLY: coset,&
+                                              ncoset
+   USE orbital_transformation_matrices, ONLY: orbtramat
    USE realspace_grid_types,            ONLY: realspace_grid_type
 #include "../base/base_uses.f90"
 
@@ -544,38 +549,36 @@ CONTAINS
 
 ! **************************************************************************************************
 !> \brief Allocates a basis set which can be passed to grid_create_task_list.
-!> \param nset ...
-!> \param nsgf ...
-!> \param maxco ...
-!> \param maxpgf ...
-!> \param lmin ...
-!> \param lmax ...
-!> \param npgf ...
-!> \param nsgf_set ...
-!> \param first_sgf ...
-!> \param sphi ...
-!> \param zet ...
+!> \param gto_basis_set Original basis, including normalized Cartesian coefficients.
 !> \param basis_set ...
 !> \author Ole Schuett
 ! **************************************************************************************************
-   SUBROUTINE grid_create_basis_set(nset, nsgf, maxco, maxpgf, &
-                                    lmin, lmax, npgf, nsgf_set, first_sgf, sphi, zet, &
-                                    basis_set)
-      INTEGER, INTENT(IN)                                :: nset, nsgf, maxco, maxpgf
-      INTEGER, DIMENSION(:), INTENT(IN), TARGET          :: lmin, lmax, npgf, nsgf_set
-      INTEGER, DIMENSION(:, :), INTENT(IN)               :: first_sgf
-      REAL(KIND=dp), DIMENSION(:, :), INTENT(IN), TARGET :: sphi, zet
+   SUBROUTINE grid_create_basis_set(gto_basis_set, basis_set)
+      TYPE(gto_basis_set_type), INTENT(IN)               :: gto_basis_set
       TYPE(grid_basis_set_type), INTENT(INOUT)           :: basis_set
 
       CHARACTER(LEN=*), PARAMETER :: routineN = 'grid_create_basis_set'
 
-      INTEGER                                            :: handle
-      INTEGER, DIMENSION(nset), TARGET                   :: my_first_sgf
-      TYPE(C_PTR)                                        :: first_sgf_c, lmax_c, lmin_c, npgf_c, &
-                                                            nsgf_set_c, sphi_c, zet_c
+      INTEGER                                            :: cgfa, cgfb, handle, icgf, ico, ipgf, &
+                                                            iset, ishell, l, maxco, maxpgf, ncgf, &
+                                                            nco_set, nset, nsgf, offset, sgfa, sgfb
+      INTEGER(KIND=C_INT), ALLOCATABLE, DIMENSION(:), &
+         TARGET                                          :: cart, my_first_sgf
+      INTEGER, DIMENSION(:), POINTER                     :: lmax, lmin, lx, ly, lz, ncart, npgf, &
+                                                            nsgf_set, nshell
+      INTEGER, DIMENSION(:, :), POINTER                  :: first_cgf, first_sgf, last_cgf, &
+                                                            last_sgf, shell_l
+      LOGICAL                                            :: have_factors
+      REAL(KIND=dp), ALLOCATABLE, DIMENSION(:, :), &
+         TARGET                                          :: angular, radial
+      REAL(KIND=dp), DIMENSION(:, :), POINTER            :: cphi, sphi, zet
+      TYPE(C_PTR)                                        :: angular_c, cart_c, first_sgf_c, lmax_c, &
+                                                            lmin_c, ncart_c, npgf_c, nsgf_set_c, &
+                                                            radial_c, sphi_c, zet_c
       INTERFACE
          SUBROUTINE grid_create_basis_set_c(nset, nsgf, maxco, maxpgf, &
                                             lmin, lmax, npgf, nsgf_set, first_sgf, sphi, zet, &
+                                            ncgf, ncart, cart, angular, radial, &
                                             basis_set) &
             BIND(C, name="grid_create_basis_set")
             IMPORT :: C_PTR, C_INT
@@ -590,27 +593,93 @@ CONTAINS
             TYPE(C_PTR), VALUE                        :: first_sgf
             TYPE(C_PTR), VALUE                        :: sphi
             TYPE(C_PTR), VALUE                        :: zet
+            INTEGER(KIND=C_INT), VALUE                :: ncgf
+            TYPE(C_PTR), VALUE                        :: ncart
+            TYPE(C_PTR), VALUE                        :: cart
+            TYPE(C_PTR), VALUE                        :: angular
+            TYPE(C_PTR), VALUE                        :: radial
             TYPE(C_PTR)                               :: basis_set
          END SUBROUTINE grid_create_basis_set_c
       END INTERFACE
 
       CALL timeset(routineN, handle)
 
-      CPASSERT(SIZE(lmin) == nset)
+      CALL get_gto_basis_set(gto_basis_set, nset=nset, nsgf=nsgf, ncgf=ncgf, &
+                             lmin=lmin, lmax=lmax, npgf=npgf, nsgf_set=nsgf_set, &
+                             first_sgf=first_sgf, last_sgf=last_sgf, sphi=sphi, zet=zet, &
+                             cphi=cphi, ncgf_set=ncart, lx=lx, ly=ly, lz=lz, &
+                             nshell=nshell, first_cgf=first_cgf, last_cgf=last_cgf, l=shell_l)
+      maxco = SIZE(sphi, 1)
+      maxpgf = SIZE(zet, 1)
+
       CPASSERT(SIZE(lmin) == nset)
       CPASSERT(SIZE(lmax) == nset)
       CPASSERT(SIZE(npgf) == nset)
       CPASSERT(SIZE(nsgf_set) == nset)
       CPASSERT(SIZE(first_sgf, 2) == nset)
-      CPASSERT(SIZE(sphi, 1) == maxco .AND. SIZE(sphi, 2) == nsgf)
-      CPASSERT(SIZE(zet, 1) == maxpgf .AND. SIZE(zet, 2) == nset)
+      CPASSERT(SIZE(sphi, 2) == nsgf)
+      CPASSERT(SIZE(zet, 2) == nset)
       CPASSERT(.NOT. C_ASSOCIATED(basis_set%c_ptr))
+
+      ALLOCATE (my_first_sgf(nset))
+      have_factors = ncgf > 0 .AND. nset > 0 .AND. nsgf > 0 .AND. maxpgf > 0 .AND. &
+                     ASSOCIATED(cphi) .AND. ASSOCIATED(ncart) .AND. ASSOCIATED(lx) .AND. &
+                     ASSOCIATED(ly) .AND. ASSOCIATED(lz) .AND. ASSOCIATED(nshell) .AND. &
+                     ASSOCIATED(first_cgf) .AND. ASSOCIATED(last_cgf) .AND. &
+                     ASSOCIATED(last_sgf) .AND. ASSOCIATED(shell_l) .AND. ASSOCIATED(orbtramat)
+      IF (have_factors) THEN
+         have_factors = SIZE(cphi, 1) == maxco .AND. SIZE(cphi, 2) == ncgf .AND. &
+                        SIZE(ncart) == nset .AND. SUM(ncart) == ncgf .AND. ALL(ncart >= 0) .AND. &
+                        SIZE(lx) >= ncgf .AND. SIZE(ly) >= ncgf .AND. SIZE(lz) >= ncgf .AND. &
+                        SIZE(nshell) == nset .AND. ALL(nshell >= 0) .AND. IS_CONTIGUOUS(ncart) .AND. &
+                        SIZE(first_cgf, 2) == nset .AND. SIZE(last_cgf, 2) == nset .AND. &
+                        SIZE(last_sgf, 2) == nset .AND. SIZE(shell_l, 2) == nset
+      END IF
+
+      ! Keep the original cphi coefficients, including norm_cgf, in radial.
+      ! The C constructor checks exact reconstruction of sphi before enabling factors.
+      IF (have_factors) THEN
+         ALLOCATE (cart(ncgf), angular(ncgf, nsgf), radial(maxpgf, ncgf))
+         angular(:, :) = 0.0_dp
+         radial(:, :) = 0.0_dp
+         offset = 0
+         DO iset = 1, nset
+            have_factors = nshell(iset) <= MIN(SIZE(first_cgf, 1), SIZE(last_cgf, 1), &
+                                               SIZE(first_sgf, 1), SIZE(last_sgf, 1), SIZE(shell_l, 1))
+            IF (.NOT. have_factors) EXIT
+            nco_set = ncoset(lmax(iset))
+            DO ishell = 1, nshell(iset)
+               l = shell_l(ishell, iset)
+               cgfa = first_cgf(ishell, iset)
+               cgfb = last_cgf(ishell, iset)
+               sgfa = first_sgf(ishell, iset)
+               sgfb = last_sgf(ishell, iset)
+               have_factors = cgfa > offset .AND. cgfb <= offset + ncart(iset) .AND. cgfb >= cgfa .AND. &
+                              sgfa >= 1 .AND. sgfb <= nsgf .AND. sgfb >= sgfa .AND. &
+                              l >= LBOUND(orbtramat, 1) .AND. l <= UBOUND(orbtramat, 1)
+               IF (have_factors) have_factors = ASSOCIATED(orbtramat(l)%c2s)
+               IF (have_factors) have_factors = SIZE(orbtramat(l)%c2s, 1) == sgfb - sgfa + 1 .AND. &
+                                                SIZE(orbtramat(l)%c2s, 2) == cgfb - cgfa + 1
+               IF (.NOT. have_factors) EXIT
+               angular(cgfa:cgfb, sgfa:sgfb) = TRANSPOSE(orbtramat(l)%c2s)
+            END DO
+            IF (.NOT. have_factors) EXIT
+            DO icgf = offset + 1, offset + ncart(iset)
+               ico = coset(lx(icgf), ly(icgf), lz(icgf))
+               cart(icgf) = ico - 1
+               DO ipgf = 1, npgf(iset)
+                  radial(ipgf, icgf) = cphi((ipgf - 1)*nco_set + ico, icgf)
+               END DO
+            END DO
+            offset = offset + ncart(iset)
+         END DO
+      END IF
+      IF (.NOT. have_factors) ncgf = 0
 
       CPASSERT(IS_CONTIGUOUS(lmin))
       CPASSERT(IS_CONTIGUOUS(lmax))
       CPASSERT(IS_CONTIGUOUS(npgf))
       CPASSERT(IS_CONTIGUOUS(nsgf_set))
-      CPASSERT(IS_CONTIGUOUS(my_first_sgf))
       CPASSERT(IS_CONTIGUOUS(sphi))
       CPASSERT(IS_CONTIGUOUS(zet))
 
@@ -621,6 +690,10 @@ CONTAINS
       first_sgf_c = C_NULL_PTR
       sphi_c = C_NULL_PTR
       zet_c = C_NULL_PTR
+      ncart_c = C_NULL_PTR
+      cart_c = C_NULL_PTR
+      angular_c = C_NULL_PTR
+      radial_c = C_NULL_PTR
 
       ! Basis sets arrays can be empty, need to check before accessing the first element.
       IF (nset > 0) THEN
@@ -639,6 +712,12 @@ CONTAINS
       IF (SIZE(zet) > 0) THEN
          zet_c = C_LOC(zet(1, 1))
       END IF
+      IF (have_factors) THEN
+         ncart_c = C_LOC(ncart(1))
+         cart_c = C_LOC(cart(1))
+         angular_c = C_LOC(angular(1, 1))
+         radial_c = C_LOC(radial(1, 1))
+      END IF
 
       CALL grid_create_basis_set_c(nset=nset, &
                                    nsgf=nsgf, &
@@ -651,6 +730,11 @@ CONTAINS
                                    first_sgf=first_sgf_c, &
                                    sphi=sphi_c, &
                                    zet=zet_c, &
+                                   ncgf=ncgf, &
+                                   ncart=ncart_c, &
+                                   cart=cart_c, &
+                                   angular=angular_c, &
+                                   radial=radial_c, &
                                    basis_set=basis_set%c_ptr)
       CPASSERT(C_ASSOCIATED(basis_set%c_ptr))
 

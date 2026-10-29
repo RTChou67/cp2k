@@ -144,7 +144,13 @@ static void create_dummy_basis_set(const int size, const int lmin,
                         /*nsgf_set=*/&size,
                         /*first_sgf=*/first_sgf,
                         /*sphi=*/sphi,
-                        /*zet=*/zet_array, basis_set);
+                        /*zet=*/zet_array,
+                        /*ncgf=*/0,
+                        /*ncart=*/NULL,
+                        /*cart=*/NULL,
+                        /*angular=*/NULL,
+                        /*radial=*/NULL,
+                        /*basis_set=*/basis_set);
 }
 
 /*******************************************************************************
