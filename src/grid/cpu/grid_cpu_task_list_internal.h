@@ -27,9 +27,23 @@ typedef struct {
   int jpgf;
   int border_mask;
   int block_num;
+  int pair;
   double radius;
   double rab[3];
 } grid_cpu_task;
+
+// A set pair on one grid level. Primitive pairs are unique in the packed
+// coefficient buffer, even when several spatial tasks use the same pair.
+typedef struct {
+  int first_task;
+  int last_task;
+  int ncoeff;
+  enum {
+    GRID_CONTRACT_DENSE,
+    GRID_CONTRACT_SELECTIVE,
+    GRID_CONTRACT_FACTORED
+  } mode;
+} grid_cpu_task_group;
 
 /*******************************************************************************
  * \brief Internal representation of a grid layout.
@@ -60,9 +74,10 @@ typedef struct {
   int *atom_kinds;
   grid_basis_set **basis_sets;
   grid_cpu_task *tasks;
+  grid_cpu_task_group *groups;
   grid_cpu_layout *layouts;
-  int *first_level_block_task;
-  int *last_level_block_task;
+  int *first_level_block_group;
+  int *last_level_block_group;
   int maxco;
   double **threadlocals;
   size_t *threadlocal_sizes;
