@@ -48,7 +48,8 @@ MODULE preconditioner_makes
    USE cp_fm_cholesky,                  ONLY: cp_fm_cholesky_decompose,&
                                               cp_fm_cholesky_reduce,&
                                               cp_fm_cholesky_restore
-   USE cp_fm_diag,                      ONLY: choose_eigv_solver
+   USE cp_fm_diag,                      ONLY: choose_eigv_solver,&
+                                              direct_generalized_diagonalization
    USE cp_fm_struct,                    ONLY: cp_fm_struct_create,&
                                               cp_fm_struct_release,&
                                               cp_fm_struct_type
@@ -107,21 +108,24 @@ CONTAINS
       CHARACTER(len=*), PARAMETER :: routineN = 'make_complex_full_all'
 
       INTEGER                                            :: handle, k
-      TYPE(cp_cfm_type)                                  :: matrix_diag_work, matrix_s_copy, &
+      TYPE(cp_cfm_type)                                  :: matrix_diag_work, matrix_s_cholesky, &
                                                             matrix_tmp
 
       CALL timeset(routineN, handle)
       CALL prepare_complex_full_all(preconditioner_env, matrix_c0, matrix_h, matrix_s, &
-                                    matrix_tmp, matrix_s_copy, c0_evals, energy_gap)
+                                    matrix_tmp, matrix_s_cholesky, c0_evals, energy_gap)
       CALL cp_cfm_create(matrix_diag_work, matrix_h%matrix_struct, &
                          name='complex FULL_ALL diagonalization work')
-      CALL cp_cfm_geeig(matrix_tmp, matrix_s_copy, preconditioner_env%complex_fm, &
-                        preconditioner_env%full_evals, matrix_diag_work)
+      ! Direct generalized solvers consume S itself; retain their existing selection.
+      IF (direct_generalized_diagonalization) CALL cp_cfm_to_cfm(matrix_s, matrix_s_cholesky)
+      CALL cp_cfm_geeig(matrix_tmp, matrix_s_cholesky, preconditioner_env%complex_fm, &
+                        preconditioner_env%full_evals, matrix_diag_work, &
+                        b_is_cholesky=.NOT. direct_generalized_diagonalization)
       k = SIZE(preconditioner_env%occ_evals)
       preconditioner_env%full_evals(1:k) = preconditioner_env%occ_evals(:)
       CALL cp_cfm_to_cfm(matrix_c0, preconditioner_env%complex_fm, k)
       CALL cp_cfm_release(matrix_diag_work)
-      CALL cp_cfm_release(matrix_s_copy)
+      CALL cp_cfm_release(matrix_s_cholesky)
       CALL cp_cfm_release(matrix_tmp)
       CALL timestop(handle)
    END SUBROUTINE make_complex_full_all
@@ -133,16 +137,16 @@ CONTAINS
 !> \param matrix_h Hamiltonian
 !> \param matrix_s overlap
 !> \param matrix_tmp projected and shifted Hamiltonian; caller releases it after diagonalization
-!> \param matrix_s_copy overlap scratch; caller releases it after diagonalization
+!> \param matrix_s_cholesky upper Cholesky factor of S; caller releases it after diagonalization
 !> \param c0_evals optional reference energies
 !> \param energy_gap denominator floor
 ! **************************************************************************************************
    SUBROUTINE prepare_complex_full_all(preconditioner_env, matrix_c0, matrix_h, matrix_s, &
-                                       matrix_tmp, matrix_s_copy, c0_evals, energy_gap)
+                                       matrix_tmp, matrix_s_cholesky, c0_evals, energy_gap)
 
       TYPE(preconditioner_type)                          :: preconditioner_env
       TYPE(cp_cfm_type), INTENT(IN)                      :: matrix_c0, matrix_h, matrix_s
-      TYPE(cp_cfm_type), INTENT(OUT)                     :: matrix_tmp, matrix_s_copy
+      TYPE(cp_cfm_type), INTENT(OUT)                     :: matrix_tmp, matrix_s_cholesky
       REAL(KIND=dp), DIMENSION(:), INTENT(IN), OPTIONAL  :: c0_evals
       REAL(KIND=dp), INTENT(IN)                          :: energy_gap
 
@@ -188,7 +192,7 @@ CONTAINS
       CALL cp_cfm_create(matrix_shifted_sc, matrix_c0%matrix_struct, &
                          name='complex FULL_ALL shifted SC')
       CALL cp_cfm_create(matrix_tmp, matrix_h%matrix_struct, name='complex FULL_ALL projected H')
-      CALL cp_cfm_create(matrix_s_copy, matrix_s%matrix_struct, name='complex FULL_ALL S copy')
+      CALL cp_cfm_create(matrix_s_cholesky, matrix_s%matrix_struct, name='complex FULL_ALL S Cholesky')
 
       CALL cp_cfm_gemm('N', 'N', n, k, n, z_one, matrix_h, matrix_c0, z_zero, matrix_hc0)
       CALL cp_cfm_gemm('N', 'N', n, k, n, z_one, matrix_s, matrix_c0, z_zero, matrix_sc0)
@@ -211,9 +215,9 @@ CONTAINS
       CALL cp_cfm_column_scale(matrix_sc_chc, shifted_evals)
       CALL cp_cfm_to_cfm(matrix_hc0, matrix_shifted_sc)
       CALL cp_cfm_scale_and_add(z_one, matrix_shifted_sc, -z_one, matrix_sc_chc)
-      CALL cp_cfm_to_cfm(matrix_s, matrix_s_copy)
-      CALL cp_cfm_cholesky_decompose(matrix_s_copy)
-      CALL cp_cfm_triangular_multiply(matrix_s_copy, matrix_shifted_sc, side='L', &
+      CALL cp_cfm_to_cfm(matrix_s, matrix_s_cholesky)
+      CALL cp_cfm_cholesky_decompose(matrix_s_cholesky)
+      CALL cp_cfm_triangular_multiply(matrix_s_cholesky, matrix_shifted_sc, side='L', &
                                       transa_tr='C', invert_tr=.TRUE., uplo_tr='U')
 
       CALL cp_cfm_vectorsnorm(matrix_shifted_sc, residual_norm_sq, squared=.TRUE.)
@@ -235,7 +239,6 @@ CONTAINS
       CALL cp_cfm_gemm('N', 'N', n, k, k, z_one, matrix_sc0, matrix_chc, z_one, matrix_shifted_sc)
       CALL cp_cfm_gemm('N', 'C', n, n, k, z_one, matrix_shifted_sc, matrix_sc0, z_one, matrix_tmp)
 
-      CALL cp_cfm_to_cfm(matrix_s, matrix_s_copy)
       preconditioner_env%in_use = ot_precond_full_all
       preconditioner_env%solver = ot_precond_solver_default
 

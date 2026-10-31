@@ -16,7 +16,6 @@ MODULE preconditioner
    USE cp_blacs_env,                    ONLY: cp_blacs_env_type
    USE cp_cfm_basic_linalg,             ONLY: cp_cfm_triangular_invert,&
                                               cp_cfm_triangular_multiply
-   USE cp_cfm_cholesky,                 ONLY: cp_cfm_cholesky_decompose
    USE cp_cfm_diag,                     ONLY: cp_cfm_diag_workspace_type,&
                                               cp_cfm_heevd_local,&
                                               cp_cfm_local_workspace_prepare
@@ -1060,8 +1059,7 @@ CONTAINS
             CALL prepare_complex_full_all(p, work(j)%c, work(j)%h, work(j)%s, work(j)%a, work(j)%b, &
                                           energy_gap=energy_gap)
             n = SIZE(p%full_evals)
-            ! Match the existing Cholesky reduction and back transformation exactly.
-            CALL cp_cfm_cholesky_decompose(work(j)%b)
+            ! Reuse the overlap factor from the residual norm in prepare_complex_full_all.
             CALL cp_cfm_triangular_invert(work(j)%b)
             CALL cp_cfm_triangular_multiply(work(j)%b, work(j)%a, side='R')
             CALL cp_cfm_triangular_multiply(work(j)%b, work(j)%a, transa_tr='C')

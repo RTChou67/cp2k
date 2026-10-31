@@ -432,20 +432,23 @@ CONTAINS
 !> \param eigenvalues ...
 !> \param work ...
 !> \param lowest_subset compute only the requested lowest eigenpairs with ScaLAPACK when available
+!> \param b_is_cholesky bmatrix contains the upper Cholesky factor of the metric;
+!>        supported by the CP2K reduction with direct generalized diagonalization disabled
 !> \par History
 !>      12.2024 Added DLA-Future support [Rocco Meli]
 ! **************************************************************************************************
-   SUBROUTINE cp_cfm_geeig(amatrix, bmatrix, eigenvectors, eigenvalues, work, lowest_subset)
+   SUBROUTINE cp_cfm_geeig(amatrix, bmatrix, eigenvectors, eigenvalues, work, lowest_subset, b_is_cholesky)
 
       TYPE(cp_cfm_type), INTENT(IN)                      :: amatrix, bmatrix, eigenvectors
       REAL(KIND=dp), DIMENSION(:)                        :: eigenvalues
       TYPE(cp_cfm_type), INTENT(IN)                      :: work
-      LOGICAL, INTENT(IN), OPTIONAL                      :: lowest_subset
+      LOGICAL, INTENT(IN), OPTIONAL                      :: lowest_subset, b_is_cholesky
 
       CHARACTER(len=*), PARAMETER                        :: routineN = 'cp_cfm_geeig'
 
       INTEGER                                            :: handle, nao, nmo
-      LOGICAL                                            :: check_eigenvectors, use_lowest_subset
+      LOGICAL                                            :: check_eigenvectors, metric_factorized, &
+                                                            use_lowest_subset
       REAL(KIND=dp), ALLOCATABLE, DIMENSION(:)           :: evals
       TYPE(cp_cfm_type)                                  :: overlap_check, scratch_check
 
@@ -460,6 +463,12 @@ CONTAINS
 #if !defined(__parallel)
       use_lowest_subset = .FALSE.
 #endif
+      metric_factorized = .FALSE.
+      IF (PRESENT(b_is_cholesky)) metric_factorized = b_is_cholesky
+      IF (metric_factorized) THEN
+         CPASSERT(.NOT. use_lowest_subset)
+         CPASSERT(.NOT. direct_generalized_diagonalization)
+      END IF
 
       IF (use_lowest_subset) THEN
 #if defined(__parallel)
@@ -532,7 +541,7 @@ CONTAINS
 #endif
       ELSE
          ! Cholesky decompose S=U(T)U
-         CALL cp_cfm_cholesky_decompose(bmatrix)
+         IF (.NOT. metric_factorized) CALL cp_cfm_cholesky_decompose(bmatrix)
          ! Invert to get U^(-1)
          CALL cp_cfm_triangular_invert(bmatrix)
          ! Reduce to get U^(-T) * H * U^(-1)
