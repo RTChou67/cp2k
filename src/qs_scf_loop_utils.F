@@ -722,10 +722,11 @@ CONTAINS
 
       CHARACTER(LEN=*), PARAMETER :: routineN = 'qs_scf_loop_do_ot_kp'
 
-      INTEGER :: energy_spin, energy_start, first_channel, handle, homo, ikpoint, ispin, &
-         local_channel, local_kpoint, nao, nkp_groups, nkpoint, nlocal_channels, nmo, &
-         nspin_energy, nspin_ot
+      INTEGER :: energy_spin, energy_start, first_channel, handle, homo, icol, ikpoint, ispin, &
+         local_channel, local_kpoint, nao, ncol_local, nkp_groups, nkpoint, nlocal_channels, nmo, &
+         nrow_local, nspin_energy, nspin_ot
       INTEGER, DIMENSION(2)                              :: kp_range
+      INTEGER, DIMENSION(:), POINTER                     :: col_indices
       LOGICAL :: local_orbitals, need_gradient, need_mo_coeff, ot_gradient_prepared, &
          physical_base_state, restart_history, restricted_roks, use_operator_cache, use_real_wfn
       REAL(KIND=dp)                                      :: trial_kTS
@@ -971,12 +972,16 @@ CONTAINS
                ! ROKS has one complex orbital variable but two spin densities. Form the exact
                ! shared-orbital derivative before handing it to the one-channel OT minimizer.
                IF (local_ot_env(local_channel)%settings%do_ener) THEN
-                  CALL multiply_complex_fm_adjoint( &
-                     active_mo_coeff, active_mo_coeff_im, hc_re, hc_im, &
-                     chc_re, chc_im, 1.0_dp, 0.0_dp)
-                  CALL copy_fm_to_dbcsr(chc_re, local_ot_env(local_channel)%rot_mat_chc)
-                  CALL dbcsr_get_diag(local_ot_env(local_channel)%rot_mat_chc, &
-                                      local_ot_env(local_channel)%ener_rayleigh(1:homo))
+                  ! Only Re diag(C^H*H_sigma*C) is needed before occupation weighting.
+                  ! Sum local column products over the BLACS grid, excluding padded rows.
+                  CALL cp_fm_get_info(active_mo_coeff, nrow_local=nrow_local, ncol_local=ncol_local, &
+                                      col_indices=col_indices)
+                  local_ot_env(local_channel)%ener_rayleigh(1:homo) = 0.0_dp
+                  DO icol = 1, ncol_local
+                     local_ot_env(local_channel)%ener_rayleigh(col_indices(icol)) = &
+                        DOT_PRODUCT(active_mo_coeff%local_data(1:nrow_local, icol), hc_re%local_data(1:nrow_local, icol)) + &
+                        DOT_PRODUCT(active_mo_coeff_im%local_data(1:nrow_local, icol), hc_im%local_data(1:nrow_local, icol))
+                  END DO
                   CALL local_ot_env(local_channel)%para_env%sum( &
                      local_ot_env(local_channel)%ener_rayleigh(1:homo))
                END IF
@@ -1010,12 +1015,12 @@ CONTAINS
                                                alpha=1.0_dp, beta=1.0_dp)
                END IF
                IF (local_ot_env(local_channel)%settings%do_ener) THEN
-                  CALL multiply_complex_fm_adjoint( &
-                     active_mo_coeff, active_mo_coeff_im, hc_roks_re, hc_roks_im, &
-                     chc_re, chc_im, 1.0_dp, 0.0_dp)
-                  CALL copy_fm_to_dbcsr(chc_re, local_ot_env(local_channel)%rot_mat_chc)
-                  CALL dbcsr_get_diag(local_ot_env(local_channel)%rot_mat_chc, &
-                                      local_ot_env(local_channel)%ener_rayleigh(homo + 1:2*homo))
+                  local_ot_env(local_channel)%ener_rayleigh(homo + 1:2*homo) = 0.0_dp
+                  DO icol = 1, ncol_local
+                     local_ot_env(local_channel)%ener_rayleigh(homo + col_indices(icol)) = &
+                        DOT_PRODUCT(active_mo_coeff%local_data(1:nrow_local, icol), hc_roks_re%local_data(1:nrow_local, icol)) + &
+                        DOT_PRODUCT(active_mo_coeff_im%local_data(1:nrow_local, icol), hc_roks_im%local_data(1:nrow_local, icol))
+                  END DO
                   CALL local_ot_env(local_channel)%para_env%sum( &
                      local_ot_env(local_channel)%ener_rayleigh(homo + 1:2*homo))
                END IF
