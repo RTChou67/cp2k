@@ -1182,11 +1182,18 @@ CONTAINS
          CALL dbcsr_copy(c_re, matrix_c)
          CALL dbcsr_copy(c_im, matrix_c_im)
 
+         ! S*(X*F) = (S*X)*F: reuse the overlap action already formed above.
+         CALL dbcsr_copy(rotated_re, sc_re, name="ref_sc_re")
+         CALL dbcsr_copy(rotated_im, sc_im, name="ref_sc_im")
+         CALL qs_ot_complex_multiply('N', 'N', sc_re, sc_im, p_re, p_im, rotated_re, rotated_im, tmp_nk)
+         CALL dbcsr_copy(sc_re, rotated_re)
+         CALL dbcsr_copy(sc_im, rotated_im)
+         CALL dbcsr_release(rotated_re)
+         CALL dbcsr_release(rotated_im)
+
          CALL dbcsr_set(f_re, 0.0_dp)
          CALL dbcsr_add_on_diag(f_re, alpha=1.0_dp)
          CALL dbcsr_set(f_im, 0.0_dp)
-
-         CALL qs_ot_complex_multiply('N', 'N', matrix_s, matrix_s_im, c_re, c_im, sc_re, sc_im, tmp_nk)
       END IF
 
       IF (qs_ot_env%settings%do_rotation) THEN
@@ -2365,13 +2372,14 @@ CONTAINS
          CALL qs_ot_spectral_matrix_local(w, matrix=w%sinp)
          CALL qs_ot_complex_multiply_local('N', 'N', w%x, w%sinp, w%out, w%tmp, w%gemm_ctx)
          IF (update) THEN
+            ! Preserve buf_nk, which retains the incoming SC0 during initialization.
+            CALL qs_ot_complex_multiply_local('N', 'N', w%sx, w%sinp, w%c0, w%tmp, w%gemm_ctx)
+            w%sx(:, :, :) = w%c0(:, :, :)
             w%x(:, :, :) = w%out(:, :, :)
             w%sinp(:, :, :) = 0.0_dp
             DO i = 1, w%k
                w%sinp(i, i, 1) = 1.0_dp
             END DO
-            CALL qs_ot_complex_multiply_local('N', 'N', overlap_re, overlap_im, w%x(:, :, 1), w%x(:, :, 2), &
-                                              w%sx(:, :, 1), w%sx(:, :, 2), w%tmp, w%gemm_ctx)
          END IF
          RETURN
       END IF
