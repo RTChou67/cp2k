@@ -188,7 +188,7 @@ CONTAINS
 !>        the single-group Schur complement A - R^T (D - chi chi^T/sum(chi)) R.
 !> \param rotation_hessian finite orbital-rotation Hessian
 !> \param rayleigh_response derivative of all spin-resolved Rayleigh energies
-!> \param response_weight positive occupation-response weights
+!> \param response_weight signed occupation-response weights
 !> \param response_group fixed-N group of every energy variable
 !> \param rotation_gradient orbital-rotation gradient
 !> \param energy_gradient auxiliary-energy gradient
@@ -207,7 +207,7 @@ CONTAINS
       REAL(KIND=dp), DIMENSION(:), INTENT(OUT)           :: schur_rhs
 
       INTEGER                                            :: group, i, nenergy, ngroups, nrotation
-      REAL(KIND=dp)                                      :: weight
+      REAL(KIND=dp), ALLOCATABLE, DIMENSION(:, :)        :: weighted_response
 
       nenergy = SIZE(response_weight)
       nrotation = SIZE(rotation_gradient)
@@ -224,15 +224,19 @@ CONTAINS
 
       schur_block(:, :) = rotation_hessian(:, :)
       coupling_matrix(:, :) = 0.0_dp
+      ALLOCATE (weighted_response(nenergy, nrotation))
       DO i = 1, nenergy
-         weight = response_weight(i)
-         schur_block(:, :) = schur_block(:, :) - weight* &
-                             SPREAD(rayleigh_response(i, :), DIM=2, NCOPIES=nrotation)* &
-                             SPREAD(rayleigh_response(i, :), DIM=1, NCOPIES=nrotation)
+         weighted_response(i, :) = response_weight(i)*rayleigh_response(i, :)
          group = response_group(i)
          coupling_matrix(:, group) = coupling_matrix(:, group) + &
-                                     weight*rayleigh_response(i, :)
+                                     weighted_response(i, :)
       END DO
+      ! R^T*diag(chi)*R also supports the negative response weights of MP/MV smearing.
+      IF (nenergy > 0 .AND. nrotation > 0) THEN
+         CALL DGEMM('T', 'N', nrotation, nrotation, nenergy, -1.0_dp, &
+                    rayleigh_response, nenergy, weighted_response, nenergy, &
+                    1.0_dp, schur_block, nrotation)
+      END IF
       schur_block(:, :) = 0.5_dp*(schur_block + TRANSPOSE(schur_block))
       schur_rhs(:) = rotation_gradient + &
                      MATMUL(TRANSPOSE(rayleigh_response), energy_gradient)
