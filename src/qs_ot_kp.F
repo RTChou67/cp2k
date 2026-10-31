@@ -36,8 +36,7 @@ MODULE qs_ot_kp
    USE local_gemm_api,                  ONLY: LOCAL_GEMM_PU_GPU,&
                                               local_gemm_ctxt_type
    USE mathlib,                         ONLY: diag_complex,&
-                                              diamat_all,&
-                                              gemm_square
+                                              diamat_all
    USE preconditioner,                  ONLY: apply_preconditioner,&
                                               apply_preconditioner_complex_batch
    USE preconditioner_types,            ONLY: preconditioner_p_type
@@ -623,14 +622,17 @@ CONTAINS
 
       ALLOCATE (cross_mode(n, n))
       DO mode = 1, nmode
-         ! GCC 15 miscompiles the equivalent complex array expressions with -march=znver3.
-         CALL gemm_square(overlap_start_current, "N", density_modes(:, :, mode), "N", &
-                          overlap_start_current, "C", cross_mode)
+         ! Only diag(O*M*O^H) is needed. Keep explicit BLAS: GCC 15 miscompiles
+         ! the equivalent complex array expressions with -march=znver3.
+         CALL ZGEMM('N', 'N', n, n, n, CMPLX(1.0_dp, 0.0_dp, KIND=dp), &
+                    overlap_start_current, n, density_modes(:, :, mode), n, &
+                    CMPLX(0.0_dp, 0.0_dp, KIND=dp), cross_mode, n)
          DO i = 1, n
             density_overlap(mode) = density_overlap(mode) + &
                                     occupation_current(i)* &
                                     REAL(density_modes(i, i, mode), KIND=dp) - &
-                                    occupation_start(i)*REAL(cross_mode(i, i), KIND=dp)
+                                    occupation_start(i)* &
+                                    REAL(DOT_PRODUCT(overlap_start_current(i, :), cross_mode(i, :)), KIND=dp)
          END DO
          response_overlap(mode) = &
             SUM(REAL(hamiltonian_step_current, KIND=dp)* &
@@ -852,15 +854,13 @@ CONTAINS
                                       eigenvectors=eigenvectors, eigenvalues=eigenvalues)
 
       work(:, :) = MATMUL(base_hamiltonian, rotation)
+      ! diag(U^H*H*U) uses the columns of the already available H*U.
+      DO i = 1, n
+         rayleigh(i) = REAL(DOT_PRODUCT(rotation(:, i), work(:, i)), KIND=dp)
+      END DO
       covector(:, :) = work(:, :)
       DO j = 1, n
          covector(:, j) = occupation_scale(j)*covector(:, j)
-      END DO
-
-      work(:, :) = MATMUL(CONJG(TRANSPOSE(rotation)), &
-                          MATMUL(base_hamiltonian, rotation))
-      DO i = 1, n
-         rayleigh(i) = REAL(work(i, i), KIND=dp)
       END DO
 
       inner(:, :) = MATMUL(CONJG(TRANSPOSE(eigenvectors)), &
