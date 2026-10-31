@@ -20,14 +20,10 @@ MODULE preconditioner_makes
                                               get_selected_ritz_vector,&
                                               set_arnoldi_initial_vector,&
                                               setup_arnoldi_env
-   USE cp_cfm_basic_linalg,             ONLY: cp_cfm_column_scale,&
-                                              cp_cfm_gemm,&
-                                              cp_cfm_get_diag,&
-                                              cp_cfm_norm,&
-                                              cp_cfm_scale_and_add,&
-                                              cp_cfm_triangular_multiply,&
-                                              cp_cfm_uplo_to_full,&
-                                              cp_cfm_vectorsnorm
+   USE cp_cfm_basic_linalg,             ONLY: &
+        cp_cfm_add_on_diag, cp_cfm_column_scale, cp_cfm_gemm, cp_cfm_get_diag, cp_cfm_norm, &
+        cp_cfm_scale, cp_cfm_scale_and_add, cp_cfm_triangular_multiply, cp_cfm_uplo_to_full, &
+        cp_cfm_vectorsnorm
    USE cp_cfm_cholesky,                 ONLY: cp_cfm_cholesky_decompose,&
                                               cp_cfm_cholesky_invert
    USE cp_cfm_diag,                     ONLY: cp_cfm_geeig,&
@@ -35,7 +31,6 @@ MODULE preconditioner_makes
    USE cp_cfm_types,                    ONLY: cp_cfm_create,&
                                               cp_cfm_get_info,&
                                               cp_cfm_release,&
-                                              cp_cfm_set_element,&
                                               cp_cfm_to_cfm,&
                                               cp_cfm_type
    USE cp_dbcsr_api,                    ONLY: &
@@ -231,14 +226,13 @@ CONTAINS
       CALL cp_cfm_to_cfm(matrix_h, matrix_tmp)
       CALL cp_cfm_gemm('N', 'C', n, n, k, -z_one, matrix_hc0, matrix_sc0, z_one, matrix_tmp)
       CALL cp_cfm_gemm('N', 'C', n, n, k, -z_one, matrix_sc0, matrix_hc0, z_one, matrix_tmp)
-      CALL cp_cfm_gemm('N', 'N', n, k, k, z_one, matrix_sc0, matrix_chc, z_zero, matrix_sc_chc)
-      CALL cp_cfm_gemm('N', 'C', n, n, k, z_one, matrix_sc_chc, matrix_sc0, z_one, matrix_tmp)
-
       ! Shift the retained reference subspace below the complementary spectrum. The caller
       ! diagonalizes and restores the original reference columns and energy labels exactly.
       shifted_evals(:) = CMPLX(preconditioner_env%occ_evals - lambda, 0.0_dp, KIND=dp)
       CALL cp_cfm_to_cfm(matrix_sc0, matrix_shifted_sc)
       CALL cp_cfm_column_scale(matrix_shifted_sc, shifted_evals)
+      ! Combine SC*(C^H*H*C) and SC*diag(epsilon-lambda) before the large rank-k update.
+      CALL cp_cfm_gemm('N', 'N', n, k, k, z_one, matrix_sc0, matrix_chc, z_one, matrix_shifted_sc)
       CALL cp_cfm_gemm('N', 'C', n, n, k, z_one, matrix_shifted_sc, matrix_sc0, z_one, matrix_tmp)
 
       CALL cp_cfm_to_cfm(matrix_s, matrix_s_copy)
@@ -1176,12 +1170,12 @@ CONTAINS
 
       CHARACTER(len=*), PARAMETER :: routineN = 'make_complex_full_single_inverse'
 
-      INTEGER                                            :: handle, i, k, n
+      INTEGER                                            :: handle, k, n
       REAL(KIND=dp)                                      :: max_ev, min_ev, pre_shift, target_edge
       REAL(KIND=dp), ALLOCATABLE, DIMENSION(:)           :: occupied_evals, operator_evals
       TYPE(cp_cfm_type) :: matrix_chc, matrix_diag_a, matrix_diag_b, matrix_diag_evec, &
-         matrix_diag_work, matrix_hc0, matrix_occ_diag_a, matrix_occ_diag_b, matrix_occ_diag_evec, &
-         matrix_occ_diag_work, matrix_operator, matrix_sc0, matrix_sc_chc
+         matrix_diag_work, matrix_hc0, matrix_occ_diag_a, matrix_occ_diag_evec, matrix_operator, &
+         matrix_sc0, matrix_sc_chc
 
       CALL timeset(routineN, handle)
 
@@ -1208,33 +1202,26 @@ CONTAINS
                          name='complex FULL_SINGLE diagonalization work')
       CALL cp_cfm_create(matrix_occ_diag_a, matrix_c0%matrix_struct, nrow=k, ncol=k, &
                          name='complex FULL_SINGLE occupied diagonalization A')
-      CALL cp_cfm_create(matrix_occ_diag_b, matrix_c0%matrix_struct, nrow=k, ncol=k, &
-                         name='complex FULL_SINGLE occupied diagonalization B', set_zero=.TRUE.)
       CALL cp_cfm_create(matrix_occ_diag_evec, matrix_c0%matrix_struct, nrow=k, ncol=k, &
                          name='complex FULL_SINGLE occupied eigenvectors')
-      CALL cp_cfm_create(matrix_occ_diag_work, matrix_c0%matrix_struct, nrow=k, ncol=k, &
-                         name='complex FULL_SINGLE occupied diagonalization work')
 
       CALL cp_cfm_gemm('N', 'N', n, k, n, z_one, matrix_h, matrix_c0, z_zero, matrix_hc0)
       CALL cp_cfm_gemm('N', 'N', n, k, n, z_one, matrix_s, matrix_c0, z_zero, matrix_sc0)
       CALL cp_cfm_gemm('C', 'N', k, k, n, z_one, matrix_c0, matrix_hc0, z_zero, matrix_chc)
 
       ! A = H - 2*S*C*(C^H*H*C)*C^H*S + S*C*C^H*S is invariant under C -> C*U.
+      ! Retain CHC for its spectrum and form SC*(I-2*CHC) in one multiplication.
+      CALL cp_cfm_to_cfm(matrix_chc, matrix_occ_diag_a)
+      CALL cp_cfm_scale(-2.0_dp, matrix_chc)
+      CALL cp_cfm_add_on_diag(matrix_chc, z_one)
       CALL cp_cfm_to_cfm(matrix_h, matrix_operator)
       CALL cp_cfm_gemm('N', 'N', n, k, k, z_one, matrix_sc0, matrix_chc, &
                        z_zero, matrix_sc_chc)
-      CALL cp_cfm_gemm('N', 'C', n, n, k, -2.0_dp*z_one, matrix_sc_chc, matrix_sc0, &
-                       z_one, matrix_operator)
-      CALL cp_cfm_gemm('N', 'C', n, n, k, z_one, matrix_sc0, matrix_sc0, &
+      CALL cp_cfm_gemm('N', 'C', n, n, k, z_one, matrix_sc_chc, matrix_sc0, &
                        z_one, matrix_operator)
 
       ALLOCATE (occupied_evals(k), operator_evals(1))
-      CALL cp_cfm_to_cfm(matrix_chc, matrix_occ_diag_a)
-      DO i = 1, k
-         CALL cp_cfm_set_element(matrix_occ_diag_b, i, i, z_one)
-      END DO
-      CALL cp_cfm_geeig(matrix_occ_diag_a, matrix_occ_diag_b, matrix_occ_diag_evec, &
-                        occupied_evals, matrix_occ_diag_work)
+      CALL cp_cfm_heevd(matrix_occ_diag_a, matrix_occ_diag_evec, occupied_evals)
       max_ev = MAXVAL(occupied_evals)
       CALL cp_cfm_to_cfm(matrix_operator, matrix_diag_a)
       CALL cp_cfm_to_cfm(matrix_s, matrix_diag_b)
@@ -1252,9 +1239,7 @@ CONTAINS
                                  ot_precond_full_single_inverse, energy_gap)
 
       DEALLOCATE (operator_evals, occupied_evals)
-      CALL cp_cfm_release(matrix_occ_diag_work)
       CALL cp_cfm_release(matrix_occ_diag_evec)
-      CALL cp_cfm_release(matrix_occ_diag_b)
       CALL cp_cfm_release(matrix_occ_diag_a)
       CALL cp_cfm_release(matrix_diag_work)
       CALL cp_cfm_release(matrix_diag_evec)
