@@ -13,6 +13,7 @@ MODULE topology_gromos
                                               cp_print_key_unit_nr
    USE cp_parser_methods,               ONLY: parser_get_next_line,&
                                               parser_get_object,&
+                                              parser_location,&
                                               parser_search_string
    USE cp_parser_types,                 ONLY: cp_parser_type,&
                                               parser_create,&
@@ -222,12 +223,19 @@ CONTAINS
             begin = 1
             IF (ntype /= 0) THEN
                DO
+                  ! End of an internal record is expected for lists continued on the next line.
                   IF (begin == 1) THEN
                      READ (parser%input_line, iostat=stat, FMT=*) itemp, itemp, ctemp, itemp, ftemp, ftemp, &
                         itemp, itemp, (ii(i), i=begin, ntype)
+                     IF (stat > 0) THEN
+                        CPABORT("Invalid GROMOS exclusion list"//TRIM(parser_location(parser)))
+                     END IF
                   ELSE IF (begin > 1) THEN
                      CALL parser_get_next_line(parser, 1)
                      READ (parser%input_line, iostat=stat, FMT=*) (ii(i), i=begin, ntype)
+                     IF (stat > 0) THEN
+                        CPABORT("Invalid GROMOS exclusion list"//TRIM(parser_location(parser)))
+                     END IF
                   END IF
                   DO i = ntype, 1, -1
                      IF (ii(i) < 0) THEN
@@ -256,9 +264,15 @@ CONTAINS
                   DO
                      IF (begin == 1) THEN
                         READ (parser%input_line, iostat=stat, FMT=*) itemp, (ii(i), i=begin, ntype)
+                        IF (stat > 0) THEN
+                           CPABORT("Invalid GROMOS 1-4 list"//TRIM(parser_location(parser)))
+                        END IF
                      ELSE IF (begin > 1) THEN
                         CALL parser_get_next_line(parser, 1)
                         READ (parser%input_line, iostat=stat, FMT=*) (ii(i), i=begin, ntype)
+                        IF (stat > 0) THEN
+                           CPABORT("Invalid GROMOS 1-4 list"//TRIM(parser_location(parser)))
+                        END IF
                      END IF
                      DO i = ntype, 1, -1
                         IF (ii(i) < 0) THEN

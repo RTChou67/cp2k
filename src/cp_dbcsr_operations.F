@@ -37,6 +37,8 @@ MODULE cp_dbcsr_operations
                                               cp_fm_release,&
                                               cp_fm_to_fm,&
                                               cp_fm_type
+   USE cp_log_handling,                 ONLY: cp_logger_get_default_io_unit,&
+                                              cp_logger_get_default_unit_nr
    USE distribution_2d_types,           ONLY: distribution_2d_get,&
                                               distribution_2d_type
    USE kinds,                           ONLY: default_string_length,&
@@ -1093,7 +1095,7 @@ CONTAINS
       CHARACTER(LEN=*), PARAMETER :: routineN = 'cp_dbcsr_plus_fm_fm_t'
 
       INTEGER                                            :: k, my_symmetry_mode, nao, npcols, &
-                                                            timing_handle
+                                                            output_unit, timing_handle
       INTEGER, DIMENSION(:), POINTER                     :: col_blk_size_left, col_dist_left, &
                                                             row_blk_size, row_dist
       LOGICAL                                            :: check_product, my_keep_sparsity
@@ -1221,10 +1223,13 @@ CONTAINS
             CALL dbcsr_add(sparse_matrix2, sparse_matrix, alpha_scalar=1.0_dp, &
                            beta_scalar=-1.0_dp)
             norm = dbcsr_frobenius_norm(sparse_matrix2)
-            WRITE (*, *) 'nao=', nao, ' k=', k, ' ncol=', ncol, ' my_alpha=', my_alpha
-            WRITE (*, *) 'PRESENT (matrix_g)', PRESENT(matrix_g)
-            WRITE (*, *) 'matrix_type=', dbcsr_get_matrix_type(sparse_matrix)
-            WRITE (*, *) 'norm(sm+alpha*v*g^t - fm+alpha*v*g^t)/n=', norm/REAL(nao, dp)
+            output_unit = cp_logger_get_default_io_unit()
+            IF (output_unit > 0) THEN
+               WRITE (output_unit, *) 'nao=', nao, ' k=', k, ' ncol=', ncol, ' my_alpha=', my_alpha
+               WRITE (output_unit, *) 'PRESENT (matrix_g)', PRESENT(matrix_g)
+               WRITE (output_unit, *) 'matrix_type=', dbcsr_get_matrix_type(sparse_matrix)
+               WRITE (output_unit, *) 'norm(sm+alpha*v*g^t - fm+alpha*v*g^t)/n=', norm/REAL(nao, dp)
+            END IF
             CALL dbcsr_release(sparse_matrix2)
             CALL dbcsr_release(sparse_matrix3)
             CALL cp_fm_release(fm_matrix)
@@ -1375,7 +1380,7 @@ CONTAINS
 
       INTEGER                                            :: bin, blk_layer, element_stack, els, &
                                                             estimated_blocks, max_blocks_per_bin, &
-                                                            nblks, nblocks, stat
+                                                            nblks, nblocks, output_unit, stat
       INTEGER, DIMENSION(:), POINTER                     :: blk_dist, blk_sizes
 
 !   ---------------------------------------------------------------------------
@@ -1389,13 +1394,14 @@ CONTAINS
          max_blocks_per_bin = CEILING(REAL(nblocks, KIND=dp)/REAL(nbins, KIND=dp))
 
          IF (debug_mod) THEN
-            WRITE (*, '(1X,A,1X,A,I7,A,I7,A)') routineP, "For", nelements, &
+            output_unit = cp_logger_get_default_unit_nr(local=.TRUE.)
+            WRITE (output_unit, '(1X,A,1X,A,I7,A,I7,A)') routineP, "For", nelements, &
                " elements and", nbins, " bins"
-            WRITE (*, '(1X,A,1X,A,I7,A)') routineP, "There are", &
+            WRITE (output_unit, '(1X,A,1X,A,I7,A)') routineP, "There are", &
                max_elements_per_block, " max elements per block"
-            WRITE (*, '(1X,A,1X,A,I7,A)') routineP, "There are", &
+            WRITE (output_unit, '(1X,A,1X,A,I7,A)') routineP, "There are", &
                nblocks, " blocks"
-            WRITE (*, '(1X,A,1X,A,I7,A)') routineP, "There are", &
+            WRITE (output_unit, '(1X,A,1X,A,I7,A)') routineP, "There are", &
                max_blocks_per_bin, " max blocks/bin"
          END IF
 
@@ -1418,7 +1424,7 @@ CONTAINS
                   nblks = nblks + 1
                   blk_dist(nblks) = bin
                   blk_sizes(nblks) = els
-                  IF (debug_mod) WRITE (*, '(1X,A,I5,A,I5,A,I5)') routineP//" Assigning", &
+                  IF (debug_mod) WRITE (output_unit, '(1X,A,I5,A,I5,A,I5)') routineP//" Assigning", &
                      els, " elements as block", nblks, " to bin", bin
                END IF
             END DO
@@ -1453,10 +1459,10 @@ CONTAINS
       END IF
 1579  FORMAT(I5, 1X, I5, 1X, I5, 1X, I5, 1X, I5, 1X, I5, 1X, I5, 1X, I5, 1X, I5, 1X, I5)
       IF (debug_mod) THEN
-         WRITE (*, '(1X,A,A)') routineP//" Distribution"
-         WRITE (*, 1579) block_distribution(:)
-         WRITE (*, '(1X,A,A)') routineP//" Sizes"
-         WRITE (*, 1579) block_size(:)
+         WRITE (output_unit, '(1X,A,A)') routineP//" Distribution"
+         WRITE (output_unit, 1579) block_distribution(:)
+         WRITE (output_unit, '(1X,A,A)') routineP//" Sizes"
+         WRITE (output_unit, 1579) block_size(:)
       END IF
    END SUBROUTINE create_bl_distribution
 
@@ -1601,7 +1607,7 @@ CONTAINS
       CHARACTER(len=*), PARAMETER :: routineN = 'dbcsr_create_dist_block_cyclic'
 
       INTEGER                                            :: nblkcols, nblkrows, npcols, nprows, &
-                                                            pdim, sz
+                                                            output_unit, pdim, sz
       INTEGER, DIMENSION(:), POINTER                     :: cd_data, rd_data
 
       ! Row sizes
@@ -1631,9 +1637,10 @@ CONTAINS
       IF (sz /= 0) col_blk_sizes(nblkcols) = sz
       !
       IF (debug_mod) THEN
-         WRITE (*, *) routineN//" nrows,nrow_block,nblkrows=", &
+         output_unit = cp_logger_get_default_unit_nr(local=.TRUE.)
+         WRITE (output_unit, *) routineN//" nrows,nrow_block,nblkrows=", &
             nrows, nrow_block, nblkrows
-         WRITE (*, *) routineN//" ncols,ncol_block,nblkcols=", &
+         WRITE (output_unit, *) routineN//" ncols,ncol_block,nblkcols=", &
             ncolumns, ncol_block, nblkcols
       END IF
       ! Calculate process row distribution
@@ -1648,9 +1655,9 @@ CONTAINS
       END DO
       !
       IF (debug_mod) THEN
-         WRITE (*, *) routineN//" row_dist", &
+         WRITE (output_unit, *) routineN//" row_dist", &
             rd_data
-         WRITE (*, *) routineN//" col_dist", &
+         WRITE (output_unit, *) routineN//" col_dist", &
             cd_data
       END IF
       !

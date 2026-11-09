@@ -28,6 +28,7 @@ MODULE cp_ddapc_util
    USE cp_ddapc_types,                  ONLY: cp_ddapc_create,&
                                               cp_ddapc_type
    USE cp_log_handling,                 ONLY: cp_get_default_logger,&
+                                              cp_logger_get_default_unit_nr,&
                                               cp_logger_type
    USE cp_output_handling,              ONLY: cp_print_key_finished_output,&
                                               cp_print_key_unit_nr
@@ -700,13 +701,14 @@ CONTAINS
 
       CHARACTER(len=*), PARAMETER :: routineN = 'debug_der_b_vector'
 
-      INTEGER                                            :: handle, i, kk, ndim
+      INTEGER                                            :: handle, i, kk, ndim, output_unit
       REAL(KIND=dp)                                      :: dx, rvec(3), v0
       REAL(KIND=dp), ALLOCATABLE, DIMENSION(:)           :: bv1, bv2, ddbv
       TYPE(cp_ddapc_type), POINTER                       :: cp_ddapc_env
 
       NULLIFY (cp_ddapc_env)
       CALL timeset(routineN, handle)
+      output_unit = cp_logger_get_default_unit_nr(local=.TRUE.)
       dx = 0.01_dp
       ndim = SIZE(particle_set)*SIZE(radii)
       ALLOCATE (bv1(ndim))
@@ -731,10 +733,11 @@ CONTAINS
          DO kk = 1, SIZE(ddbv)
             IF (ddbv(kk) > 1.0E-8_dp) THEN
                v0 = ABS(dbv(kk, i) - ddbv(kk))/ddbv(kk)*100.0_dp
-               WRITE (*, *) "Error % on B ::", v0
+               WRITE (output_unit, *) "Error % on B ::", v0
                IF (v0 > 0.1_dp) THEN
-                  WRITE (*, '(A,2I5,2F15.9)') "ERROR IN DERIVATIVE OF B VECTOR, IPARTICLE, ICOORD:", iparticle, i, &
+                  WRITE (output_unit, '(A,2I5,2F15.9)') "ERROR IN DERIVATIVE OF B VECTOR, IPARTICLE, ICOORD:", iparticle, i, &
                      dbv(kk, i), ddbv(kk)
+                  FLUSH (output_unit)
                   CPABORT("Error on B large than 0.1")
                END IF
             END IF
@@ -775,7 +778,7 @@ CONTAINS
 
       CHARACTER(len=*), PARAMETER :: routineN = 'debug_der_A_matrix'
 
-      INTEGER                                            :: handle, i, kk, ll, ndim
+      INTEGER                                            :: handle, i, kk, ll, ndim, output_unit
       REAL(KIND=dp)                                      :: dx, rvec(3), v0
       REAL(KIND=dp), ALLOCATABLE, DIMENSION(:, :)        :: Am1, Am2, ddAm, g_dot_rvec_cos, &
                                                             g_dot_rvec_sin
@@ -785,6 +788,7 @@ CONTAINS
 
       NULLIFY (cp_ddapc_env)
       CALL timeset(routineN, handle)
+      output_unit = cp_logger_get_default_unit_nr(local=.TRUE.)
       dx = 0.01_dp
       ndim = SIZE(particle_set)*SIZE(radii)
       ALLOCATE (Am1(ndim, ndim))
@@ -811,10 +815,12 @@ CONTAINS
             DO ll = 1, SIZE(ddAm, 2)
                IF (ddAm(kk, ll) > 1.0E-8_dp) THEN
                   v0 = ABS(dAm(kk, ll, i) - ddAm(kk, ll))/ddAm(kk, ll)*100.0_dp
-                  WRITE (*, *) "Error % on A ::", v0, Am1(kk, ll), Am2(kk, ll), iparticle, i, kk, ll
+                  WRITE (output_unit, *) "Error % on A ::", v0, Am1(kk, ll), Am2(kk, ll), iparticle, i, kk, ll
                   IF (v0 > 0.1_dp) THEN
-                     WRITE (*, '(A,4I5,2F15.9)') "ERROR IN DERIVATIVE OF A MATRIX, IPARTICLE, ICOORD:", iparticle, i, kk, ll, &
+                     WRITE (output_unit, '(A,4I5,2F15.9)') &
+                        "ERROR IN DERIVATIVE OF A MATRIX, IPARTICLE, ICOORD:", iparticle, i, kk, ll, &
                         dAm(kk, ll, i), ddAm(kk, ll)
+                     FLUSH (output_unit)
                      CPABORT("Error on A larger than 0.1")
                   END IF
                END IF
@@ -854,13 +860,15 @@ CONTAINS
 
       CHARACTER(len=*), PARAMETER                        :: routineN = 'debug_charge'
 
-      INTEGER                                            :: handle, i, iparticle, kk, ndim
+      INTEGER                                            :: handle, i, iparticle, kk, ndim, &
+                                                            output_unit
       REAL(KIND=dp)                                      :: dx, rvec(3)
       REAL(KIND=dp), ALLOCATABLE, DIMENSION(:)           :: ddqv
       REAL(KIND=dp), DIMENSION(:), POINTER               :: qtot1, qtot2
 
       CALL timeset(routineN, handle)
-      WRITE (*, *) "DEBUG_CHARGE_ROUTINE"
+      output_unit = cp_logger_get_default_unit_nr(local=.TRUE.)
+      WRITE (output_unit, *) "DEBUG_CHARGE_ROUTINE"
       ndim = SIZE(particle_set)*SIZE(radii)
       NULLIFY (qtot1, qtot2)
       ALLOCATE (qtot1(ndim))
@@ -880,7 +888,7 @@ CONTAINS
             ddqv(:) = (qtot1 - qtot2)/(2.0_dp*dx)
             DO kk = 1, SIZE(qtot1) - 1, SIZE(radii)
                IF (ANY(ddqv(kk:kk + 2) > 1.0E-8_dp)) THEN
-                  WRITE (*, '(A,2F12.6,F12.2)') "Error :", SUM(dqv(kk:kk + 2, iparticle, i)), SUM(ddqv(kk:kk + 2)), &
+                  WRITE (output_unit, '(A,2F12.6,F12.2)') "Error :", SUM(dqv(kk:kk + 2, iparticle, i)), SUM(ddqv(kk:kk + 2)), &
                      ABS((SUM(ddqv(kk:kk + 2)) - SUM(dqv(kk:kk + 2, iparticle, i)))/SUM(ddqv(kk:kk + 2))*100.0_dp)
                END IF
             END DO

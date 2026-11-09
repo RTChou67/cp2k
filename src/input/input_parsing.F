@@ -163,7 +163,7 @@ CONTAINS
                   CALL parser_get_object(parser, token, newline=.FALSE., &
                                          lower_to_upper=.TRUE.)
                   IF (token /= section%name) THEN
-                     PRINT *, TRIM(token), "/=", TRIM(section%name)
+                     IF (output_unit > 0) WRITE (output_unit, *) TRIM(token), "/=", TRIM(section%name)
                      compatible_end = .FALSE.
                   END IF
                END IF

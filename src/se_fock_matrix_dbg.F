@@ -9,6 +9,7 @@ MODULE se_fock_matrix_dbg
    USE cp_dbcsr_api,                    ONLY: dbcsr_p_type,&
                                               dbcsr_set
    USE cp_dbcsr_contrib,                ONLY: dbcsr_dot
+   USE cp_log_handling,                 ONLY: cp_logger_get_default_io_unit
    USE kinds,                           ONLY: dp
    USE qs_energy_types,                 ONLY: init_qs_energy,&
                                               qs_energy_type
@@ -48,7 +49,7 @@ CONTAINS
       LOGICAL, INTENT(IN)                                :: calculate_forces
       TYPE(semi_empirical_si_type), POINTER              :: store_int_env
 
-      INTEGER                                            :: ispin
+      INTEGER                                            :: ispin, output_unit
       REAL(KIND=dp)                                      :: ecoul
 
 ! Zero structures only for debugging purpose
@@ -61,18 +62,21 @@ CONTAINS
       ! Evaluate Coulomb Long-Range
       CALL build_fock_matrix_coulomb_lr(qs_env, ks_matrix, matrix_p, energy, calculate_forces, &
                                         store_int_env)
+      output_unit = cp_logger_get_default_io_unit()
 
       ! Compute the Hartree energy
       DO ispin = 1, nspins
          CALL dbcsr_dot(ks_matrix(ispin)%matrix, matrix_p(ispin)%matrix, ecoul)
          energy%hartree = energy%hartree + ecoul
 
-         WRITE (*, *) ispin, "ECOUL ", ecoul
+         IF (output_unit > 0) WRITE (output_unit, *) ispin, "ECOUL ", ecoul
       END DO
-      WRITE (*, *) "ENUC in DBG:", energy%core_overlap
+      IF (output_unit > 0) WRITE (output_unit, *) "ENUC in DBG:", energy%core_overlap
 
       ! Debug statements
-      WRITE (*, *) "TOTAL ENE", 0.5_dp*energy%hartree + energy%core_overlap
+      IF (output_unit > 0) THEN
+         WRITE (output_unit, *) "TOTAL ENE", 0.5_dp*energy%hartree + energy%core_overlap
+      END IF
       CPABORT("Debug energy for Coulomb Long-Range")
 
    END SUBROUTINE dbg_energy_coulomb_lr

@@ -13,6 +13,7 @@
 MODULE mc_coordinates
    USE cell_types,                      ONLY: cell_type,&
                                               get_cell
+   USE cp_log_handling,                 ONLY: cp_logger_get_default_io_unit
    USE cp_subsys_types,                 ONLY: cp_subsys_get,&
                                               cp_subsys_type
    USE force_env_methods,               ONLY: force_env_calc_energy_force
@@ -354,7 +355,7 @@ CONTAINS
 
       INTEGER                                            :: atom_number, choosen, end_atom, handle, &
                                                             i, iatom, imolecule, imove, &
-                                                            molecule_number
+                                                            molecule_number, output_unit
       LOGICAL                                            :: all_overlaps
       LOGICAL, ALLOCATABLE, DIMENSION(:)                 :: loverlap_array
       REAL(KIND=dp)                                      :: bias_energy, exponent, rand, &
@@ -434,10 +435,13 @@ CONTAINS
 
          IF (loverlap_array(1)) THEN
             IF (ionode) THEN
-               WRITE (*, *) start_atom, end_atom, natoms_tot
-               DO iatom = 1, natoms_tot
-                  WRITE (*, *) r(1:3, iatom, 1)
-               END DO
+               output_unit = cp_logger_get_default_io_unit()
+               IF (output_unit > 0) THEN
+                  WRITE (output_unit, *) start_atom, end_atom, natoms_tot
+                  DO iatom = 1, natoms_tot
+                     WRITE (output_unit, *) r(1:3, iatom, 1)
+                  END DO
+               END IF
             END IF
             CPABORT('CBMC swap move found an overlap in the old config')
          END IF
@@ -531,14 +535,17 @@ CONTAINS
 ! should never have 0.0 for an old weight...causes a divide by zero
 ! in the acceptance rule
          IF (ionode) THEN
-            WRITE (*, *) boltz_weights(1:nswapmoves)
-            WRITE (*, *) start_atom, end_atom, lremove
-            WRITE (*, *) loverlap_array(1:nswapmoves)
-            WRITE (*, *) natoms_tot
-            WRITE (*, *)
-            DO iatom = 1, natoms_tot
-               WRITE (*, *) r(1:3, iatom, 1)*angstrom
-            END DO
+            output_unit = cp_logger_get_default_io_unit()
+            IF (output_unit > 0) THEN
+               WRITE (output_unit, *) boltz_weights(1:nswapmoves)
+               WRITE (output_unit, *) start_atom, end_atom, lremove
+               WRITE (output_unit, *) loverlap_array(1:nswapmoves)
+               WRITE (output_unit, *) natoms_tot
+               WRITE (output_unit, *)
+               DO iatom = 1, natoms_tot
+                  WRITE (output_unit, *) r(1:3, iatom, 1)*angstrom
+               END DO
+            END IF
          END IF
          CPABORT('CBMC swap move found a bad old weight')
       END IF
@@ -567,12 +574,15 @@ CONTAINS
 ! this should never be the case, but I'm testing something
          IF (lremove) THEN
             IF (ionode) THEN
-               WRITE (*, *) boltz_weights(1:nswapmoves)
-               WRITE (*, *) start_atom, end_atom, lremove
-               WRITE (*, *) loverlap_array(1:nswapmoves)
-               DO iatom = 1, natoms_tot
-                  WRITE (*, *) r(1:3, iatom, 1)
-               END DO
+               output_unit = cp_logger_get_default_io_unit()
+               IF (output_unit > 0) THEN
+                  WRITE (output_unit, *) boltz_weights(1:nswapmoves)
+                  WRITE (output_unit, *) start_atom, end_atom, lremove
+                  WRITE (output_unit, *) loverlap_array(1:nswapmoves)
+                  DO iatom = 1, natoms_tot
+                     WRITE (output_unit, *) r(1:3, iatom, 1)
+                  END DO
+               END IF
             END IF
             CPABORT('CBMC swap move found all overlaps for the remove config')
          END IF

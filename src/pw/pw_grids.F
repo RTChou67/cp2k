@@ -38,6 +38,7 @@ MODULE pw_grids
                                               C_LOC,&
                                               C_PTR,&
                                               C_SIZE_T
+   USE cp_log_handling,                 ONLY: cp_logger_get_default_unit_nr
    USE kinds,                           ONLY: dp,&
                                               int_8,&
                                               int_size
@@ -1882,7 +1883,8 @@ CONTAINS
                      EXIT
                   END DO
                   IF (.NOT. g_found) THEN
-                     WRITE (*, "(A,I10,F20.10)") "G-vector", ig, pw_grid%gsq(ig)
+                     WRITE (cp_logger_get_default_unit_nr(local=.TRUE.), "(A,I10,F20.10)") &
+                        "G-vector", ig, pw_grid%gsq(ig)
                      CPABORT("G vector not found")
                   END IF
                   ip = ih - 1
@@ -1895,14 +1897,14 @@ CONTAINS
                      EXIT
                   END DO
                   IF (pw_grid%gidx(ig) == 0) THEN
-                     WRITE (*, "(A,2I10)") " G-Shell ", is + 1, ip + 1
-                     WRITE (*, "(A,I10,3I6,F20.10)") &
+                     WRITE (cp_logger_get_default_unit_nr(local=.TRUE.), "(A,2I10)") " G-Shell ", is + 1, ip + 1
+                     WRITE (cp_logger_get_default_unit_nr(local=.TRUE.), "(A,I10,3I6,F20.10)") &
                         " G-vector", ig, pw_grid%g_hat(1:3, ig), pw_grid%gsq(ig)
                      DO ih = 1, SIZE(ref_grid%gsq)
                         IF (pw_grid%g_hat(1, ig) /= ref_grid%g_hat(1, ih)) CYCLE
                         IF (pw_grid%g_hat(2, ig) /= ref_grid%g_hat(2, ih)) CYCLE
                         IF (pw_grid%g_hat(3, ig) /= ref_grid%g_hat(3, ih)) CYCLE
-                        WRITE (*, "(A,I10,3I6,F20.10)") &
+                        WRITE (cp_logger_get_default_unit_nr(local=.TRUE.), "(A,I10,3I6,F20.10)") &
                            " G-vector", ih, ref_grid%g_hat(1:3, ih), ref_grid%gsq(ih)
                      END DO
                      CPABORT("G vector not found")
@@ -1922,7 +1924,8 @@ CONTAINS
                      EXIT
                   END DO
                   IF (.NOT. g_found) THEN
-                     WRITE (*, "(A,I10,F20.10)") "G-vector", ig, ref_grid%gsq(ig)
+                     WRITE (cp_logger_get_default_unit_nr(local=.TRUE.), "(A,I10,F20.10)") &
+                        "G-vector", ig, ref_grid%gsq(ig)
                      CPABORT("G vector not found")
                   END IF
                   ip = ih - 1
@@ -1935,14 +1938,14 @@ CONTAINS
                      EXIT
                   END DO
                   IF (pw_grid%gidx(ig) == 0) THEN
-                     WRITE (*, "(A,2I10)") " G-Shell ", is + 1, ip + 1
-                     WRITE (*, "(A,I10,3I6,F20.10)") &
+                     WRITE (cp_logger_get_default_unit_nr(local=.TRUE.), "(A,2I10)") " G-Shell ", is + 1, ip + 1
+                     WRITE (cp_logger_get_default_unit_nr(local=.TRUE.), "(A,I10,3I6,F20.10)") &
                         " G-vector", ig, ref_grid%g_hat(1:3, ig), ref_grid%gsq(ig)
                      DO ih = 1, ng
                         IF (pw_grid%g_hat(1, ih) /= ref_grid%g_hat(1, ig)) CYCLE
                         IF (pw_grid%g_hat(2, ih) /= ref_grid%g_hat(2, ig)) CYCLE
                         IF (pw_grid%g_hat(3, ih) /= ref_grid%g_hat(3, ig)) CYCLE
-                        WRITE (*, "(A,I10,3I6,F20.10)") &
+                        WRITE (cp_logger_get_default_unit_nr(local=.TRUE.), "(A,I10,3I6,F20.10)") &
                            " G-vector", ih, pw_grid%g_hat(1:3, ih), pw_grid%gsq(ih)
                      END DO
                      CPABORT("G vector not found")

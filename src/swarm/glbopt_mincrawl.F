@@ -186,8 +186,6 @@ CONTAINS
          CALL mincrawl_register_minima(this, report)
       END IF
 
-      IF (.FALSE.) CALL print_tempdist(best_minima)
-
       best_minima => choose_promising_minima(this)
 
       IF (.NOT. ASSOCIATED(best_minima)) THEN ! no suitable minima found
@@ -282,23 +280,6 @@ CONTAINS
       END DO
 
    END FUNCTION choose_tempstep
-
-! **************************************************************************************************
-!> \brief Debugging routine, prints a minimum's temp-distribution.
-!> \param minima ...
-!> \author Ole Schuett
-! **************************************************************************************************
-   SUBROUTINE print_tempdist(minima)
-      TYPE(minima_type), POINTER                         :: minima
-
-      INTEGER                                            :: i
-
-!WRITE (*,*) "tempdist: ", SUM(minima%tempdist, DIM=1)
-
-      DO i = 1, SIZE(minima%tempdist)
-         WRITE (*, *) "tempstep: ", i, minima%tempdist(i)
-      END DO
-   END SUBROUTINE print_tempdist
 
 ! **************************************************************************************************
 !> \brief Helper routine, convertes a  discrete temp-step to a temperature.

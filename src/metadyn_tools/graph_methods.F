@@ -29,6 +29,7 @@ MODULE graph_methods
                                               point_pbc
    USE kinds,                           ONLY: dp
    USE memory_utilities,                ONLY: reallocate
+   USE machine,                         ONLY: default_output_unit
    USE periodic_table,                  ONLY: init_periodic_table,&
                                               nelem,&
                                               ptable
@@ -267,23 +268,24 @@ CONTAINS
       REAL(KIND=dp), DIMENSION(:), POINTER               :: dp_grid, x0
       INTEGER, INTENT(IN)                                :: ndw
 
-      INTEGER                                            :: i, id, iter, j, k, max_ntrust, nacc, &
+      INTEGER                                            :: i, id, iter, iw, j, k, max_ntrust, nacc, &
                                                             ntrials, pnt
       INTEGER, ALLOCATABLE, DIMENSION(:, :)              :: history
       INTEGER, DIMENSION(:), POINTER                     :: pos, pos0
       INTEGER, DIMENSION(ndim)                           :: Dpos, ntrust
       LOGICAL                                            :: do_save
       REAL(KIND=dp)                                      :: fes_now, fes_old, norm_dx, resto
-      REAL(KIND=dp), DIMENSION(:), POINTER               :: dx, rnd, xx
+      REAL(KIND=dp), DIMENSION(:), POINTER               :: dx, xx
 
       IF (ndw /= ndim) CPABORT("Not implemented for projected FES!")
 
       ntrust = ngrid/10
       ntrials = PRODUCT(ngrid)
-      WRITE (*, '(A,10I6)', ADVANCE="no") "FES| Trust hyper-radius ", ntrust
-      WRITE (*, '(A,10F12.6)') " which is equivalent to: ", ntrust*dp_grid
+      iw = default_output_unit
+      WRITE (iw, '(A,10I6)', ADVANCE="no") "FES| Trust hyper-radius ", ntrust
+      WRITE (iw, '(A,10F12.6)') " which is equivalent to: ", ntrust*dp_grid
 
-      ALLOCATE (xx(ndim), dx(ndim), pos0(ndim), rnd(ndim), pos(ndim))
+      ALLOCATE (xx(ndim), dx(ndim), pos0(ndim), pos(ndim))
       ALLOCATE (history(ndim, ntrials))
       history = 0
       nacc = 0
@@ -356,15 +358,15 @@ CONTAINS
          IF (do_save) THEN
             pnt = point_no_pbc(pos, ngrid, ndim)
             xx = x0 + dp_grid*(pos - 1)
-            WRITE (*, '(A,5F12.6)', ADVANCE="NO") "FES| Minimum found (", (xx(id), id=ndim, ndim - ndw + 1, -1)
-            WRITE (*, '(A,F12.6,A,I6)') " ). FES value = ", -fes(pnt), " Hartree. Number of Iter: ", iter
+            WRITE (iw, '(A,5F12.6)', ADVANCE="NO") "FES| Minimum found (", (xx(id), id=ndim, ndim - ndw + 1, -1)
+            WRITE (iw, '(A,F12.6,A,I6)') " ). FES value = ", -fes(pnt), " Hartree. Number of Iter: ", iter
             nacc = nacc + 1
             history(:, nacc) = pos
          END IF
       END DO Trials
-      WRITE (*, '(A,I6,A)') "FES| Number of Minimum found: ", nacc, "."
+      WRITE (iw, '(A,I6,A)') "FES| Number of Minimum found: ", nacc, "."
 
-      DEALLOCATE (xx, dx, pos0, rnd, pos)
+      DEALLOCATE (xx, dx, pos0, pos)
       DEALLOCATE (history)
 
    END SUBROUTINE fes_min
@@ -396,7 +398,7 @@ CONTAINS
       TYPE(mep_input_data_type), INTENT(IN)              :: mep_input_data
       LOGICAL                                            :: l_int
 
-      INTEGER                                            :: i, id, irep, iter, nf, nreplica, ns, &
+      INTEGER                                            :: i, id, irep, iter, iw, nf, nreplica, ns, &
                                                             pnt, unit_nr
       INTEGER, DIMENSION(:), POINTER                     :: ipos
       LOGICAL                                            :: converged
@@ -406,6 +408,7 @@ CONTAINS
       REAL(KIND=dp), DIMENSION(:, :), POINTER            :: dx, pos, pos_old
 
       IF (ndw /= ndim) CPABORT("Not implemented for projected FES!")
+      iw = default_output_unit
       nreplica = mep_input_data%nreplica
       ALLOCATE (xx(ndim), dx(ndim, nreplica), pos_old(ndim, nreplica), pos(ndim, nreplica), &
                 ipos(ndim), fes_rep(nreplica), dxx(ndim), dyy(ndim), yy(ndim), davg1(ndim), &
@@ -548,10 +551,10 @@ CONTAINS
             converged = .TRUE.
          END IF
          pos_old = pos
-         WRITE (*, *) "Iteration nr.", iter, SQRT(diff)
+         WRITE (iw, *) "Iteration nr.", iter, SQRT(diff)
       END DO
 
-      WRITE (*, *) "MEP saved on <mep.data> file."
+      WRITE (iw, *) "MEP saved on <mep.data> file."
       CALL open_file(unit_number=unit_nr, file_name="mep.data", file_action="WRITE", file_status="UNKNOWN", file_form="FORMATTED")
       DO irep = 1, nreplica
          ! compute energy and derivative for each single point of the replica
@@ -577,12 +580,14 @@ CONTAINS
 !> \param ndw ...
 !> \param l_fes_int ...
 !> \param file ...
+!> \param cube_unit output unit for the cube file
 !> \par History
 !>      12.2013 created [tlaino]
 !>      teodoro.laino .at. gmail.com
 !> \author Teodoro Laino
 ! **************************************************************************************************
-   SUBROUTINE fes_cube_write(idim, fes, pos, ndim, ngrid, dp_grid, x0, ndw, l_fes_int, file)
+   SUBROUTINE fes_cube_write(idim, fes, pos, ndim, ngrid, dp_grid, x0, ndw, l_fes_int, &
+                             file, cube_unit)
       INTEGER, INTENT(IN)                                :: idim
       REAL(KIND=dp), DIMENSION(:), POINTER               :: fes
       INTEGER, DIMENSION(:), POINTER                     :: pos
@@ -592,11 +597,12 @@ CONTAINS
       INTEGER, INTENT(IN)                                :: ndw
       LOGICAL, INTENT(IN)                                :: l_fes_int
       CHARACTER(LEN=80)                                  :: file
+      INTEGER, INTENT(IN)                                :: cube_unit
 
       CHARACTER(LEN=120)                                 :: line
       CHARACTER(LEN=5)                                   :: label, labelp
-      INTEGER                                            :: i, id(3), ii, iix, iiy, iiz, ix, iy, iz, &
-                                                            natoms, np
+      INTEGER                                            :: i, id(3), ii, iix, iiy, iiz, input_unit, ix, iy, iz, &
+                                                            iw, natoms, np
       INTEGER, DIMENSION(:), POINTER                     :: izat
       REAL(KIND=dp)                                      :: cell(3, 3), delta(3), dr(3), residual, &
                                                             rt(3)
@@ -608,18 +614,19 @@ CONTAINS
          CPABORT("ERROR: GAUSSIAN format can only handle FES on 3 CV !")
       END IF
 
-      OPEN (10, file=file, status='old')
-      CALL get_val_res(unit=10, section="&SUBSYS", subsection="&CELL")
-      READ (10, *) label, cell(1, 1), cell(2, 1), cell(3, 1)
-      READ (10, *) label, cell(1, 2), cell(2, 2), cell(3, 2)
-      READ (10, *) label, cell(1, 3), cell(2, 3), cell(3, 3)
+      iw = default_output_unit
+      CALL open_file(file_name=file, file_status="OLD", file_action="READ", unit_number=input_unit)
+      CALL get_val_res(unit=input_unit, section="&SUBSYS", subsection="&CELL")
+      READ (input_unit, *) label, cell(1, 1), cell(2, 1), cell(3, 1)
+      READ (input_unit, *) label, cell(1, 2), cell(2, 2), cell(3, 2)
+      READ (input_unit, *) label, cell(1, 3), cell(2, 3), cell(3, 3)
       rt(1) = -(cell(1, 1)/2._dp)
       rt(2) = -(cell(2, 2)/2._dp)
       rt(3) = -(cell(3, 3)/2._dp)
 
-      WRITE (*, *) 'Dumping GAUSSIAN CUBE format'
-      WRITE (*, *) 'Cell vectors'
-      WRITE (*, *)
+      WRITE (iw, *) 'Dumping GAUSSIAN CUBE format'
+      WRITE (iw, *) 'Cell vectors'
+      WRITE (iw, *)
 
       residual = 0.0d0
       DO ix = 1, 3
@@ -634,10 +641,10 @@ CONTAINS
                        "vectors pointing in the X, Y and Z directions")
       END IF
 
-      WRITE (*, *)
-      WRITE (*, *) 'Cube grid mesh: ', ngrid(1), 'x', ngrid(2), 'x', ngrid(3)
-      WRITE (*, *) 'Origin in:', rt
-      WRITE (*, *)
+      WRITE (iw, *)
+      WRITE (iw, *) 'Cube grid mesh: ', ngrid(1), 'x', ngrid(2), 'x', ngrid(3)
+      WRITE (iw, *) 'Origin in:', rt
+      WRITE (iw, *)
 
       DO ix = 1, 3
          dr(ix) = cell(ix, ix)/REAL(ngrid(ix), KIND=dp)
@@ -645,8 +652,8 @@ CONTAINS
 
       np = ngrid(1)*ngrid(2)*ngrid(3)
       ALLOCATE (rho(np), rhot(np))
-      CALL fes_write(123, idim, fes, pos, ndim, ngrid, dp_grid, x0, ndw, l_fes_int, rho)
-      WRITE (*, *) 'Internal FES transfer completed!'
+      CALL fes_write(cube_unit, idim, fes, pos, ndim, ngrid, dp_grid, x0, ndw, l_fes_int, rho)
+      WRITE (iw, *) 'Internal FES transfer completed!'
 
       ! translate cell
       DO ix = 1, 3
@@ -681,13 +688,13 @@ CONTAINS
          END DO
       END DO
 
-      REWIND (10)
-      CALL get_val_res(unit=10, section="&SUBSYS", subsection="&COORD")
+      REWIND (input_unit)
+      CALL get_val_res(unit=input_unit, section="&SUBSYS", subsection="&COORD")
       natoms = 0
       ALLOCATE (xat(1000, 3))
       ALLOCATE (izat(1000))
       DO WHILE (.TRUE.)
-         READ (10, '(A)') line
+         READ (input_unit, '(A)') line
          IF (INDEX(line, '&END') /= 0) EXIT
          natoms = natoms + 1
          READ (line, *) label, (xat(natoms, ix), ix=1, 3)
@@ -702,11 +709,12 @@ CONTAINS
             IF (TRIM(label) == TRIM(labelp)) EXIT
          END DO
          IF (i == nelem + 1) THEN
-            WRITE (*, *) TRIM(label), "In line: ", line
+            WRITE (iw, *) TRIM(label), "In line: ", line
             CPABORT("Element not recognized!")
          END IF
          izat(natoms) = i
       END DO
+      CALL close_file(input_unit)
       CALL reallocate(xat, 1, natoms, 1, 3)
       CALL reallocate(izat, 1, natoms)
 
@@ -718,23 +726,23 @@ CONTAINS
          END DO
       END DO
 
-      WRITE (123, *) "FES on CUBE"
-      WRITE (123, *) "created by fes in CP2K"
-      WRITE (123, '(i5,3f12.6)') natoms, rt(1:3)*bohr
+      WRITE (cube_unit, *) "FES on CUBE"
+      WRITE (cube_unit, *) "created by fes in CP2K"
+      WRITE (cube_unit, '(i5,3f12.6)') natoms, rt(1:3)*bohr
 
       DO ix = 1, 3
          ii = ngrid(ix)
-         WRITE (123, '(i5,4f12.6)') ii, (cell(ix, iy)/ii*bohr, iy=1, 3)
+         WRITE (cube_unit, '(i5,4f12.6)') ii, (cell(ix, iy)/ii*bohr, iy=1, 3)
       END DO
 
       DO i = 1, natoms
-         WRITE (123, '(i5,4f12.6)') izat(i), 0.0, (xat(i, ix)*bohr, ix=1, 3)
+         WRITE (cube_unit, '(i5,4f12.6)') izat(i), 0.0, (xat(i, ix)*bohr, ix=1, 3)
       END DO
 
       DO ix = 1, ngrid(1)
          DO iy = 1, ngrid(2)
 
-            WRITE (123, '(6e13.5)') (rhot(ix + (iy - 1)*ngrid(1) + (iz - 1)*ngrid(1)&
+            WRITE (cube_unit, '(6e13.5)') (rhot(ix + (iy - 1)*ngrid(1) + (iz - 1)*ngrid(1)&
                                          &*ngrid(2)), iz=1, ngrid(3))
          END DO
       END DO

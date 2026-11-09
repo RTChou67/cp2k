@@ -17,6 +17,7 @@ MODULE topology_generate_util
    USE cell_types,                      ONLY: pbc
    USE cp_log_handling,                 ONLY: cp_get_default_logger,&
                                               cp_logger_get_default_io_unit,&
+                                              cp_logger_get_default_unit_nr,&
                                               cp_logger_type,&
                                               cp_to_string
    USE cp_output_handling,              ONLY: cp_print_key_finished_output,&
@@ -149,22 +150,24 @@ CONTAINS
       CHARACTER(LEN=default_string_length), INTENT(IN)   :: molname
       INTEGER, DIMENSION(:), INTENT(INOUT)               :: id_molname
 
-      INTEGER                                            :: j, k
+      INTEGER                                            :: j, k, output_unit
 
       IF (debug_this_module) THEN
-         WRITE (*, *) "Entered with :", i
-         WRITE (*, *) TRIM(molname)//": entering with i:", i, " full series to test:: ", atom_bond_list(i)%array1
+         output_unit = cp_logger_get_default_unit_nr(local=.TRUE.)
+         WRITE (output_unit, *) "Entered with :", i
+         WRITE (output_unit, *) TRIM(molname)//": entering with i:", i, " full series to test:: ", atom_bond_list(i)%array1
          IF ((TRIM(id2str(id_molname(i))) /= "__UNDEF__") .AND. &
              (TRIM(id2str(id_molname(i))) /= TRIM(molname))) THEN
-            WRITE (*, *) "Atom (", i, ") has already a molecular name assigned ! ("//TRIM(id2str(id_molname(i)))//")."
-            WRITE (*, *) "New molecular name would be: ("//TRIM(molname)//")."
+            WRITE (output_unit, *) "Atom (", i, ") has already a molecular name assigned ! ("//TRIM(id2str(id_molname(i)))//")."
+            WRITE (output_unit, *) "New molecular name would be: ("//TRIM(molname)//")."
+            FLUSH (output_unit)
             CPABORT("Detecting something wrong in the molecular setup!")
          END IF
       END IF
       id_molname(i) = str2id(molname)
       DO j = 1, SIZE(atom_bond_list(i)%array1)
          k = atom_bond_list(i)%array1(j)
-         IF (debug_this_module) WRITE (*, *) "entering with i:", i, "testing :", k
+         IF (debug_this_module) WRITE (output_unit, *) "entering with i:", i, "testing :", k
          IF (k == -1) CYCLE
          atom_bond_list(i)%array1(j) = -1
          WHERE (atom_bond_list(k)%array1 == i) atom_bond_list(k)%array1 = -1
@@ -308,9 +311,9 @@ CONTAINS
       ALLOCATE (wrk2(natom))
       wrk1 = atom_info%map_mol_num
 
-      IF (debug_this_module) THEN
+      IF (debug_this_module .AND. iw > 0) THEN
          DO i = 1, natom
-            WRITE (*, '(2I10)') i, atom_info%map_mol_num(i)
+            WRITE (iw, '(2I10)') i, atom_info%map_mol_num(i)
          END DO
       END IF
 
@@ -324,7 +327,7 @@ CONTAINS
             last = MAXVAL(wrk2(istart:iend))
             nlocl = last - first + 1
             IF (iend - istart + 1 /= nlocl) THEN
-               IF (debug_this_module) WRITE (*, *) iend, istart, iend - istart + 1, first, last, nlocl
+               IF (debug_this_module .AND. iw > 0) WRITE (iw, *) iend, istart, iend - istart + 1, first, last, nlocl
                CALL cp_abort(__LOCATION__, &
                              "CP2K requires molecules to be contiguous and we have detected a non contiguous one!! "// &
                              "In particular a molecule defined from index ("//cp_to_string(first)//") to ("// &
@@ -342,7 +345,7 @@ CONTAINS
       last = MAXVAL(wrk2(istart:iend))
       nlocl = last - first + 1
       IF (iend - istart + 1 /= nlocl) THEN
-         IF (debug_this_module) WRITE (*, *) iend, istart, iend - istart + 1, first, last, nlocl
+         IF (debug_this_module .AND. iw > 0) WRITE (iw, *) iend, istart, iend - istart + 1, first, last, nlocl
          CALL cp_abort(__LOCATION__, &
                        "CP2K requires molecules to be contiguous and we have detected a non contiguous one!! "// &
                        "In particular a molecule defined from index ("//cp_to_string(first)//") to ("// &

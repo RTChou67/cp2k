@@ -34,6 +34,7 @@ MODULE se_fock_matrix_coulomb
    USE cp_dbcsr_operations,             ONLY: dbcsr_allocate_matrix_set,&
                                               dbcsr_deallocate_matrix_set
    USE cp_log_handling,                 ONLY: cp_get_default_logger,&
+                                              cp_logger_get_default_unit_nr,&
                                               cp_logger_type
    USE cp_output_handling,              ONLY: cp_print_key_finished_output,&
                                               cp_print_key_unit_nr
@@ -650,7 +651,8 @@ CONTAINS
                END DO
                ! Print some info about charge, dipole and quadrupole (debug purpose only)
                IF (debug_this_module) THEN
-                  WRITE (*, '(I5,F12.6,5X,3F12.6,5X,9F12.6)') iatom, se_nddo_mpole%charge(iatom), &
+                  WRITE (cp_logger_get_default_unit_nr(local=.TRUE.), '(I5,F12.6,5X,3F12.6,5X,9F12.6)') &
+                     iatom, se_nddo_mpole%charge(iatom), &
                      se_nddo_mpole%dipole(:, iatom), se_nddo_mpole%quadrupole(:, :, iatom)
                END IF
             END DO
@@ -717,7 +719,8 @@ CONTAINS
       ! Debug Statements
       IF (debug_this_module) THEN
          CALL para_env%sum(energy_glob)
-         WRITE (*, *) "TOTAL ENERGY AFTER EWALD:", energy_local + energy_glob + e_neut + e_self, &
+         WRITE (cp_logger_get_default_unit_nr(local=.TRUE.), *) &
+            "TOTAL ENERGY AFTER EWALD:", energy_local + energy_glob + e_neut + e_self, &
             energy_local, energy_glob, e_neut, e_self
       END IF
 
@@ -786,7 +789,7 @@ CONTAINS
 
       ! Debug Statements
       IF (debug_this_module) THEN
-         WRITE (*, *) "ENUC: ", enuc*0.5_dp
+         WRITE (cp_logger_get_default_unit_nr(local=.TRUE.), *) "ENUC: ", enuc*0.5_dp
       END IF
 
       DO ispin = 1, nspins

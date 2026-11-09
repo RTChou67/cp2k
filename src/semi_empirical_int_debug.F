@@ -18,6 +18,7 @@
 ! **************************************************************************************************
 SUBROUTINE check_rotmat_der(sepi, sepj, rjiv, ij_matrix, do_invert)
 
+   USE cp_log_handling, ONLY: cp_logger_get_default_unit_nr
    USE kinds, ONLY: dp
    USE semi_empirical_int_utils, ONLY: rotmat
    USE semi_empirical_types, ONLY: rotmat_create, &
@@ -63,7 +64,7 @@ SUBROUTINE check_rotmat_der(sepi, sepj, rjiv, ij_matrix, do_invert)
       imap(3) = 1
    END IF
    ! Check derivatives: analytical VS numerical
-   WRITE (*, *) "DEBUG::"//routineP
+   WRITE (cp_logger_get_default_unit_nr(local=.TRUE.), *) "DEBUG::"//routineP
    DO j = 1, 3
       x = 0.0_dp
       x(imap(j)) = dx
@@ -79,7 +80,8 @@ SUBROUTINE check_rotmat_der(sepi, sepj, rjiv, ij_matrix, do_invert)
       DO i = 1, 3
          DO k = 1, 3
             IF (.NOT. check_value(matrix_n%sp_d(j, k, i), ij_matrix%sp_d(j, k, i), dx, 0.1_dp)) THEN
-               WRITE (*, *) "ERROR for SP rotation matrix derivative SP(j,k,i), j,k,i::", j, k, i
+               WRITE (cp_logger_get_default_unit_nr(local=.TRUE.), *) &
+                  "ERROR for SP rotation matrix derivative SP(j,k,i), j,k,i::", j, k, i
                CPABORT("")
             END IF
          END DO
@@ -90,7 +92,8 @@ SUBROUTINE check_rotmat_der(sepi, sepj, rjiv, ij_matrix, do_invert)
          DO k = 1, 3
             DO l = 1, 6
                IF (.NOT. check_value(matrix_n%pp_d(j, l, k, i), ij_matrix%pp_d(j, l, k, i), dx, 0.1_dp)) THEN
-                  WRITE (*, *) "ERROR for PP rotation matrix derivative PP(j,l,k,i), j,l,k,i::", j, l, k, i
+                  WRITE (cp_logger_get_default_unit_nr(local=.TRUE.), *) &
+                     "ERROR for PP rotation matrix derivative PP(j,l,k,i), j,l,k,i::", j, l, k, i
                   CPABORT("")
                END IF
             END DO
@@ -103,7 +106,8 @@ SUBROUTINE check_rotmat_der(sepi, sepj, rjiv, ij_matrix, do_invert)
          DO i = 1, 5
             DO k = 1, 5
                IF (.NOT. check_value(matrix_n%sd_d(j, k, i), ij_matrix%sd_d(j, k, i), dx, 0.1_dp)) THEN
-                  WRITE (*, *) "ERROR for SD rotation matrix derivative SD(j,k,i), j,k,i::", j, k, i
+                  WRITE (cp_logger_get_default_unit_nr(local=.TRUE.), *) &
+                     "ERROR for SD rotation matrix derivative SD(j,k,i), j,k,i::", j, k, i
                   CPABORT("")
                END IF
             END DO
@@ -114,7 +118,8 @@ SUBROUTINE check_rotmat_der(sepi, sepj, rjiv, ij_matrix, do_invert)
             DO k = 1, 5
                DO l = 1, 15
                   IF (.NOT. check_value(matrix_n%pd_d(j, l, k, i), ij_matrix%pd_d(j, l, k, i), dx, 0.1_dp)) THEN
-                     WRITE (*, *) "ERROR for DP rotation matrix derivative DP(j,l,k,i), j,l,k,i::", j, l, k, i
+                     WRITE (cp_logger_get_default_unit_nr(local=.TRUE.), *) &
+                        "ERROR for DP rotation matrix derivative DP(j,l,k,i), j,l,k,i::", j, l, k, i
                      CPABORT("")
                   END IF
                END DO
@@ -126,7 +131,8 @@ SUBROUTINE check_rotmat_der(sepi, sepj, rjiv, ij_matrix, do_invert)
             DO k = 1, 5
                DO l = 1, 15
                   IF (.NOT. check_value(matrix_n%dd_d(j, l, k, i), ij_matrix%dd_d(j, l, k, i), dx, 0.1_dp)) THEN
-                     WRITE (*, *) "ERROR for DD rotation matrix derivative DD(j,l,k,i), j,l,k,i::", j, l, k, i
+                     WRITE (cp_logger_get_default_unit_nr(local=.TRUE.), *) &
+                        "ERROR for DD rotation matrix derivative DD(j,l,k,i), j,l,k,i::", j, l, k, i
                      CPABORT("")
                   END IF
                END DO
@@ -157,6 +163,7 @@ END SUBROUTINE check_rotmat_der
 !>      Debug routine
 ! **************************************************************************************************
 SUBROUTINE rot_2el_2c_first_debug(sepi, sepj, rijv, se_int_control, se_taper, invert, ii, kk, v_d)
+   USE cp_log_handling, ONLY: cp_logger_get_default_unit_nr
 
    USE kinds, ONLY: dp
    USE semi_empirical_int_utils, ONLY: rotmat
@@ -212,7 +219,7 @@ SUBROUTINE rot_2el_2c_first_debug(sepi, sepj, rijv, se_int_control, se_taper, in
    END IF
    limkl = indexb(kk, kk)
    ! Check derivatives: analytical VS numerical
-   WRITE (*, *) "DEBUG::"//routineP
+   WRITE (cp_logger_get_default_unit_nr(local=.TRUE.), *) "DEBUG::"//routineP
    DO j = 1, 3
       x = 0.0_dp
       x(imap(j)) = dx
@@ -242,7 +249,8 @@ SUBROUTINE rot_2el_2c_first_debug(sepi, sepj, rijv, se_int_control, se_taper, in
             ! Compute the numerical derivative
             v_n(i, k) = (v_p(i, k) - v_m(i, k))/(2.0_dp*dx)
             IF (.NOT. check_value(v_d(j, i, k), v_n(i, k), dx, 0.1_dp)) THEN
-               WRITE (*, *) "ERROR for  rot_2el_2c_first derivative V_D(j,i,k), j,i,k::", j, i, k
+               WRITE (cp_logger_get_default_unit_nr(local=.TRUE.), *) &
+                  "ERROR for  rot_2el_2c_first derivative V_D(j,i,k), j,i,k::", j, i, k
                CPABORT("")
             END IF
          END DO
@@ -266,6 +274,7 @@ END SUBROUTINE rot_2el_2c_first_debug
 !>      Debug routine
 ! **************************************************************************************************
 SUBROUTINE check_dssss_nucint_ana(sepi, sepj, r, dssss, itype, se_int_control, se_taper)
+   USE cp_log_handling, ONLY: cp_logger_get_default_unit_nr
 
    USE kinds, ONLY: dp
    USE semi_empirical_int_num, ONLY: ssss_nucint_num
@@ -303,9 +312,9 @@ SUBROUTINE check_dssss_nucint_ana(sepi, sepj, r, dssss, itype, se_int_control, s
    CALL ssss_nucint_num(sepi, sepj, rn, ssssm, itype, se_taper, se_int_control)
    nssss = od*(ssssp - ssssm)
    ! check
-   WRITE (*, *) "DEBUG::"//routineP
+   WRITE (cp_logger_get_default_unit_nr(local=.TRUE.), *) "DEBUG::"//routineP
    IF (.NOT. check_value(nssss, dssss, delta, 0.1_dp)) THEN
-      WRITE (*, *) "ERROR for SSSS derivative SSSS"
+      WRITE (cp_logger_get_default_unit_nr(local=.TRUE.), *) "ERROR for SSSS derivative SSSS"
       CPABORT("")
    END IF
 END SUBROUTINE check_dssss_nucint_ana
@@ -326,6 +335,7 @@ END SUBROUTINE check_dssss_nucint_ana
 !>      Debug routine
 ! **************************************************************************************************
 SUBROUTINE check_dcore_nucint_ana(sepi, sepj, r, dcore, itype, se_int_control, se_taper)
+   USE cp_log_handling, ONLY: cp_logger_get_default_unit_nr
 
    USE kinds, ONLY: dp
    USE semi_empirical_int_num, ONLY: core_nucint_num
@@ -365,11 +375,11 @@ SUBROUTINE check_dcore_nucint_ana(sepi, sepj, r, dcore, itype, se_int_control, s
    CALL core_nucint_num(sepi, sepj, rn, corem, itype, se_taper, se_int_control)
    ncore = od*(corep - corem)
    ! check
-   WRITE (*, *) "DEBUG::"//routineP
+   WRITE (cp_logger_get_default_unit_nr(local=.TRUE.), *) "DEBUG::"//routineP
    DO i = 1, 2
       DO j = 1, 10
          IF (.NOT. check_value(ncore(j, i), dcore(j, i), delta, 0.1_dp)) THEN
-            WRITE (*, *) "ERROR for CORE derivative CORE(j,i), j,i::", j, i
+            WRITE (cp_logger_get_default_unit_nr(local=.TRUE.), *) "ERROR for CORE derivative CORE(j,i), j,i::", j, i
             CPABORT("")
          END IF
       END DO
@@ -390,6 +400,7 @@ END SUBROUTINE check_dcore_nucint_ana
 !>      Debug routine
 ! **************************************************************************************************
 FUNCTION check_value(num, ana, minval, thrs) RESULT(passed)
+   USE cp_log_handling, ONLY: cp_logger_get_default_unit_nr
    USE kinds, ONLY: dp
    IMPLICIT NONE
    REAL(KIND=dp)                            :: num, ana, thrs, minval
@@ -398,20 +409,20 @@ FUNCTION check_value(num, ana, minval, thrs) RESULT(passed)
    passed = .TRUE.
 
    IF ((ABS(num) < minval) .AND. (ABS(ana) > minval)) THEN
-      WRITE (*, *) "WARNING ---> ", num, ana, thrs
+      WRITE (cp_logger_get_default_unit_nr(local=.TRUE.), *) "WARNING ---> ", num, ana, thrs
    ELSE IF ((ABS(num) > minval) .AND. (ABS(ana) < minval)) THEN
-      WRITE (*, *) "WARNING ---> ", num, ana, thrs
+      WRITE (cp_logger_get_default_unit_nr(local=.TRUE.), *) "WARNING ---> ", num, ana, thrs
    ELSE IF ((ABS(num) < minval) .AND. (ABS(ana) < minval)) THEN
       ! skip..
       RETURN
    END IF
    IF (ABS((num - ana)/num*100._dp) > thrs) THEN
-      WRITE (*, *) ABS(num - ana)/num*100._dp, thrs
+      WRITE (cp_logger_get_default_unit_nr(local=.TRUE.), *) ABS(num - ana)/num*100._dp, thrs
       passed = .FALSE.
    END IF
    IF (.NOT. passed) THEN
-      WRITE (*, *) "ANALYTICAL ::", ana
-      WRITE (*, *) "NUMERICAL  ::", num
+      WRITE (cp_logger_get_default_unit_nr(local=.TRUE.), *) "ANALYTICAL ::", ana
+      WRITE (cp_logger_get_default_unit_nr(local=.TRUE.), *) "NUMERICAL  ::", num
    END IF
 END FUNCTION check_value
 
@@ -434,6 +445,7 @@ END FUNCTION check_value
 !>      Debug routine
 ! **************************************************************************************************
 SUBROUTINE check_drotnuc_ana(sepi, sepj, rijv, itype, se_int_control, se_taper, e1b, e2a, de1b, de2a)
+   USE cp_log_handling, ONLY: cp_logger_get_default_unit_nr
 
    USE kinds, ONLY: dp
    USE semi_empirical_int_num, ONLY: rotnuc_num, &
@@ -479,12 +491,12 @@ SUBROUTINE check_drotnuc_ana(sepi, sepj, rijv, itype, se_int_control, se_taper, 
    lgrad = l_de1b .OR. l_de2a
    delta = 1.0E-5_dp
    ! Check value of integrals
-   WRITE (*, *) "DEBUG::"//routineP
+   WRITE (cp_logger_get_default_unit_nr(local=.TRUE.), *) "DEBUG::"//routineP
    CALL rotnuc_num(sepi, sepj, rijv, e1b2, e2a2, itype, se_int_control, se_taper=se_taper)
    IF (l_e1b) THEN
       DO j = 1, 45
          IF (.NOT. check_value(e1b2(j), e1b(j), delta, 0.1_dp)) THEN
-            WRITE (*, *) "ERROR for E1B value E1B(j), j::", j
+            WRITE (cp_logger_get_default_unit_nr(local=.TRUE.), *) "ERROR for E1B value E1B(j), j::", j
             CPABORT("")
          END IF
       END DO
@@ -492,7 +504,7 @@ SUBROUTINE check_drotnuc_ana(sepi, sepj, rijv, itype, se_int_control, se_taper, 
    IF (l_e2a) THEN
       DO J = 1, 45
          IF (.NOT. check_value(e2a2(j), e2a(j), delta, 0.1_dp)) THEN
-            WRITE (*, *) "ERROR for E2A value E2A(j), j::", j
+            WRITE (cp_logger_get_default_unit_nr(local=.TRUE.), *) "ERROR for E2A value E2A(j), j::", j
             CPABORT("")
          END IF
       END DO
@@ -508,7 +520,8 @@ SUBROUTINE check_drotnuc_ana(sepi, sepj, rijv, itype, se_int_control, se_taper, 
                ! Additional check on the value of the integral before checking derivatives
                IF (ABS(e1b2(j)) > delta) THEN
                   IF (.NOT. check_value(de1b2(i, j), de1b(i, j), delta, 0.1_dp)) THEN
-                     WRITE (*, *) "ERROR for derivative of E1B.  DE1B(i,j), i,j::", i, j
+                     WRITE (cp_logger_get_default_unit_nr(local=.TRUE.), *) &
+                        "ERROR for derivative of E1B.  DE1B(i,j), i,j::", i, j
                      CPABORT("")
                   END IF
                END IF
@@ -521,7 +534,8 @@ SUBROUTINE check_drotnuc_ana(sepi, sepj, rijv, itype, se_int_control, se_taper, 
                ! Additional check on the value of the integral before checking derivatives
                IF (ABS(e2a2(j)) > delta) THEN
                   IF (.NOT. check_value(de2a2(i, j), de2a(i, j), delta, 0.1_dp)) THEN
-                     WRITE (*, *) "ERROR for derivative of E2A.  DE2A(i,j), i,j::", i, j
+                     WRITE (cp_logger_get_default_unit_nr(local=.TRUE.), *) &
+                        "ERROR for derivative of E2A.  DE2A(i,j), i,j::", i, j
                      CPABORT("")
                   END IF
                END IF
@@ -548,6 +562,7 @@ END SUBROUTINE check_drotnuc_ana
 !>      Debug routine
 ! **************************************************************************************************
 SUBROUTINE check_dcorecore_ana(sepi, sepj, rijv, itype, se_int_control, se_taper, enuc, denuc)
+   USE cp_log_handling, ONLY: cp_logger_get_default_unit_nr
 
    USE kinds, ONLY: dp
    USE semi_empirical_int_num, ONLY: corecore_num, &
@@ -582,13 +597,14 @@ SUBROUTINE check_dcorecore_ana(sepi, sepj, rijv, itype, se_int_control, se_taper
       END FUNCTION check_value
    END INTERFACE
 
-   WRITE (*, *) "DEBUG::"//routineP
+   WRITE (cp_logger_get_default_unit_nr(local=.TRUE.), *) "DEBUG::"//routineP
    delta = 1.0E-7_dp
    ! check
    IF (PRESENT(enuc)) THEN
       CALL corecore_num(sepi, sepj, rijv, enuc_num, itype, se_int_control, se_taper)
       IF (.NOT. check_value(enuc, enuc_num, delta, 0.001_dp)) THEN
-         WRITE (*, *) "ERROR for CORE-CORE energy value (numerical different from analytical)!"
+         WRITE (cp_logger_get_default_unit_nr(local=.TRUE.), *) &
+            "ERROR for CORE-CORE energy value (numerical different from analytical)!"
          CPABORT("")
       END IF
    END IF
@@ -596,7 +612,8 @@ SUBROUTINE check_dcorecore_ana(sepi, sepj, rijv, itype, se_int_control, se_taper
       CALL dcorecore_num(sepi, sepj, rijv, denuc_num, itype, delta, se_int_control, se_taper)
       DO j = 1, 3
          IF (.NOT. check_value(denuc(j), denuc_num(j), delta, 0.001_dp)) THEN
-            WRITE (*, *) "ERROR for CORE-CORE energy derivative value (numerical different from analytical). DENUC(j), j::", j
+            WRITE (cp_logger_get_default_unit_nr(local=.TRUE.), *) &
+               "ERROR for CORE-CORE energy derivative value (numerical different from analytical). DENUC(j), j::", j
             CPABORT("")
          END IF
       END DO
@@ -620,6 +637,7 @@ END SUBROUTINE check_dcorecore_ana
 !>      Debug routine
 ! **************************************************************************************************
 SUBROUTINE check_dterep_ana(sepi, sepj, r, ri, dri, se_int_control, se_taper, lgrad)
+   USE cp_log_handling, ONLY: cp_logger_get_default_unit_nr
 
    USE kinds, ONLY: dp
    USE semi_empirical_int_num, ONLY: terep_num
@@ -663,18 +681,19 @@ SUBROUTINE check_dterep_ana(sepi, sepj, r, ri, dri, se_int_control, se_taper, lg
       nri = od*(rip - rim)
    END IF
    ! check
-   WRITE (*, *) "DEBUG::"//routineP
+   WRITE (cp_logger_get_default_unit_nr(local=.TRUE.), *) "DEBUG::"//routineP
    DO j = 1, 491
       IF (ABS(ri(j) - ri0(j)) > EPSILON(0.0_dp)) THEN
-         WRITE (*, *) "Error in value of the integral RI", j, ri(j), ri0(j)
+         WRITE (cp_logger_get_default_unit_nr(local=.TRUE.), *) "Error in value of the integral RI", j, ri(j), ri0(j)
          CPABORT("")
       END IF
       IF (lgrad) THEN
          IF (.NOT. check_value(dri(j), nri(j), delta*100.0_dp, 0.1_dp)) THEN
-            WRITE (*, *) "ERROR for derivative of RI integral, RI(j), j::", j
-            WRITE (*, *) "FULL SET OF INTEGRALS: INDX  ANAL  NUM   DIFF"
+            WRITE (cp_logger_get_default_unit_nr(local=.TRUE.), *) "ERROR for derivative of RI integral, RI(j), j::", j
+            WRITE (cp_logger_get_default_unit_nr(local=.TRUE.), *) "FULL SET OF INTEGRALS: INDX  ANAL  NUM   DIFF"
             DO i = 1, 491
-               WRITE (*, '(I5,3F15.9)') i, dri(i), nri(i), nri(i) - dri(i)
+               WRITE (cp_logger_get_default_unit_nr(local=.TRUE.), '(I5,3F15.9)') &
+                  i, dri(i), nri(i), nri(i) - dri(i)
             END DO
             CPABORT("")
          END IF
@@ -698,6 +717,7 @@ END SUBROUTINE check_dterep_ana
 !>      Debug routine
 ! **************************************************************************************************
 SUBROUTINE check_rotint_ana(sepi, sepj, rijv, w, dw, se_int_control, se_taper)
+   USE cp_log_handling, ONLY: cp_logger_get_default_unit_nr
 
    USE kinds, ONLY: dp
    USE semi_empirical_int_num, ONLY: rotint_num, &
@@ -734,13 +754,13 @@ SUBROUTINE check_rotint_ana(sepi, sepj, rijv, w, dw, se_int_control, se_taper)
    END INTERFACE
 
    delta = 1.0E-6_dp
-   WRITE (*, *) "DEBUG::"//routineP
+   WRITE (cp_logger_get_default_unit_nr(local=.TRUE.), *) "DEBUG::"//routineP
    IF (PRESENT(w)) THEN
       w2 = 0.0_dp
       CALL rotint_num(sepi, sepj, rijv, w2, se_int_control, se_taper=se_taper)
       DO j = 1, 2025
          IF (.NOT. check_value(w(j), w2(j), delta, 0.1_dp)) THEN
-            WRITE (*, *) "ERROR for integral value W(j), j::", j
+            WRITE (cp_logger_get_default_unit_nr(local=.TRUE.), *) "ERROR for integral value W(j), j::", j
             CPABORT("")
          END IF
       END DO
@@ -756,7 +776,8 @@ SUBROUTINE check_rotint_ana(sepi, sepj, rijv, w, dw, se_int_control, se_taper)
          DO j = 1, 2025
             IF ((ABS(w2(j)) > delta) .AND. (ABS(dw2(i, j)) > delta*10)) THEN
                IF (.NOT. check_value(dw(i, j), dw2(i, j), delta, 0.1_dp)) THEN
-                  WRITE (*, *) "ERROR for derivative of the integral value W(j). DW(i,j) i,j::", i, j
+                  WRITE (cp_logger_get_default_unit_nr(local=.TRUE.), *) &
+                     "ERROR for derivative of the integral value W(j). DW(i,j) i,j::", i, j
                   CPABORT("")
                END IF
             END IF

@@ -810,39 +810,6 @@ CONTAINS
    END SUBROUTINE poly_write3
 
 ! **************************************************************************************************
-!> \brief random poly with coeffiecents that are easy to print exactly,
-!>        of the given maximum size (for testing purposes)
-!> \param p ...
-!> \param maxSize ...
-!> \param minSize ...
-!> \return ...
-! **************************************************************************************************
-   FUNCTION poly_random(p, maxSize, minSize) RESULT(res)
-      REAL(dp), DIMENSION(:), INTENT(out)                :: p
-      INTEGER, INTENT(in)                                :: maxSize
-      INTEGER, INTENT(in), OPTIONAL                      :: minSize
-      INTEGER                                            :: res
-
-      INTEGER                                            :: i, myMinSize, pSize
-      REAL(dp)                                           :: g
-
-      IF (.NOT. module_initialized) CPABORT("module d3_poly not initialized")
-      myMinSize = 1
-      IF (PRESENT(minSize)) myMinSize = minSize
-      CALL RANDOM_NUMBER(g)
-      pSize = MIN(maxSize, myMinSize + INT((maxSize - myMinSize + 1)*g))
-      CPASSERT(SIZE(p) >= pSize)
-      CALL RANDOM_NUMBER(p)
-      DO i = 1, pSize
-         p(i) = REAL(INT(p(i)*200.0_dp - 100.0_dp), dp)/100.0_dp
-      END DO
-      DO i = pSize + 1, SIZE(p)
-         p(i) = 0.0_dp
-      END DO
-      res = pSize
-   END FUNCTION poly_random
-
-! **************************************************************************************************
 !> \brief returns in the polynomials pRes the transpose of the
 !> affine transformation x -> m*x+b of p
 !> \param p ...

@@ -15,6 +15,7 @@
 !> \author Roland Schmehl <Roland.Schmehl@mach.uni-karlsruhe.de>
 ! **************************************************************************************************
 MODULE fparser
+   USE cp_log_handling,                 ONLY: cp_logger_get_default_unit_nr
    USE kinds,                           ONLY: default_string_length,&
                                               rn => dp
 #include "../base/base_uses.f90"
@@ -459,6 +460,7 @@ CONTAINS
       CHARACTER(LEN=*), INTENT(in), OPTIONAL             :: Msg
 
       CHARACTER(LEN=default_string_length)               :: message
+      INTEGER                                            :: output_unit
 
 ! Original function string
 !----- -------- --------- --------- --------- --------- --------- --------- -------
@@ -468,12 +470,14 @@ CONTAINS
       ELSE
          WRITE (UNIT=message, FMT="(A)") "Syntax error in function string"
       END IF
-      WRITE (*, '(/,T2,A)') TRIM(FuncStr)
+      output_unit = cp_logger_get_default_unit_nr(local=.TRUE.)
+      WRITE (output_unit, '(/,T2,A)') TRIM(FuncStr)
       IF ((j > LBOUND(ipos, DIM=1)) .AND. (j <= UBOUND(ipos, DIM=1))) THEN
-         WRITE (*, '(A)') REPEAT(" ", ipos(j))//"?"
+         WRITE (output_unit, '(A)') REPEAT(" ", ipos(j))//"?"
       ELSE
-         WRITE (*, '(A)') REPEAT(" ", SIZE(ipos) + 1)//"?"
+         WRITE (output_unit, '(A)') REPEAT(" ", SIZE(ipos) + 1)//"?"
       END IF
+      FLUSH (output_unit)
       CPABORT(TRIM(message))
 
    END SUBROUTINE ParseErrMsg

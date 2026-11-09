@@ -19,7 +19,8 @@ MODULE tmc_analysis
                                               pbc
    USE cp_files,                        ONLY: close_file,&
                                               open_file
-   USE cp_log_handling,                 ONLY: cp_to_string
+   USE cp_log_handling,                 ONLY: cp_logger_get_default_io_unit,&
+                                              cp_to_string
    USE force_fields_input,              ONLY: read_chrg_section
    USE input_section_types,             ONLY: section_vals_get,&
                                               section_vals_get_subs_vals,&
@@ -1156,7 +1157,7 @@ CONTAINS
       CHARACTER(LEN=*), PARAMETER :: routineN = 'print_paircorrelation'
 
       CHARACTER(LEN=default_path_length)                 :: file_name
-      INTEGER                                            :: bin, file_ptr, handle, pair
+      INTEGER                                            :: bin, file_ptr, handle, output_unit, pair
       REAL(KIND=dp)                                      :: aver_box_scale(3), vol, voldr
       REAL(KIND=dp), DIMENSION(3)                        :: cell_size
 
@@ -1165,6 +1166,8 @@ CONTAINS
 
       ! start the timing
       CALL timeset(routineN, handle)
+      output_unit = -1
+      IF (ana_env%print_test_output) output_unit = cp_logger_get_default_io_unit()
 
       CALL get_cell(cell=ana_env%cell, abc=cell_size)
       aver_box_scale(:) = ana_env%pair_correl%sum_box_scale(:)/ana_env%pair_correl%conf_counter
@@ -1199,8 +1202,8 @@ CONTAINS
          END DO
          CALL close_file(unit_number=file_ptr)
 
-         IF (ana_env%print_test_output) THEN
-            WRITE (*, *) "TMC|ANALYSIS_G_R_"// &
+         IF (output_unit > 0) THEN
+            WRITE (output_unit, *) "TMC|ANALYSIS_G_R_"// &
                TRIM(ana_env%pair_correl%pairs(pair)%f_n)//"_"// &
                TRIM(ana_env%pair_correl%pairs(pair)%s_n)//"_X= ", &
                SUM(ana_env%pair_correl%g_r(pair, :)/ana_env%pair_correl%conf_counter/ &
@@ -1321,10 +1324,14 @@ CONTAINS
 ! **************************************************************************************************
    SUBROUTINE print_dipole_moment(ana_env)
       TYPE(tmc_analysis_env), POINTER                    :: ana_env
+      INTEGER                                            :: output_unit
 
       IF (ana_env%print_test_output) THEN
-         WRITE (*, *) "TMC|ANALYSIS_FINAL_CLASS_CELL_DIPOLE_MOMENT_X= ", &
-            ana_env%dip_mom%last_dip_cl(:)
+         output_unit = cp_logger_get_default_io_unit()
+         IF (output_unit > 0) THEN
+            WRITE (output_unit, *) "TMC|ANALYSIS_FINAL_CLASS_CELL_DIPOLE_MOMENT_X= ", &
+               ana_env%dip_mom%last_dip_cl(:)
+         END IF
       END IF
    END SUBROUTINE print_dipole_moment
 
@@ -1656,6 +1663,7 @@ CONTAINS
 ! **************************************************************************************************
    SUBROUTINE print_average_displacement(ana_env)
       TYPE(tmc_analysis_env), POINTER                    :: ana_env
+      INTEGER                                            :: output_unit
 
       CHARACTER(LEN=*), PARAMETER :: fmt_my = '(T2,A,"| ",A,T41,A40)', plabel = "TMC_ANA"
 
@@ -1669,9 +1677,12 @@ CONTAINS
          cp_to_string(SQRT(ana_env%displace%disp/ &
                            REAL(ana_env%displace%conf_counter, KIND=dp)))
       IF (ana_env%print_test_output) THEN
-         WRITE (*, *) "TMC|ANALYSIS_AVERAGE_CELL_DISPLACEMENT_X= ", &
-            SQRT(ana_env%displace%disp/ &
-                 REAL(ana_env%displace%conf_counter, KIND=dp))
+         output_unit = cp_logger_get_default_io_unit()
+         IF (output_unit > 0) THEN
+            WRITE (output_unit, *) "TMC|ANALYSIS_AVERAGE_CELL_DISPLACEMENT_X= ", &
+               SQRT(ana_env%displace%disp/ &
+                    REAL(ana_env%displace%conf_counter, KIND=dp))
+         END IF
       END IF
    END SUBROUTINE print_average_displacement
 END MODULE tmc_analysis

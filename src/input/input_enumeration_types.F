@@ -13,7 +13,8 @@
 ! **************************************************************************************************
 MODULE input_enumeration_types
 
-   USE cp_log_handling,                 ONLY: cp_to_string
+   USE cp_log_handling,                 ONLY: cp_logger_get_default_io_unit,&
+                                              cp_to_string
    USE kinds,                           ONLY: default_string_length
    USE string_utilities,                ONLY: a2s,&
                                               uppercase
@@ -153,7 +154,7 @@ CONTAINS
       INTEGER, INTENT(in)                                :: i
       CHARACTER(len=default_string_length)               :: res
 
-      INTEGER                                            :: j
+      INTEGER                                            :: j, output_unit
       LOGICAL                                            :: found
 
       CPASSERT(ASSOCIATED(enum))
@@ -169,13 +170,14 @@ CONTAINS
       END DO
       IF (.NOT. found) THEN
          IF (enum%strict) THEN
-            DO j = 1, SIZE(enum%desc)
-               PRINT *, TRIM(a2s(enum%desc(j)%chars))
-               PRINT *, TRIM(enum%c_vals(j))
-            END DO
-            PRINT *, enum%i_vals
-         END IF
-         IF (enum%strict) THEN
+            output_unit = cp_logger_get_default_io_unit()
+            IF (output_unit > 0) THEN
+               DO j = 1, SIZE(enum%desc)
+                  WRITE (output_unit, *) TRIM(a2s(enum%desc(j)%chars))
+                  WRITE (output_unit, *) TRIM(enum%c_vals(j))
+               END DO
+               WRITE (output_unit, *) enum%i_vals
+            END IF
             CPABORT("invalid value for enumeration:"//cp_to_string(i))
          END IF
          res = ADJUSTL(cp_to_string(i))

@@ -56,7 +56,8 @@ MODULE topology_pdb
    USE cp_output_handling,              ONLY: cp_print_key_finished_output,&
                                               cp_print_key_generate_filename,&
                                               cp_print_key_unit_nr
-   USE cp_parser_methods,               ONLY: parser_get_next_line
+   USE cp_parser_methods,               ONLY: parser_get_next_line,&
+                                              parser_location
    USE cp_parser_types,                 ONLY: cp_parser_type,&
                                               parser_create,&
                                               parser_release
@@ -185,20 +186,25 @@ CONTAINS
             ELSE
                atom_info%id_resname(natom) = id0
             END IF
-            ! Some information is not always given, so we mark it as used to prevent linters from crying
-            ! regarding never a never used variable 'istat'
+            ! Optional numeric fields retain the zero defaults used when allocating atom_info.
             READ (UNIT=line(23:26), FMT=*, IOSTAT=istat) atom_info%resid(natom)
-            MARK_USED(istat)
+            IF (istat /= 0) atom_info%resid(natom) = 0
             READ (UNIT=line(31:38), FMT=*, IOSTAT=istat) atom_info%r(1, natom)
-            MARK_USED(istat)
+            IF (istat /= 0) THEN
+               CPABORT("Invalid PDB X coordinate"//TRIM(parser_location(parser)))
+            END IF
             READ (UNIT=line(39:46), FMT=*, IOSTAT=istat) atom_info%r(2, natom)
-            MARK_USED(istat)
+            IF (istat /= 0) THEN
+               CPABORT("Invalid PDB Y coordinate"//TRIM(parser_location(parser)))
+            END IF
             READ (UNIT=line(47:54), FMT=*, IOSTAT=istat) atom_info%r(3, natom)
-            MARK_USED(istat)
+            IF (istat /= 0) THEN
+               CPABORT("Invalid PDB Z coordinate"//TRIM(parser_location(parser)))
+            END IF
             READ (UNIT=line(55:60), FMT=*, IOSTAT=istat) atom_info%occup(natom)
-            MARK_USED(istat)
+            IF (istat /= 0) atom_info%occup(natom) = 0.0_dp
             READ (UNIT=line(61:66), FMT=*, IOSTAT=istat) atom_info%beta(natom)
-            MARK_USED(istat)
+            IF (istat /= 0) atom_info%beta(natom) = 0.0_dp
             READ (UNIT=line(73:76), FMT=*, IOSTAT=istat) strtmp
             IF (istat == 0) THEN
                atom_info%id_molname(natom) = str2id(s2s(strtmp))

@@ -25,7 +25,8 @@ MODULE qs_linres_atom_current
    USE cp_control_types,                ONLY: dft_control_type
    USE cp_dbcsr_api,                    ONLY: dbcsr_get_block_p,&
                                               dbcsr_p_type
-   USE cp_log_handling,                 ONLY: cp_logger_get_default_io_unit
+   USE cp_log_handling,                 ONLY: cp_logger_get_default_io_unit,&
+                                              cp_logger_get_default_unit_nr
    USE input_constants,                 ONLY: current_gauge_atom,&
                                               current_gauge_r,&
                                               current_gauge_r_and_step_func
@@ -948,16 +949,19 @@ CONTAINS
                                  iso2 = cg_list(2, icg, iso)
                                  !
                                  IF (.NOT. (iso2 > 0 .AND. iso1 > 0)) THEN
-                                    WRITE (*, *) 'iso1=', iso1, ' iso2=', iso2, ' iso=', iso, ' icg=', icg
-                                    WRITE (*, *) '.... will stop!'
+                                    WRITE (cp_logger_get_default_unit_nr(local=.TRUE.), *) &
+                                       'iso1=', iso1, ' iso2=', iso2, ' iso=', iso, ' icg=', icg
+                                    WRITE (cp_logger_get_default_unit_nr(local=.TRUE.), *) '.... will stop!'
                                  END IF
                                  CPASSERT(iso2 > 0 .AND. iso1 > 0)
                                  !
                                  l = indso(1, iso1) + indso(1, iso2)
                                  IF (l > lmax_expansion .OR. l < 0) THEN
-                                    WRITE (*, *) 'calculate_jrho_atom_rad: 1 l', l
-                                    WRITE (*, *) 'calculate_jrho_atom_rad: 1 lmax_expansion', lmax_expansion
-                                    WRITE (*, *) '.... will stop!'
+                                    WRITE (cp_logger_get_default_unit_nr(local=.TRUE.), *) &
+                                       'calculate_jrho_atom_rad: 1 l', l
+                                    WRITE (cp_logger_get_default_unit_nr(local=.TRUE.), *) &
+                                       'calculate_jrho_atom_rad: 1 lmax_expansion', lmax_expansion
+                                    WRITE (cp_logger_get_default_unit_nr(local=.TRUE.), *) '.... will stop!'
                                  END IF
                                  CPASSERT(l <= lmax_expansion)
                                  !------------------------------------------------------------------
@@ -1062,16 +1066,19 @@ CONTAINS
                                  iso2 = dacg_list(2, icg, iso)
                                  !
                                  IF (.NOT. (iso2 > 0 .AND. iso1 > 0)) THEN
-                                    WRITE (*, *) 'iso1=', iso1, ' iso2=', iso2, ' iso=', iso, ' icg=', icg
-                                    WRITE (*, *) '.... will stop!'
+                                    WRITE (cp_logger_get_default_unit_nr(local=.TRUE.), *) &
+                                       'iso1=', iso1, ' iso2=', iso2, ' iso=', iso, ' icg=', icg
+                                    WRITE (cp_logger_get_default_unit_nr(local=.TRUE.), *) '.... will stop!'
                                  END IF
                                  CPASSERT(iso2 > 0 .AND. iso1 > 0)
                                  !
                                  l = indso(1, iso1) + indso(1, iso2)
                                  IF (l > lmax_expansion) THEN
-                                    WRITE (*, *) 'calculate_jrho_atom_rad: 1 l', l
-                                    WRITE (*, *) 'calculate_jrho_atom_rad: 1 lmax_expansion', lmax_expansion
-                                    WRITE (*, *) '.... will stop!'
+                                    WRITE (cp_logger_get_default_unit_nr(local=.TRUE.), *) &
+                                       'calculate_jrho_atom_rad: 1 l', l
+                                    WRITE (cp_logger_get_default_unit_nr(local=.TRUE.), *) &
+                                       'calculate_jrho_atom_rad: 1 lmax_expansion', lmax_expansion
+                                    WRITE (cp_logger_get_default_unit_nr(local=.TRUE.), *) '.... will stop!'
                                  END IF
                                  CPASSERT(l <= lmax_expansion)
                                  !------------------------------------------------------------------

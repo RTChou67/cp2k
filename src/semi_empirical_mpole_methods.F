@@ -10,7 +10,7 @@
 !> \author Teodoro Laino [tlaino] - 08.2008 Zurich University
 ! **************************************************************************************************
 MODULE semi_empirical_mpole_methods
-
+   USE cp_log_handling,                 ONLY: cp_logger_get_default_unit_nr
    USE input_constants,                 ONLY: do_method_pnnl
    USE kinds,                           ONLY: dp
    USE mathconstants,                   ONLY: sqrt3
@@ -64,7 +64,7 @@ CONTAINS
       INTEGER, DIMENSION(9), PARAMETER :: loc_index = [1, 2, 2, 2, 3, 3, 3, 3, 3]
 
       INTEGER                                            :: a, b, i, ind1, ind2, j, k, k1, k2, mu, &
-                                                            natorb, ndim, nr
+                                                            natorb, ndim, nr, output_unit
       REAL(KIND=dp)                                      :: dlm, tmp, wp, ws, zb, ZP, ZS, zt
       REAL(KIND=dp), DIMENSION(3, 3, 45)                 :: M2
       REAL(KIND=dp), DIMENSION(3, 45)                    :: M1
@@ -85,6 +85,7 @@ CONTAINS
          ! distribution
          NULLIFY (mpole)
          CALL amn_l(se_parameter, amn)
+         IF (debug_this_module) output_unit = cp_logger_get_default_unit_nr(local=.TRUE.)
          DO i = 1, natorb
             DO j = 1, i
                ind1 = indexa(se_map_alm(i), se_map_alm(j))
@@ -139,12 +140,12 @@ CONTAINS
                END IF
 
                IF (debug_this_module) THEN
-                  WRITE (*, '(A,2I6,A)') "Orbitals ", i, j, &
+                  WRITE (output_unit, '(A,2I6,A)') "Orbitals ", i, j, &
                      " ("//label_print_orb(i)//","//label_print_orb(j)//")"
-                  IF (mpole%task(1)) WRITE (*, '(9F12.6)') mpole%c
-                  IF (mpole%task(2)) WRITE (*, '(9F12.6)') mpole%d
-                  IF (mpole%task(3)) WRITE (*, '(9F12.6)') mpole%qc
-                  WRITE (*, *)
+                  IF (mpole%task(1)) WRITE (output_unit, '(9F12.6)') mpole%c
+                  IF (mpole%task(2)) WRITE (output_unit, '(9F12.6)') mpole%d
+                  IF (mpole%task(3)) WRITE (output_unit, '(9F12.6)') mpole%qc
+                  WRITE (output_unit, *)
                END IF
             END DO
          END DO
@@ -209,12 +210,12 @@ CONTAINS
                   ! Quadrupole
                   mpole%qq = -3._dp*M2(1:3, 1:3, indexb(i, j))
                   IF (debug_this_module) THEN
-                     WRITE (*, '(A,2I6,A)') "Orbitals ", i, j, &
+                     WRITE (output_unit, '(A,2I6,A)') "Orbitals ", i, j, &
                         " ("//label_print_orb(i)//","//label_print_orb(j)//")"
-                     WRITE (*, '(9F12.6)') mpole%cs
-                     WRITE (*, '(9F12.6)') mpole%ds
-                     WRITE (*, '(9F12.6)') mpole%qq
-                     WRITE (*, *)
+                     WRITE (output_unit, '(9F12.6)') mpole%cs
+                     WRITE (output_unit, '(9F12.6)') mpole%ds
+                     WRITE (output_unit, '(9F12.6)') mpole%qq
+                     WRITE (output_unit, *)
                   END IF
                END DO
             END DO

@@ -9,11 +9,11 @@
 !> \author Noam Bernstein [noamb] 02.2012
 ! **************************************************************************************************
 MODULE al_system_dynamics
-
    USE al_system_types,                 ONLY: al_system_type
    USE atomic_kind_types,               ONLY: atomic_kind_type,&
                                               get_atomic_kind
    USE constraint_fxd,                  ONLY: fix_atom_control
+   USE cp_log_handling,                 ONLY: cp_logger_get_default_unit_nr
    USE distribution_1d_types,           ONLY: distribution_1d_type
    USE extended_system_types,           ONLY: map_info_type
    USE force_env_types,                 ONLY: force_env_type
@@ -142,9 +142,11 @@ CONTAINS
       CHARACTER(len=*)                                   :: label
 
       INTEGER                                            :: first_atom, ikind, imol, imol_local, &
-                                                            ipart, last_atom, nmol_local
+                                                            ipart, last_atom, nmol_local, &
+                                                            output_unit
       TYPE(molecule_type), POINTER                       :: molecule
 
+      output_unit = cp_logger_get_default_unit_nr(local=.TRUE.)
       DO ikind = 1, SIZE(molecule_kind_set)
          nmol_local = local_molecules%n_el(ikind)
          DO imol_local = 1, nmol_local
@@ -153,9 +155,10 @@ CONTAINS
             CALL get_molecule(molecule, first_atom=first_atom, last_atom=last_atom)
             DO ipart = first_atom, last_atom
                IF (PRESENT(vel)) THEN
-                  WRITE (unit=*, fmt='("VEL ",A20," IPART ",I6," V ",3F20.10)') TRIM(label), ipart, vel(:, ipart)
+                  WRITE (unit=output_unit, fmt='("VEL ",A20," IPART ",I6," V ",3F20.10)') &
+                     TRIM(label), ipart, vel(:, ipart)
                ELSE
-                  WRITE (unit=*, fmt='("PARTICLE_SET%VEL ",A20," IPART ",I6," V ",3F20.10)') TRIM(label), &
+                  WRITE (unit=output_unit, fmt='("PARTICLE_SET%VEL ",A20," IPART ",I6," V ",3F20.10)') TRIM(label), &
                      ipart, particle_set(ipart)%v(:)
                END IF
             END DO

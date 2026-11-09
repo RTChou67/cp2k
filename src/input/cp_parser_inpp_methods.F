@@ -439,10 +439,10 @@ CONTAINS
                   ") resolves to false. Skipping Lines."
                WRITE (output_unit, *) TRIM(message)
             END IF
-            istat = 0
-            DO WHILE (istat == 0)
+            DO
                input_line_number = input_line_number + 1
                READ (UNIT=input_unit, FMT="(A)", IOSTAT=istat) input_line
+               IF (istat /= 0) EXIT
                IF (debug_this_module .AND. output_unit > 0) THEN
                   WRITE (UNIT=message, FMT="(1A,I6,2A)") "INPP_@IF: skipping line ", &
                      input_line_number, ": ", TRIM(input_line)

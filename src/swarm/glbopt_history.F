@@ -341,6 +341,7 @@ CONTAINS
       TYPE(history_fingerprint_type), INTENT(IN)         :: fingerprint
       INTEGER, INTENT(IN)                                :: found_i_ref
 
+      CHARACTER(len=128)                                 :: message
       INTEGER                                            :: found_i, i
       REAL(KIND=dp)                                      :: best_fp_match, Epot_dist, fp_dist
 
@@ -359,8 +360,8 @@ CONTAINS
       END DO
 
       IF (found_i /= found_i_ref) THEN
-         WRITE (*, *) found_i, found_i_ref
-         CPABORT("verify_history_lookup failed")
+         WRITE (message, '(A,I0,A,I0)') "verify_history_lookup failed: found ", found_i, ", expected ", found_i_ref
+         CPABORT(TRIM(message))
       END IF
 
    END SUBROUTINE verify_history_lookup

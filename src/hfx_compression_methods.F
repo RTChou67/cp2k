@@ -269,13 +269,11 @@ CONTAINS
             tmp_nints = (tmp_elements*64)/nbits
             CALL bits2ints_specific(nbits, tmp_nints, container%current%data(start_idx), full_array(1))
             IF (use_disk_storage) THEN
-               !! it could happen, that we are at the end of a file and we try to read
-               !! This happens in case a container has fully been filled in the compression step
-               !! but no other was needed for the current bit size
-               !! Therefore we can safely igonore an eof error
-               ! We still need to ask for it to read the data correctly, so we mark it as used
+               ! A completely filled last container has no following record, so EOF is expected.
                READ (container%unit, IOSTAT=stat) container%current%data
-               MARK_USED(stat)
+               IF (stat /= 0 .AND. stat /= iostat_end) THEN
+                  CPABORT("Failed to read HFX container")
+               END IF
                memory_usage = memory_usage + 1
                container%file_counter = container%file_counter + 1
             ELSE

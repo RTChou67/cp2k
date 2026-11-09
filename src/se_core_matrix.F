@@ -22,6 +22,7 @@ MODULE se_core_matrix
    USE cp_dbcsr_operations,             ONLY: dbcsr_allocate_matrix_set
    USE cp_dbcsr_output,                 ONLY: cp_dbcsr_write_sparse_matrix
    USE cp_log_handling,                 ONLY: cp_get_default_logger,&
+                                              cp_logger_get_default_io_unit,&
                                               cp_logger_type
    USE cp_output_handling,              ONLY: cp_p_file,&
                                               cp_print_key_finished_output,&
@@ -392,6 +393,7 @@ CONTAINS
       INTEGER                                            :: nra, nrb
       REAL(kind=dp)                                      :: ZSA, ZSB, ZPA, ZPB
       REAL(kind=dp), DIMENSION(4, 4)                     :: S
+      INTEGER                                            :: output_unit
 
       INTEGER, DIMENSION(4, 4), PARAMETER :: &
          nc1 = RESHAPE([2, 4, 4, 6, 4, 3, 6, 7, 4, 6, 4, 8, 6, 7, 8, 5], [4, 4]), &
@@ -616,7 +618,8 @@ CONTAINS
                   IF (nra == 4) THEN
                      fac1 = fac1*SQRT(4.0_dp/315.0_dp)
                   ELSE
-                     WRITE (*, *) 'nra= ', nra
+                     output_unit = cp_logger_get_default_io_unit()
+                     IF (output_unit > 0) WRITE (output_unit, *) 'nra= ', nra
                      RETURN
                   END IF
                END IF
@@ -634,7 +637,8 @@ CONTAINS
                   IF (nrb == 4) THEN
                      fac1 = fac1*SQRT(4.0_dp/315.0_dp)
                   ELSE
-                     WRITE (*, *) 'nrb= ', nrb
+                     output_unit = cp_logger_get_default_io_unit()
+                     IF (output_unit > 0) WRITE (output_unit, *) 'nrb= ', nrb
                      RETURN
                   END IF
                END IF
@@ -768,6 +772,7 @@ CONTAINS
       INTEGER                                            :: nra, nrb
       REAL(kind=dp)                                      :: ZSA, ZSB, ZPA, ZPB
       REAL(kind=dp), DIMENSION(4, 4, 3)                  :: dS
+      INTEGER                                            :: output_unit
 
       INTEGER, DIMENSION(4, 4), PARAMETER :: &
          nc1 = RESHAPE([2, 4, 4, 6, 4, 3, 6, 7, 4, 6, 4, 8, 6, 7, 8, 5], [4, 4]), &
@@ -994,7 +999,8 @@ CONTAINS
                   IF (nra == 4) THEN
                      fac1 = fac1*SQRT(4.0_dp/315.0_dp)
                   ELSE
-                     WRITE (*, *) 'nra= ', nra
+                     output_unit = cp_logger_get_default_io_unit()
+                     IF (output_unit > 0) WRITE (output_unit, *) 'nra= ', nra
                      RETURN
                   END IF
                END IF
@@ -1012,7 +1018,8 @@ CONTAINS
                   IF (nrb == 4) THEN
                      fac1 = fac1*SQRT(4.0_dp/315.0_dp)
                   ELSE
-                     WRITE (*, *) 'nrb= ', nrb
+                     output_unit = cp_logger_get_default_io_unit()
+                     IF (output_unit > 0) WRITE (output_unit, *) 'nrb= ', nrb
                      RETURN
                   END IF
                END IF
@@ -1231,6 +1238,7 @@ CONTAINS
       REAL(kind=dp)                                      :: x, AA
 
       REAL(kind=dp)                                      :: p
+      INTEGER                                            :: output_unit
 
       IF (n == 0) THEN
          p = 1.0_dp
@@ -1311,7 +1319,8 @@ CONTAINS
                                            10.0_dp + x)))))))))
                                     ELSE
                                        p = 1.0_dp
-                                       WRITE (*, *) ' n= ', n, ' in AA(n,x) '
+                                       output_unit = cp_logger_get_default_io_unit()
+                                       IF (output_unit > 0) WRITE (output_unit, *) ' n= ', n, ' in AA(n,x) '
                                     END IF
                                  END IF
                               END IF

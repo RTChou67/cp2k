@@ -19,7 +19,8 @@
 MODULE tmc_dot_tree
    USE cp_files,                        ONLY: close_file,&
                                               open_file
-   USE cp_log_handling,                 ONLY: cp_to_string
+   USE cp_log_handling,                 ONLY: cp_logger_get_default_unit_nr,&
+                                              cp_to_string
    USE tmc_file_io,                     ONLY: expand_file_name_char,&
                                               expand_file_name_temp
    USE tmc_move_types,                  ONLY: mv_type_swap_conf
@@ -399,7 +400,8 @@ CONTAINS
             IF (.TRUE.) WRITE (list_of_nr, *) ref_count, ' | '
             tmp_pt_list_elem => tmp_pt_list_elem%next
          END DO
-         WRITE (*, *) "mark subtree", tree_element%sub_tree_nr, " node", tree_element%nr, " with status ", &
+         WRITE (cp_logger_get_default_unit_nr(local=.TRUE.), *) &
+            "mark subtree", tree_element%sub_tree_nr, " node", tree_element%nr, " with status ", &
             tree_element%stat, "ref ", TRIM(ADJUSTL(list_of_nr))
       END IF
 
@@ -421,7 +423,8 @@ CONTAINS
       CPASSERT(ASSOCIATED(gt_tree_element))
       CPASSERT(ASSOCIATED(tmc_params))
 
-      IF (DEBUG > 8) WRITE (*, *) "mark global tree node color", gt_tree_element%nr, gt_tree_element%stat
+      IF (DEBUG > 8) WRITE (cp_logger_get_default_unit_nr(local=.TRUE.), *) &
+         "mark global tree node color", gt_tree_element%nr, gt_tree_element%stat
       CALL write_color(node_nr=gt_tree_element%nr, stat=gt_tree_element%stat, &
                        filename=get_dot_file_name(tmc_params, 0))
    END SUBROUTINE create_global_tree_dot_color

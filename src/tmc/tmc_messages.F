@@ -17,7 +17,9 @@
 !> \author Mandes
 ! **************************************************************************************************
 MODULE tmc_messages
-   USE cp_log_handling,                 ONLY: cp_to_string
+   USE cp_log_handling,                 ONLY: cp_logger_get_default_io_unit,&
+                                              cp_logger_get_default_unit_nr,&
+                                              cp_to_string
    USE kinds,                           ONLY: default_string_length,&
                                               dp
    USE message_passing,                 ONLY: mp_any_source,&
@@ -157,10 +159,11 @@ CONTAINS
          IF ((DEBUG >= 7) .AND. (dest /= bcast_group) .AND. &
              (dest /= MASTER_COMM_ID)) THEN
             IF (PRESENT(elem)) THEN
-               WRITE (*, *) "send element info to ", dest, " of type ", msg_type, "of subtree", elem%sub_tree_nr, &
+               WRITE (cp_logger_get_default_unit_nr(local=.TRUE.), *) &
+                  "send element info to ", dest, " of type ", msg_type, "of subtree", elem%sub_tree_nr, &
                   "elem", elem%nr
             ELSE
-               WRITE (*, *) "send element info to ", dest, " of type ", msg_type
+               WRITE (cp_logger_get_default_unit_nr(local=.TRUE.), *) "send element info to ", dest, " of type ", msg_type
             END IF
          END IF
          SELECT CASE (msg_type)
@@ -213,7 +216,7 @@ CONTAINS
             !TODO send characters CALL para_env%send(m_send%task_char, dest, message_tag)
          END IF
          IF (DEBUG >= 1) THEN
-            WRITE (*, *) "TMC|message: ID: ", para_env%mepos, &
+            WRITE (cp_logger_get_default_unit_nr(local=.TRUE.), *) "TMC|message: ID: ", para_env%mepos, &
                " send element info to   ", dest, " of stat ", m_send%info(1), &
                " with size int/real/char", m_send%info(2:), " with comm ", &
                para_env%get_handle(), " and tag ", message_tag
@@ -293,7 +296,7 @@ CONTAINS
             CALL para_env%recv(m_send%info, dest, message_tag)
          END IF
          IF (DEBUG >= 1) THEN
-            WRITE (*, *) "TMC|message: ID: ", para_env%mepos, &
+            WRITE (cp_logger_get_default_unit_nr(local=.TRUE.), *) "TMC|message: ID: ", para_env%mepos, &
                " recv element info from ", dest, " of stat ", m_send%info(1), &
                " with size int/real/char", m_send%info(2:)
          END IF
@@ -913,7 +916,7 @@ CONTAINS
       TYPE(message_send), POINTER                        :: m_send
       TYPE(tmc_param_type), POINTER                      :: tmc_params
 
-      INTEGER                                            :: counter
+      INTEGER                                            :: counter, output_unit
 
       CPASSERT(ASSOCIATED(elem))
       CPASSERT(ASSOCIATED(m_send))
@@ -926,9 +929,13 @@ CONTAINS
          counter = 1
          IF (elem%sub_tree_nr /= m_send%task_int(counter + 1) .OR. &
              elem%nr /= m_send%task_int(counter + 3)) THEN
-            WRITE (*, *) "ERROR: read_energy_result: master got energy result of subtree elem ", &
-               m_send%task_int(counter + 1), m_send%task_int(counter + 3), &
-               " but expect result of subtree elem", elem%sub_tree_nr, elem%nr
+            output_unit = cp_logger_get_default_io_unit()
+            IF (output_unit > 0) THEN
+               WRITE (output_unit, *) &
+                  "ERROR: read_energy_result: master got energy result of subtree elem ", &
+                  m_send%task_int(counter + 1), m_send%task_int(counter + 3), &
+                  " but expect result of subtree elem", elem%sub_tree_nr, elem%nr
+            END IF
             CPABORT("read_energy_result: got energy result from unexpected tree element.")
          END IF
       ELSE

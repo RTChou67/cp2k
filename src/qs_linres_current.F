@@ -593,7 +593,7 @@ CONTAINS
          igrid_level, iiB, iiiB, ikind, ikind_old, ipgf, iset, iset_old, itask, ithread, jatom, &
          jatom_old, jkind, jkind_old, jpgf, jset, jset_old, maxco, maxpgf, maxset, maxsgf, &
          maxsgf_set, na1, na2, natom, nb1, nb2, ncoa, ncob, nimages, nkind, nseta, nsetb, ntasks, &
-         nthread, sgfa, sgfb
+         nthread, output_unit, sgfa, sgfb
       INTEGER, DIMENSION(:), POINTER                     :: la_max, la_min, lb_max, lb_min, npgfa, &
                                                             npgfb, nsgfa, nsgfb
       INTEGER, DIMENSION(:, :), POINTER                  :: first_sgfa, first_sgfb
@@ -701,6 +701,7 @@ CONTAINS
       END DO
       eps_rho_rspace = dft_control%qs_control%eps_rho_rspace
       nthread = 1
+      output_unit = cp_logger_get_default_io_unit()
 
       !   *** Allocate work storage ***
       CALL get_qs_kind_set(qs_kind_set=qs_kind_set, &
@@ -903,12 +904,20 @@ CONTAINS
                 UBOUND(my_rho, 3) /= UBOUND(my_current, 3) .OR. &
                 UBOUND(my_rho, 2) /= UBOUND(my_current, 2) .OR. &
                 UBOUND(my_rho, 1) /= UBOUND(my_current, 1)) THEN
-               WRITE (*, *) 'LBOUND(my_rho,3),LBOUND(my_current,3)', LBOUND(my_rho, 3), LBOUND(my_current, 3)
-               WRITE (*, *) 'LBOUND(my_rho,2),LBOUND(my_current,2)', LBOUND(my_rho, 2), LBOUND(my_current, 2)
-               WRITE (*, *) 'LBOUND(my_rho,1),LBOUND(my_current,1)', LBOUND(my_rho, 1), LBOUND(my_current, 1)
-               WRITE (*, *) 'UBOUND(my_rho,3),UBOUND(my_current,3)', UBOUND(my_rho, 3), UBOUND(my_current, 3)
-               WRITE (*, *) 'UBOUND(my_rho,2),UBOUND(my_current,2)', UBOUND(my_rho, 2), UBOUND(my_current, 2)
-               WRITE (*, *) 'UBOUND(my_rho,1),UBOUND(my_current,1)', UBOUND(my_rho, 1), UBOUND(my_current, 1)
+               IF (output_unit > 0) THEN
+                  WRITE (output_unit, *) 'LBOUND(my_rho,3),LBOUND(my_current,3)', &
+                     LBOUND(my_rho, 3), LBOUND(my_current, 3)
+                  WRITE (output_unit, *) 'LBOUND(my_rho,2),LBOUND(my_current,2)', &
+                     LBOUND(my_rho, 2), LBOUND(my_current, 2)
+                  WRITE (output_unit, *) 'LBOUND(my_rho,1),LBOUND(my_current,1)', &
+                     LBOUND(my_rho, 1), LBOUND(my_current, 1)
+                  WRITE (output_unit, *) 'UBOUND(my_rho,3),UBOUND(my_current,3)', &
+                     UBOUND(my_rho, 3), UBOUND(my_current, 3)
+                  WRITE (output_unit, *) 'UBOUND(my_rho,2),UBOUND(my_current,2)', &
+                     UBOUND(my_rho, 2), UBOUND(my_current, 2)
+                  WRITE (output_unit, *) 'UBOUND(my_rho,1),UBOUND(my_current,1)', &
+                     UBOUND(my_rho, 1), UBOUND(my_current, 1)
+               END IF
                CPABORT("Bug")
             END IF
 
@@ -919,12 +928,20 @@ CONTAINS
                 UBOUND(my_rho, 3) /= UBOUND(my_gauge, 3) .OR. &
                 UBOUND(my_rho, 2) /= UBOUND(my_gauge, 2) .OR. &
                 UBOUND(my_rho, 1) /= UBOUND(my_gauge, 1)) THEN
-               WRITE (*, *) 'LBOUND(my_rho,3),LBOUND(my_gauge,3)', LBOUND(my_rho, 3), LBOUND(my_gauge, 3)
-               WRITE (*, *) 'LBOUND(my_rho,2),LBOUND(my_gauge,2)', LBOUND(my_rho, 2), LBOUND(my_gauge, 2)
-               WRITE (*, *) 'LBOUND(my_rho,1),LBOUND(my_gauge,1)', LBOUND(my_rho, 1), LBOUND(my_gauge, 1)
-               WRITE (*, *) 'UBOUND(my_rho,3),UbOUND(my_gauge,3)', UBOUND(my_rho, 3), UBOUND(my_gauge, 3)
-               WRITE (*, *) 'UBOUND(my_rho,2),UBOUND(my_gauge,2)', UBOUND(my_rho, 2), UBOUND(my_gauge, 2)
-               WRITE (*, *) 'UBOUND(my_rho,1),UBOUND(my_gauge,1)', UBOUND(my_rho, 1), UBOUND(my_gauge, 1)
+               IF (output_unit > 0) THEN
+                  WRITE (output_unit, *) 'LBOUND(my_rho,3),LBOUND(my_gauge,3)', &
+                     LBOUND(my_rho, 3), LBOUND(my_gauge, 3)
+                  WRITE (output_unit, *) 'LBOUND(my_rho,2),LBOUND(my_gauge,2)', &
+                     LBOUND(my_rho, 2), LBOUND(my_gauge, 2)
+                  WRITE (output_unit, *) 'LBOUND(my_rho,1),LBOUND(my_gauge,1)', &
+                     LBOUND(my_rho, 1), LBOUND(my_gauge, 1)
+                  WRITE (output_unit, *) 'UBOUND(my_rho,3),UbOUND(my_gauge,3)', &
+                     UBOUND(my_rho, 3), UBOUND(my_gauge, 3)
+                  WRITE (output_unit, *) 'UBOUND(my_rho,2),UBOUND(my_gauge,2)', &
+                     UBOUND(my_rho, 2), UBOUND(my_gauge, 2)
+                  WRITE (output_unit, *) 'UBOUND(my_rho,1),UBOUND(my_gauge,1)', &
+                     UBOUND(my_rho, 1), UBOUND(my_gauge, 1)
+               END IF
                CPABORT("Bug")
             END IF
          END DO
@@ -1563,20 +1580,6 @@ CONTAINS
          END DO
          END DO
          !
-         IF (.FALSE.) THEN
-            DO kbox = 0, nbox(3) - 1
-            DO jbox = 0, nbox(2) - 1
-            DO ibox = 0, nbox(1) - 1
-               WRITE (*, *) 'box=', ibox, jbox, kbox
-               WRITE (*, *) 'nbr atom=', box_ptr(ibox + 1, jbox, kbox) - box_ptr(ibox, jbox, kbox)
-               DO iatom = box_ptr(ibox, jbox, kbox), box_ptr(ibox + 1, jbox, kbox) - 1
-                  WRITE (*, *) 'iatom=', iatom
-                  WRITE (*, '(A,3E14.6)') 'coor=', box_data(:, iatom)
-               END DO
-            END DO
-            END DO
-            END DO
-         END IF
          DEALLOCATE (ratom)
       END SUBROUTINE box_atoms
 
@@ -1760,7 +1763,7 @@ CONTAINS
       INTEGER                                            :: handle, i, iatom, ibeg, ibox, iend, &
                                                             ifind, ii, imax, imin, j, jatom, jbox, &
                                                             jmax, jmin, k, kbox, kmax, kmin, &
-                                                            natms, natms_local
+                                                            natms, natms_local, output_unit
       REAL(dp)                                           :: gauge_atom_radius, offset(3), scale
       REAL(dp), ALLOCATABLE, DIMENSION(:, :)             :: ratom
       REAL(dp), DIMENSION(:, :), POINTER                 :: r_ptr
@@ -1771,6 +1774,7 @@ CONTAINS
       TYPE(qs_kind_type), DIMENSION(:), POINTER          :: qs_kind_set
 
          CALL timeset(routineN, handle)
+         output_unit = cp_logger_get_default_io_unit()
 
          CALL get_qs_env(qs_env=qs_env, &
                          qs_kind_set=qs_kind_set, &
@@ -1826,21 +1830,6 @@ CONTAINS
          END DO
          END DO
          !
-         IF (.FALSE.) THEN
-            DO kbox = 0, nbox(3) - 1
-            DO jbox = 0, nbox(2) - 1
-            DO ibox = 0, nbox(1) - 1
-               IF (box_ptr(ibox + 1, jbox, kbox) - box_ptr(ibox, jbox, kbox) > 0) THEN
-                  WRITE (*, *) 'box=', ibox, jbox, kbox
-                  WRITE (*, *) 'nbr atom=', box_ptr(ibox + 1, jbox, kbox) - box_ptr(ibox, jbox, kbox)
-                  DO iatom = box_ptr(ibox, jbox, kbox), box_ptr(ibox + 1, jbox, kbox) - 1
-                     WRITE (*, '(A,I3,3E14.6)') 'coor=', iatom, box_data(:, iatom)
-                  END DO
-               END IF
-            END DO
-            END DO
-            END DO
-         END IF
          !
          NULLIFY (box)
          ALLOCATE (box(0:nbox(1) - 1, 0:nbox(2) - 1, 0:nbox(3) - 1))
@@ -1905,70 +1894,38 @@ CONTAINS
          END DO
          END DO
 
-         IF (.FALSE.) THEN
-            DO k = 0, nbox(3) - 1
-            DO j = 0, nbox(2) - 1
-            DO i = 0, nbox(1) - 1
-               IF (box(i, j, k)%n > 0) THEN
-                  WRITE (*, *)
-                  WRITE (*, *) 'box=', i, j, k
-                  box_center(1) = (REAL(i, dp) + 0.5_dp)*dbox(1)
-                  box_center(2) = (REAL(j, dp) + 0.5_dp)*dbox(2)
-                  box_center(3) = (REAL(k, dp) + 0.5_dp)*dbox(3)
-                  box_center = pbc(box_center, cell)
-                  WRITE (*, '(A,3E14.6)') 'box_center=', box_center
-                  WRITE (*, *) 'nbr atom=', box(i, j, k)%n
-                  r_ptr => box(i, j, k)%r
-                  DO iatom = 1, box(i, j, k)%n
-                     WRITE (*, '(A,I3,3E14.6)') 'coor=', iatom, r_ptr(:, iatom)
-                     r(:) = pbc(box_center(:) - r_ptr(:, iatom), cell)
-                     IF (ABS(r(1)) > (scale + 0.5_dp)*dbox(1) .OR. &
-                         ABS(r(2)) > (scale + 0.5_dp)*dbox(2) .OR. &
-                         ABS(r(3)) > (scale + 0.5_dp)*dbox(3)) THEN
-                        WRITE (*, *) 'error too many atoms'
-                        WRITE (*, *) 'dist=', ABS(r(:))
-                        WRITE (*, *) 'large_dist=', (scale + 0.5_dp)*dbox
-                        CPABORT("Some atoms are too far from box center")
-                     END IF
-                  END DO
-               END IF
-            END DO ! list
-            END DO
-            END DO
-         END IF
-
-         IF (.TRUE.) THEN
-            DO k = 0, nbox(3) - 1
-            DO j = 0, nbox(2) - 1
-            DO i = 0, nbox(1) - 1
-               box_center(1) = (REAL(i, dp) + 0.5_dp)*dbox(1)
-               box_center(2) = (REAL(j, dp) + 0.5_dp)*dbox(2)
-               box_center(3) = (REAL(k, dp) + 0.5_dp)*dbox(3)
-               box_center = pbc(box_center, cell)
-               r_ptr => box(i, j, k)%r
-               DO iatom = 1, natms
-                  r(:) = pbc(box_center(:) - ratom(:, iatom), cell)
-                  ifind = 0
-                  DO jatom = 1, box(i, j, k)%n
-                     IF (SUM(ABS(ratom(:, iatom) - r_ptr(:, jatom))) < 1E-10_dp) ifind = 1
-                  END DO
-
-                  IF (ifind == 0) THEN
-                     ! SQRT(DOT_PRODUCT(r, r)) < gauge_atom_radius
-                     IF (DOT_PRODUCT(r, r) < (gauge_atom_radius*gauge_atom_radius)) THEN
-                        WRITE (*, *) 'error atom too close'
-                        WRITE (*, *) 'iatom', iatom
-                        WRITE (*, *) 'box_center', box_center
-                        WRITE (*, *) 'ratom', ratom(:, iatom)
-                        WRITE (*, *) 'gauge_atom_radius', gauge_atom_radius
-                        CPABORT("Some atoms are too close within gauge_atom_radius")
-                     END IF
-                  END IF
+         DO k = 0, nbox(3) - 1
+         DO j = 0, nbox(2) - 1
+         DO i = 0, nbox(1) - 1
+            box_center(1) = (REAL(i, dp) + 0.5_dp)*dbox(1)
+            box_center(2) = (REAL(j, dp) + 0.5_dp)*dbox(2)
+            box_center(3) = (REAL(k, dp) + 0.5_dp)*dbox(3)
+            box_center = pbc(box_center, cell)
+            r_ptr => box(i, j, k)%r
+            DO iatom = 1, natms
+               r(:) = pbc(box_center(:) - ratom(:, iatom), cell)
+               ifind = 0
+               DO jatom = 1, box(i, j, k)%n
+                  IF (SUM(ABS(ratom(:, iatom) - r_ptr(:, jatom))) < 1E-10_dp) ifind = 1
                END DO
-            END DO ! list
+
+               IF (ifind == 0) THEN
+                  ! SQRT(DOT_PRODUCT(r, r)) < gauge_atom_radius
+                  IF (DOT_PRODUCT(r, r) < (gauge_atom_radius*gauge_atom_radius)) THEN
+                     IF (output_unit > 0) THEN
+                        WRITE (output_unit, *) 'error atom too close'
+                        WRITE (output_unit, *) 'iatom', iatom
+                        WRITE (output_unit, *) 'box_center', box_center
+                        WRITE (output_unit, *) 'ratom', ratom(:, iatom)
+                        WRITE (output_unit, *) 'gauge_atom_radius', gauge_atom_radius
+                     END IF
+                     CPABORT("Some atoms are too close within gauge_atom_radius")
+                  END IF
+               END IF
             END DO
-            END DO
-         END IF
+         END DO ! list
+         END DO
+         END DO
 
          DEALLOCATE (ratom)
 

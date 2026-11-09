@@ -203,8 +203,7 @@ CONTAINS
       CALL search(unit, TRIM(section), line, stat=stat)
 
       IF (stat /= 0) THEN
-         WRITE (*, *) "Pattern: "//TRIM(section)//" not found in input file!"
-         CPABORT("Search failed!")
+         CPABORT("Pattern: "//TRIM(section)//" not found in input file!")
       END IF
 
       IF (PRESENT(keyword)) THEN

@@ -164,7 +164,7 @@ CONTAINS
          output_unit = logger%default_local_unit_nr
          swarm_mpi%master_output_path = output_unit2path(output_unit)
          IF (output_unit /= default_output_unit) THEN
-            CLOSE (output_unit)
+            CALL close_file(output_unit)
          END IF
       END IF
 

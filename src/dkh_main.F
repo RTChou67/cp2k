@@ -25,6 +25,7 @@ MODULE dkh_main
                                               cp_fm_release,&
                                               cp_fm_to_fm,&
                                               cp_fm_type
+   USE cp_log_handling,                 ONLY: cp_logger_get_default_unit_nr
    USE kinds,                           ONLY: dp
    USE parallel_gemm_api,               ONLY: parallel_gemm
    USE physcon,                         ONLY: c_light_au
@@ -317,7 +318,7 @@ CONTAINS
       REAL(KIND=dp), DIMENSION(:), INTENT(IN)            :: tt
       REAL(KIND=dp), DIMENSION(:), INTENT(OUT)           :: e
 
-      INTEGER                                            :: i
+      INTEGER                                            :: i, output_unit
       REAL(KIND=dp)                                      :: con, con2, prea, ratio, tv1, tv2, tv3, &
                                                             tv4
 
@@ -327,7 +328,8 @@ CONTAINS
 
       DO i = 1, n
          IF (tt(i) < 0.0_dp) THEN
-            WRITE (*, *) ' dkh_main.F | tt(', i, ') = ', tt(i)
+            output_unit = cp_logger_get_default_unit_nr(local=.TRUE.)
+            WRITE (output_unit, *) ' dkh_main.F | tt(', i, ') = ', tt(i)
          END IF
 
          !       If T is sufficiently small, use series expansion to avoid
@@ -1483,13 +1485,14 @@ CONTAINS
       REAL(KIND=dp), DIMENSION(:), INTENT(IN)            :: tt
       REAL(KIND=dp), DIMENSION(:), INTENT(OUT)           :: e
 
-      INTEGER                                            :: i
+      INTEGER                                            :: i, output_unit
       REAL(KIND=dp)                                      :: con, con2, prea, ratio, tv1, tv2, tv3, &
                                                             tv4
 
       DO i = 1, n
          IF (tt(i) < 0.0_dp) THEN
-            WRITE (*, *) ' dkh_main.F | tt(', i, ') = ', tt(i)
+            output_unit = cp_logger_get_default_unit_nr(local=.TRUE.)
+            WRITE (output_unit, *) ' dkh_main.F | tt(', i, ') = ', tt(i)
          END IF
 
          !       Calculate some constants

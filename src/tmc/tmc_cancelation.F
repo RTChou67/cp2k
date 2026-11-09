@@ -25,6 +25,7 @@
 
 MODULE tmc_cancelation
    USE cp_log_handling,                 ONLY: cp_to_string
+   USE kinds,                           ONLY: default_string_length
    USE tmc_dot_tree,                    ONLY: create_dot_color
    USE tmc_tree_types,                  ONLY: &
         add_to_list, elem_list_type, status_accepted, status_accepted_result, &
@@ -57,6 +58,7 @@ CONTAINS
 
       CHARACTER(LEN=*), PARAMETER :: routineN = 'add_to_canceling_list'
 
+      CHARACTER(len=default_string_length)               :: warning_message
       INTEGER                                            :: handle
       LOGICAL                                            :: need_to_cancel
 
@@ -89,8 +91,10 @@ CONTAINS
                status_canceled_ener)
          CASE (status_deleted_result, status_deleted)
             ! if deallocation is deactivated, should not be
-            CPWARN("try to add deleted element cancelation list ")
-            WRITE (*, *) "WARNING: try to cancel subtree, element ", elem%sub_tree_nr, elem%nr, ", with status ", elem%stat
+            warning_message = "try to add deleted element to cancelation list: subtree "// &
+                              cp_to_string(elem%sub_tree_nr)//", element "//cp_to_string(elem%nr)//", status "// &
+                              cp_to_string(elem%stat)
+            CPWARN(warning_message)
          CASE DEFAULT
             CALL cp_abort(__LOCATION__, &
                           "try to add element with unknown status to cancelation list (stat=" &

@@ -23,8 +23,7 @@ MODULE qs_fb_env_methods
    USE cp_dbcsr_operations,             ONLY: copy_dbcsr_to_fm,&
                                               dbcsr_allocate_matrix_set,&
                                               dbcsr_deallocate_matrix_set
-   USE cp_fm_basic_linalg,              ONLY: cp_fm_gemm,&
-                                              cp_fm_symm,&
+   USE cp_fm_basic_linalg,              ONLY: cp_fm_symm,&
                                               cp_fm_triangular_invert,&
                                               cp_fm_triangular_multiply,&
                                               cp_fm_uplo_to_full
@@ -553,12 +552,12 @@ CONTAINS
          ! convert mo_coeff_filtered back to original basis
          CALL cp_fm_set_all(matrix=mo_coeff, alpha=0.0_dp)
          CALL copy_dbcsr_to_fm(matrix_filter(ispin)%matrix, fm_matrix_filter)
-         CALL cp_fm_gemm("N", "N", &
-                         original_nfullrowsORcols_total, &
-                         my_nmo, &
-                         filtered_nfullrowsORcols_total, &
-                         1.0_dp, fm_matrix_filter, mo_coeff_filtered, &
-                         0.0_dp, mo_coeff)
+         CALL parallel_gemm("N", "N", &
+                            original_nfullrowsORcols_total, &
+                            my_nmo, &
+                            filtered_nfullrowsORcols_total, &
+                            1.0_dp, fm_matrix_filter, mo_coeff_filtered, &
+                            0.0_dp, mo_coeff)
 
       END DO ! ispin
 

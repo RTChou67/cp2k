@@ -14,7 +14,8 @@
 !>           module made publicly available
 ! **************************************************************************************************
 MODULE statistical_methods
-   USE cp_log_handling,                 ONLY: cp_logger_get_default_io_unit
+   USE cp_log_handling,                 ONLY: cp_logger_get_default_io_unit,&
+                                              cp_logger_get_default_unit_nr
    USE global_types,                    ONLY: global_environment_type
    USE kinds,                           ONLY: dp
    USE util,                            ONLY: sort
@@ -441,17 +442,18 @@ CONTAINS
       REAL(KIND=dp), DIMENSION(:), POINTER               :: xdata
       TYPE(global_environment_type), POINTER             :: globenv
 
-      INTEGER                                            :: i, n
+      INTEGER                                            :: i, n, output_unit
       REAL(KINd=dp)                                      :: prob, pw, r, tau, u, w, z
       REAL(KIND=dp), DIMENSION(:), POINTER               :: ydata
 
       IF (debug_this_module) THEN
+         output_unit = cp_logger_get_default_unit_nr(local=.TRUE.)
          n = 50 ! original sample size
          NULLIFY (xdata)
          ALLOCATE (xdata(n))
          DO i = 1, 10
             xdata(i) = 5.0_dp - REAL(i, KIND=dp)/2.0_dp + 0.1_dp*globenv%gaussian_rng_stream%next()
-            WRITE (3, *) xdata(i)
+            WRITE (output_unit, *) xdata(i)
          END DO
          DO i = 11, n
             xdata(i) = 0.1_dp*globenv%gaussian_rng_stream%next()
@@ -462,7 +464,7 @@ CONTAINS
             CALL k_test(xdata, i, n, tau, z, prob)
             IF (prob <= 0.2_dp) EXIT
          END DO
-         WRITE (*, *) "Mann-Kendall test", i
+         WRITE (output_unit, *) "Mann-Kendall test", i
 
          ! Test for normality distribution and for serial correlation
          DO i = 1, n
@@ -470,8 +472,8 @@ CONTAINS
             ydata = xdata(i:n)
             CALL sw_test(ydata, n - i + 1, w, pw)
             CALL vn_test(ydata, n - i + 1, r, u, prob)
-            WRITE (*, *) "Shapiro Wilks test", i, w, pw
-            WRITE (*, *) "Von Neu", i, r, u, prob
+            WRITE (output_unit, *) "Shapiro Wilks test", i, w, pw
+            WRITE (output_unit, *) "Von Neu", i, r, u, prob
             DEALLOCATE (ydata)
          END DO
 

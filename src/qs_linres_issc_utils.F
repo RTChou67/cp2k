@@ -396,7 +396,7 @@ CONTAINS
       CHARACTER(LEN=*), PARAMETER                        :: routineN = 'issc_issc'
 
       INTEGER                                            :: handle, ispin, ixyz, jatom, jxyz, natom, &
-                                                            nmo, nspins
+                                                            nmo, nspins, output_unit
       LOGICAL                                            :: do_dso, do_fc, do_pso, do_sd, gapw
       REAL(dp)                                           :: buf, facdso, facfc, facpso, facsd, g, &
                                                             issc_dso, issc_fc, issc_pso, issc_sd, &
@@ -415,6 +415,7 @@ CONTAINS
       TYPE(section_vals_type), POINTER                   :: issc_section
 
       CALL timeset(routineN, handle)
+      output_unit = cp_logger_get_default_io_unit()
 
       NULLIFY (cell, dft_control, particle_set, issc, psi1_fc, psi1_efg, psi1_pso)
       NULLIFY (matrix_efg, matrix_fc, matrix_pso, mos, mo_coeff, fc_psi0)
@@ -483,7 +484,7 @@ CONTAINS
                     &                 alpha=1.0_dp)
 
                CALL cp_fm_trace(fc_psi0(ispin), mo_coeff, buf)
-               WRITE (*, *) ' jatom', jatom, 'tr(P*fc)=', buf
+               IF (output_unit > 0) WRITE (output_unit, *) ' jatom', jatom, 'tr(P*fc)=', buf
 
                CALL cp_fm_trace(fc_psi0(ispin), psi1_fc(ispin), buf)
                issc_fc = 2.0_dp*2.0_dp*maxocc*facfc*buf
@@ -509,7 +510,7 @@ CONTAINS
                                          fc_psi0(ispin), ncol=nmo,& ! fc_psi0 a buffer
                        &                 alpha=1.0_dp, beta=0.0_dp)
                   CALL cp_fm_trace(fc_psi0(ispin), mo_coeff, buf)
-                  WRITE (*, *) ' jatom', jatom, ixyz, 'tr(P*efg)=', buf
+                  IF (output_unit > 0) WRITE (output_unit, *) ' jatom', jatom, ixyz, 'tr(P*efg)=', buf
                   DO jxyz = 1, 6
                      CALL cp_fm_trace(fc_psi0(ispin), psi1_efg(ispin, jxyz), buf)
                      issc_sd = 2.0_dp*maxocc*facsd*buf
