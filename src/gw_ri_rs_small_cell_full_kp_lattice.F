@@ -224,26 +224,27 @@ CONTAINS
       DO first = 1, n, grid_pair_panel_cols
          width = MIN(grid_pair_panel_cols, n - first + 1)
          CALL grid_pair_unpack_panel(pairs, first, width, panel)
-         CALL grid_pair_multiply_panel(n, nrhs, first, width, panel, Z, Y)
+         CALL grid_pair_multiply_panel(n, nrhs, first, width, panel, Z, z_one, Y)
       END DO
    END SUBROUTINE grid_pair_upper_multiply
 
 ! **************************************************************************************************
-!> \brief Accumulate the contribution of one unpacked triangular panel to Y=U Z.
+!> \brief Multiply one unpacked triangular panel by the matching rows of Z.
 !> \param n grid points
 !> \param nrhs columns of Z and Y
 !> \param first first column of U in this panel
 !> \param width number of columns of U in this panel
 !> \param panel ...
 !> \param Z dense right-hand sides
+!> \param beta scale for the previous result
 !> \param Y result
 ! **************************************************************************************************
-   SUBROUTINE grid_pair_multiply_panel(n, nrhs, first, width, panel, Z, Y)
+   SUBROUTINE grid_pair_multiply_panel(n, nrhs, first, width, panel, Z, beta, Y)
       INTEGER, INTENT(IN)                                :: n, nrhs, first, width
-      COMPLEX(KIND=dp), INTENT(IN)                       :: panel(n, width), Z(n, nrhs)
+      COMPLEX(KIND=dp), INTENT(IN)                       :: panel(n, width), Z(n, nrhs), beta
       COMPLEX(KIND=dp), INTENT(INOUT)                    :: Y(n, nrhs)
 
-      CALL zgemm('N', 'N', first + width - 1, nrhs, width, z_one, panel, n, Z(first, 1), n, z_one, Y, n)
+      CALL zgemm('N', 'N', first + width - 1, nrhs, width, z_one, panel, n, Z(first, 1), n, beta, Y, n)
    END SUBROUTINE grid_pair_multiply_panel
 
 ! **************************************************************************************************
