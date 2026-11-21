@@ -138,7 +138,7 @@ MODULE gw_ri_rs_small_cell_full_kp_utils
       COMPLEX(KIND=dp), ALLOCATABLE :: product_phase(:)
       INTEGER, ALLOCATABLE :: grid_linear(:), partner_linear(:), extract_q(:), extract_partner(:), mirror_cell(:)
       INTEGER, ALLOCATABLE :: input_to_native(:), green_source(:), pair_counts(:), pair_displs(:), column_segments(:)
-      INTEGER, ALLOCATABLE :: w_source(:)
+      INTEGER, ALLOCATABLE :: w_source(:), w_z_index(:)
       TYPE(pair_segment_type), ALLOCATABLE :: segments(:)
       LOGICAL, ALLOCATABLE :: diagonal(:)
       TYPE(k_grid_to_cell_work_type) :: inverse
@@ -177,7 +177,7 @@ CONTAINS
                      work%extract_q, work%extract_partner, work%mirror_cell, work%diagonal, work%input_to_native, &
                      work%green_source, work%pair_counts, work%pair_displs, work%column_segments, work%segments)
       END IF
-      IF (ALLOCATED(work%w_source)) DEALLOCATE (work%w_source)
+      IF (ALLOCATED(work%w_source)) DEALLOCATE (work%w_source, work%w_z_index)
       work%profile = lattice_fft_profile_type()
       work%setup_seconds = 0.0_dp
       work%cache_hit = .FALSE.
@@ -644,8 +644,8 @@ CONTAINS
 !> \brief Retain Z and fixed W in the smallest memory-feasible time groups.
 !>
 !> Each group owns τ = group + 1, group + 1 + ngroups, ... . Within a group,
-!> Z and W use owner MOD(q,g). W remains in the auxiliary basis. A single q block is broadcast during this
-!> one-time redistribution; each auxiliary W(q,τ) goes only to its owning rank.
+!> Z and W retain the representative q points with cyclic owner MOD(q,g). Z is
+!> compacted into consecutive local columns; auxiliary W keeps its cyclic slots.
 !> \param bs_env Band-structure settings.
 !> \param gwkp_env Work arrays and their MPI distribution.
 ! **************************************************************************************************
@@ -660,6 +660,7 @@ CONTAINS
          it_local, n_ao, n_aux, n_grid, n_k, n_local_k, n_local_q, n_local_time, n_q_exchange, &
          n_spin, n_stored_q, n_threads, n_time, n_world
       INTEGER, ALLOCATABLE                               :: w_counts(:)
+      LOGICAL, ALLOCATABLE                               :: needed(:)
       REAL(KIND=dp) :: available_GB, block_bytes, budget_bytes, grid_bytes, input_bytes, n_pairs, &
          peak_bytes, persistent_bytes, result_bytes
       TYPE(mp_comm_type)                                 :: column_env
@@ -687,7 +688,10 @@ CONTAINS
       block_bytes = complex_bytes*REAL(n_grid, dp)*REAL(n_aux, dp)
       result_bytes = 2.0_dp*complex_bytes*REAL(n_ao, dp)*REAL(SIZE(bs_env%eigenval_scf, 2), dp)* &
                      REAL(n_time*n_spin, dp)
-      ALLOCATE (w_counts(0:n_world - 1))
+      ALLOCATE (w_counts(0:n_world - 1), needed(n_k))
+      DO iq = 1, n_k
+         needed(iq) = gwkp_env%w_q_partner(iq) >= iq
+      END DO
       DO i_group_size = MIN(2, MAX(1, n_world/2)), n_world
          IF (MODULO(n_world, i_group_size) /= 0) CYCLE
          gwkp_env%ngroups = n_world/i_group_size
@@ -697,12 +701,12 @@ CONTAINS
          n_local_time = (n_time + gwkp_env%ngroups - 1)/gwkp_env%ngroups
          w_counts(:) = 0
          DO iq = 1, n_k
-            IF (gwkp_env%w_q_partner(iq) < iq) CYCLE
+            IF (.NOT. needed(iq)) CYCLE
             i_dest = MODULO(iq, i_group_size)
             w_counts(i_dest) = w_counts(i_dest) + 1
          END DO
          n_stored_q = MAXVAL(w_counts)
-         persistent_bytes = complex_bytes*(REAL(n_local_k, dp)*REAL(n_grid, dp)*REAL(n_aux, dp) + &
+         persistent_bytes = complex_bytes*(REAL(n_stored_q, dp)*REAL(n_grid, dp)*REAL(n_aux, dp) + &
                                            REAL(n_aux, dp)**2*REAL(n_stored_q*n_local_time, dp))
          n_pairs = REAL(CEILING(REAL(n_grid, dp)*REAL(n_grid + 1, dp)/(2.0_dp*REAL(i_group_size, dp)), KIND=int_8), dp)
          ! G(k), W(R), the retained off-mesh product, and the prepared FFT input coexist.
@@ -724,7 +728,9 @@ CONTAINS
                       2.0_dp*complex_bytes*REAL(n_threads*n_k, dp) + library_bytes
          peak_bytes = MAX(persistent_bytes + block_bytes, &
                           persistent_bytes - input_bytes + grid_bytes + result_bytes)
-         IF (gwkp_env%ngroups == 1) peak_bytes = grid_bytes + result_bytes
+         IF (gwkp_env%ngroups == 1) THEN
+            peak_bytes = MAX(grid_bytes + result_bytes, block_bytes*REAL(n_stored_q + 1, dp))
+         END IF
          IF (peak_bytes <= budget_bytes) EXIT
       END DO
       IF (i_group_size > n_world) THEN
@@ -736,22 +742,24 @@ CONTAINS
       ALLOCATE (gwkp_env%group_env)
       CALL gwkp_env%group_env%from_split(bs_env%para_env, gwkp_env%my_group)
       CPASSERT(gwkp_env%group_env%num_pe == i_group_size)
+      ! The same representative order is used in every time group, including a single group.
+      CALL column_env%from_split(bs_env%para_env, gwkp_env%group_env%mepos)
+      CALL gather_group_columns(bs_env, gwkp_env, column_env, i_group_size, gwkp_env%group_env%mepos, &
+                                Z_group, needed=needed)
+      CALL MOVE_ALLOC(Z_group, gwkp_env%Z_lP_q)
       IF (gwkp_env%ngroups == 1) THEN
+         CALL column_env%free()
          CALL timestop(handle)
          RETURN
       END IF
       n_local_q = COUNT([(MODULO(iq, i_group_size) == gwkp_env%group_env%mepos, iq=1, n_k)])
       n_local_time = (n_time - gwkp_env%my_group + gwkp_env%ngroups - 1)/gwkp_env%ngroups
       ALLOCATE (W_group(n_local_q))
-      ! Ranks with the same within-group index need the same k/q slices.
-      ! Communicate only along this column, independently of the other columns.
-      CALL column_env%from_split(bs_env%para_env, gwkp_env%group_env%mepos)
-      CALL gather_group_columns(bs_env, gwkp_env, column_env, i_group_size, gwkp_env%group_env%mepos, Z_group)
       iq_local = 0
       DO iq = MODULO(gwkp_env%group_env%mepos - 1, i_group_size) + 1, n_k, i_group_size
          i_root = MODULO(iq, n_world)/i_group_size
          iq_local = iq_local + 1
-         IF (gwkp_env%w_q_partner(iq) < iq) CYCLE
+         IF (.NOT. needed(iq)) CYCLE
          ALLOCATE (W_group(iq_local)%values(n_aux, n_aux, n_local_time))
          DO it = 1, n_time
             i_dest = MODULO(it - 1, gwkp_env%ngroups)
@@ -772,7 +780,6 @@ CONTAINS
          IF (column_env%mepos == i_root) DEALLOCATE (gwkp_env%W_PQ_tau((iq - 1)/n_world + 1)%values)
       END DO
       CALL column_env%free()
-      CALL MOVE_ALLOC(Z_group, gwkp_env%Z_lP_q)
       CALL MOVE_ALLOC(W_group, gwkp_env%W_PQ_tau)
 
       CALL timestop(handle)
@@ -2741,7 +2748,7 @@ CONTAINS
          partner_output, rank_end, reflected(3), row_first, row_last, shift(3), width
       INTEGER(KIND=int_8)                                :: nfft_grid, spectrum_columns
       INTEGER, ALLOCATABLE :: extract_partner(:), extract_q(:), grid_linear(:), &
-         input_to_native(:), native_to_input(:), partner_linear(:), q_position(:)
+         input_to_native(:), native_to_input(:), partner_linear(:), q_position(:), w_counts(:)
       LOGICAL                                            :: tie(3)
       REAL(KIND=dp)                                      :: cutoff_squared, displacement(3), &
                                                             energy_tolerance, half_tau, started, &
@@ -2807,7 +2814,15 @@ CONTAINS
       CPASSERT(ALL(plan%inverse%nfft == nmesh([3, 2, 1])))
       CPASSERT(ALLOCATED(plan%inverse%k_partner))
       IF (PRESENT(w_q_partner)) THEN
-         ALLOCATE (plan%w_source(n_k))
+         ALLOCATE (plan%w_source(n_k), plan%w_z_index(n_k), w_counts(0:n_rank - 1))
+         plan%w_z_index(:) = 0
+         w_counts(:) = 0
+         DO ik = 1, n_k
+            IF (w_q_partner(ik) < ik) CYCLE
+            i_rank = MODULO(ik, n_rank)
+            w_counts(i_rank) = w_counts(i_rank) + 1
+            plan%w_z_index(ik) = w_counts(i_rank)
+         END DO
          DO isource = 1, n_k
             ik = input_to_native(isource)
             plan%w_source(isource) = native_to_input(MIN(ik, w_q_partner(ik)))
@@ -3415,8 +3430,8 @@ CONTAINS
       CHARACTER(LEN=*), PARAMETER :: routineN = 'project_auxiliary_time_q_to_fft_pairs'
 
       COMPLEX(KIND=dp), ALLOCATABLE                      :: panel(:, :), sent(:), ZW(:, :, :)
-      INTEGER :: first_col, handle, i_first, i_q, i_q_local, n_aux_cols, n_cols, n_grid, n_owned, &
-         n_pairs, n_q, n_q_local, n_rank, n_RI, n_round, n_scheduled, n_threads, ri_block
+      INTEGER :: first_col, handle, i_first, i_q, i_q_local, i_z, n_aux_cols, n_cols, n_grid, &
+         n_owned, n_pairs, n_q, n_q_local, n_rank, n_RI, n_round, n_scheduled, n_threads, ri_block
       INTEGER, ALLOCATABLE                               :: jobs(:), recv_counts(:), recv_displs(:)
 
       CALL timeset(routineN, handle)
@@ -3427,7 +3442,6 @@ CONTAINS
       n_q = SIZE(fft_pairs, 3)
       n_rank = para_env%num_pe
       n_pairs = SUM(work%pair_counts)
-      CPASSERT(SIZE(interaction_q) == n_q_local)
       CPASSERT(SIZE(fft_pairs, 1) == work%pair_counts(para_env%mepos))
       CPASSERT(ALLOCATED(work%w_source))
       ALLOCATE (sent(MAX(1, n_pairs*MIN(n_q_local, work%k_batch))), ZW(n_grid, n_RI, MIN(n_q_local, work%k_batch)), &
@@ -3444,14 +3458,15 @@ CONTAINS
 
          !$OMP PARALLEL DEFAULT(NONE) IF(n_owned > 0) &
          !$OMP SHARED(Z_q, ZW, interaction_q, itime, work, sent, jobs, n_owned, n_grid, n_rank, n_RI, ri_block) &
-         !$OMP PRIVATE(first_col, i_q, i_q_local, n_aux_cols, n_cols, panel)
+         !$OMP PRIVATE(first_col, i_q, i_q_local, i_z, n_aux_cols, n_cols, panel)
          ALLOCATE (panel(n_grid, MIN(n_grid, grid_pair_panel_cols)))
          !$OMP DO COLLAPSE(2) SCHEDULE(STATIC)
          DO i_q = 1, n_owned
             DO first_col = 1, n_RI, ri_block
                i_q_local = (jobs(i_q) - 1)/n_rank + 1
+               i_z = work%w_z_index(jobs(i_q))
                n_aux_cols = MIN(ri_block, n_RI - first_col + 1)
-               CALL zgemm('N', 'N', n_grid, n_aux_cols, n_RI, z_one, Z_q(:, :, i_q_local), n_grid, &
+               CALL zgemm('N', 'N', n_grid, n_aux_cols, n_RI, z_one, Z_q(:, :, i_z), n_grid, &
                           interaction_q(i_q_local)%values(1, first_col, itime), n_RI, z_zero, ZW(1, first_col, i_q), n_grid)
             END DO
          END DO
@@ -3459,9 +3474,9 @@ CONTAINS
          !$OMP DO COLLAPSE(2) SCHEDULE(STATIC, 1)
          DO i_q = 1, n_owned
             DO first_col = 1, n_grid, grid_pair_panel_cols
-               i_q_local = (jobs(i_q) - 1)/n_rank + 1
+               i_z = work%w_z_index(jobs(i_q))
                n_cols = MIN(grid_pair_panel_cols, n_grid - first_col + 1)
-               CALL grid_pair_gemm_panel(n_grid, n_RI, first_col, n_cols, ZW(:, :, i_q), Z_q(:, :, i_q_local), panel)
+               CALL grid_pair_gemm_panel(n_grid, n_RI, first_col, n_cols, ZW(:, :, i_q), Z_q(:, :, i_z), panel)
                CALL pack_grid_pair_panel(work, first_col, n_cols, panel, n_owned, i_q, sent)
             END DO
          END DO
