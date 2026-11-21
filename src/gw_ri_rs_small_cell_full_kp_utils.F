@@ -51,7 +51,8 @@ MODULE gw_ri_rs_small_cell_full_kp_utils
    USE gw_ri_rs_small_cell_full_kp_types,ONLY: gwkp_type,&
                                               ri_q_matrix_block_type
    USE gw_utils_fm,                     ONLY: local_complex_power
-   USE input_constants,                 ONLY: evGW0
+   USE input_constants,                 ONLY: G0W0,&
+                                              evGW0
    USE kinds,                           ONLY: dp,&
                                               int_1,&
                                               int_1_size,&
@@ -130,12 +131,12 @@ MODULE gw_ri_rs_small_cell_full_kp_utils
 
    TYPE gw_pair_fft_work_type
       PRIVATE
-      INTEGER :: n_pairs = 0, width = 0, k_batch = 0, nmesh(3) = 0
+      INTEGER :: n_pairs = 0, width = 0, k_batch = 0, green_reuses = 0, nmesh(3) = 0
       INTEGER(KIND=int_8) :: nfft_grid = 0_int_8, spectrum_columns = 0_int_8
       LOGICAL :: cache_hit = .FALSE.
       COMPLEX(KIND=dp), ALLOCATABLE :: product_phase(:)
       INTEGER, ALLOCATABLE :: grid_linear(:), partner_linear(:), extract_q(:), extract_partner(:), mirror_cell(:)
-      INTEGER, ALLOCATABLE :: input_to_native(:), pair_counts(:), pair_displs(:), column_segments(:)
+      INTEGER, ALLOCATABLE :: input_to_native(:), green_source(:), pair_counts(:), pair_displs(:), column_segments(:)
       INTEGER, ALLOCATABLE :: w_source(:)
       TYPE(pair_segment_type), ALLOCATABLE :: segments(:)
       LOGICAL, ALLOCATABLE :: diagonal(:)
@@ -173,12 +174,13 @@ CONTAINS
          END DO
          DEALLOCATE (work%batches, work%product_phase, work%grid_linear, work%partner_linear, &
                      work%extract_q, work%extract_partner, work%mirror_cell, work%diagonal, work%input_to_native, &
-                     work%pair_counts, work%pair_displs, work%column_segments, work%segments)
+                     work%green_source, work%pair_counts, work%pair_displs, work%column_segments, work%segments)
       END IF
       IF (ALLOCATED(work%w_source)) DEALLOCATE (work%w_source)
       work%profile = lattice_fft_profile_type()
       work%setup_seconds = 0.0_dp
       work%cache_hit = .FALSE.
+      work%green_reuses = 0
    END SUBROUTINE release_pair_fft
 
 ! **************************************************************************************************
@@ -1517,6 +1519,7 @@ CONTAINS
 !> \brief Form the unordered pairs of G(k,τ)=U(k,τ) U(k,τ)^H and exchange bounded k batches.
 !> Each upper-triangle Gram tile writes directly to its destination's message. No full
 !> grid matrix, conjugate lower triangle, or separate send-packing pass is formed.
+!> The exchange sends each reusable inversion pair once; pair owners restore its partner.
 !> \param bs_env ...
 !> \param orbitals Band Bloch orbitals of one spin at the k points owned in env, MOD(k-1,P).
 !> \param env Ranks that share the grid pairs and the band k points.
@@ -1538,15 +1541,14 @@ CONTAINS
 
       CHARACTER(LEN=*), PARAMETER                        :: routineN = 'build_green_pairs'
 
-      COMPLEX(KIND=dp), ALLOCATABLE                      :: gram(:, :), scaled_coeff(:, :), sent(:)
-      COMPLEX(KIND=dp), CONTIGUOUS, POINTER              :: received(:)
-      COMPLEX(KIND=dp), TARGET                           :: unused_receive(1)
-      INTEGER :: first_band, handle, i_band, i_batch, i_col, i_first, i_rank, ikp, k_batch, &
-         n_active, n_bands, n_cols, n_grid, n_k, n_local, n_owned, n_pairs, n_rank, n_round, &
-         n_workers, offset, unit_nr
+      COMPLEX(KIND=dp), ALLOCATABLE                      :: gram(:, :), scaled_coeff(:, :, :), &
+                                                            sent(:)
+      INTEGER :: chunk_first, first_band, handle, i_band, i_batch, i_col, i_first, i_job, ikp, &
+         k_batch, n_active, n_bands, n_chunk, n_cols, n_grid, n_jobs, n_k, n_local, n_owned, &
+         n_pairs, n_rank, n_round, n_scheduled, unit_nr
       INTEGER(KIND=int_8)                                :: active_bands, possible_bands
-      INTEGER, ALLOCATABLE                               :: recv_counts(:), recv_displs(:), &
-                                                            send_counts(:), send_displs(:)
+      INTEGER, ALLOCATABLE                               :: active_columns(:), k_jobs(:), &
+                                                            recv_counts(:), recv_displs(:)
       REAL(KIND=dp)                                      :: seconds(4), started, tau_E, total_started
       TYPE(gwkp_type), POINTER                           :: gwkp_env
 
@@ -1577,79 +1579,89 @@ CONTAINS
       k_batch = work%k_batch
       n_pairs = SUM(work%pair_counts)
       CPASSERT(n_local == work%pair_counts(env%mepos))
-      ALLOCATE (sent(MAX(1, n_pairs*k_batch)), &
-                recv_counts(0:n_rank - 1), recv_displs(0:n_rank - 1), &
-                send_counts(0:n_rank - 1), send_displs(0:n_rank - 1))
-      unused_receive = z_zero
+      n_chunk = 1
+!$    n_chunk = MIN(k_batch, omp_get_max_threads())
+      ALLOCATE (scaled_coeff(n_grid, n_bands, n_chunk), active_columns(n_chunk))
+      ALLOCATE (sent(MAX(1, n_pairs*k_batch)), k_jobs(k_batch), &
+                recv_counts(0:n_rank - 1), recv_displs(0:n_rank - 1))
       IF (fft_profile_enabled) seconds(1) = m_walltime() - total_started
       ! G_ll′(k,τ) = Σ_n [ψ_ln(k) exp(-|τ(ε_nk-ε_F)|/2)]
       !                         [ψ_l′n(k) exp(-|τ(ε_nk-ε_F)|/2)]*.
       DO i_first = 1, n_k, n_rank*k_batch
          n_round = MIN(n_rank*k_batch, n_k - i_first + 1)
-         n_owned = MAX(0, (n_round + n_rank - 1 - env%mepos)/n_rank)
-         send_counts(:) = work%pair_counts*n_owned
-         send_displs(:) = work%pair_displs*n_owned
-         n_workers = 1
-!$       n_workers = MIN(omp_get_max_threads(), MAX(1, n_owned))
+         CALL pair_exchange_jobs(work, work%green_source, env, i_first, n_round, 0, &
+                                 k_jobs, n_owned, n_scheduled, recv_counts, recv_displs)
+         IF (n_scheduled == 0) THEN
+            CALL count_time_loop_k_points(bs_env, INT(n_round, int_8))
+            CYCLE
+         END IF
          IF (fft_profile_enabled) started = m_walltime()
-         !$OMP PARALLEL DEFAULT(NONE) NUM_THREADS(n_workers) &
-         !$OMP SHARED(bs_env, env, first_band, gwkp_env, i_first, n_bands, n_grid, n_owned, n_rank) &
-         !$OMP SHARED(orbitals, sent, tau, ispin, work) &
-         !$OMP PRIVATE(scaled_coeff, gram, i_band, i_batch, ikp, n_active, tau_E) &
-         !$OMP PRIVATE(i_col, n_cols) &
+         ! Scale at most one reciprocal point per worker, then distribute the Gram
+         ! column blocks independently so one owned k point can occupy the whole team.
+         !$OMP PARALLEL DEFAULT(NONE) IF(n_owned > 0) &
+         !$OMP SHARED(bs_env, first_band, gwkp_env, k_jobs, n_bands, n_chunk, n_grid, n_owned, n_rank) &
+         !$OMP SHARED(active_columns, orbitals, scaled_coeff, sent, tau, ispin, work) &
+         !$OMP PRIVATE(chunk_first, gram, i_band, i_batch, i_col, i_job, ikp, n_active, n_cols, n_jobs, tau_E) &
          !$OMP REDUCTION(+:active_bands, possible_bands)
-         ALLOCATE (scaled_coeff(n_grid, n_bands), gram(n_grid, column_block_cols))
-         !$OMP DO SCHEDULE(STATIC)
-         DO i_batch = 1, n_owned
-            ikp = i_first + env%mepos + (i_batch - 1)*n_rank
-            n_active = 0
-            DO i_band = 1, n_bands
-               tau_E = ABS(0.5_dp*tau*(gwkp_env%eigenvalues_G(first_band + i_band - 1, ikp, ispin) - &
-                                       bs_env%e_fermi(ispin)))
-               IF (tau_E < bs_env%stabilize_exp) THEN
-                  n_active = n_active + 1
-                  scaled_coeff(:, n_active) = &
-                     orbitals(:, first_band + i_band - 1, (ikp - 1)/n_rank + 1)*EXP(-tau_E)
-               END IF
-            END DO
-            IF (fft_profile_enabled) THEN
-               active_bands = active_bands + INT(n_active, int_8)
-               possible_bands = possible_bands + INT(n_bands, int_8)
-            END IF
-            DO i_col = 1, n_grid, column_block_cols
-               n_cols = MIN(column_block_cols, n_grid - i_col + 1)
-               IF (n_active == 0) THEN
-                  gram = z_zero
-               ELSE
-                  CALL zherk('U', 'N', n_cols, n_active, 1.0_dp, scaled_coeff(i_col, 1), n_grid, &
-                             0.0_dp, gram(i_col, 1), n_grid)
-                  IF (i_col > 1) THEN
-                     CALL zgemm('N', 'C', i_col - 1, n_cols, n_active, z_one, scaled_coeff, n_grid, &
-                                scaled_coeff(i_col, 1), n_grid, z_zero, gram, n_grid)
+         ALLOCATE (gram(n_grid, MIN(n_grid, column_block_cols)))
+         DO chunk_first = 1, n_owned, n_chunk
+            n_jobs = MIN(n_chunk, n_owned - chunk_first + 1)
+            !$OMP DO SCHEDULE(STATIC)
+            DO i_job = 1, n_jobs
+               ikp = k_jobs(chunk_first + i_job - 1)
+               n_active = 0
+               DO i_band = 1, n_bands
+                  tau_E = ABS(0.5_dp*tau*(gwkp_env%eigenvalues_G(first_band + i_band - 1, ikp, ispin) - &
+                                          bs_env%e_fermi(ispin)))
+                  IF (tau_E < bs_env%stabilize_exp) THEN
+                     n_active = n_active + 1
+                     scaled_coeff(:, n_active, i_job) = &
+                        orbitals(:, first_band + i_band - 1, (ikp - 1)/n_rank + 1)*EXP(-tau_E)
                   END IF
+               END DO
+               active_columns(i_job) = n_active
+               IF (fft_profile_enabled) THEN
+                  active_bands = active_bands + INT(n_active, int_8)
+                  possible_bands = possible_bands + INT(n_bands, int_8)
                END IF
-               CALL pack_grid_pair_panel(work, i_col, n_cols, gram, n_owned, i_batch, sent)
             END DO
+            !$OMP END DO
+            ! Successive column tiles grow in cost. Interleave them among workers.
+            !$OMP DO COLLAPSE(2) SCHEDULE(STATIC, 1)
+            DO i_job = 1, n_jobs
+               DO i_col = 1, n_grid, column_block_cols
+                  i_batch = chunk_first + i_job - 1
+                  n_cols = MIN(column_block_cols, n_grid - i_col + 1)
+                  n_active = active_columns(i_job)
+                  IF (n_active == 0) THEN
+                     gram(:, :) = z_zero
+                  ELSE
+                     CALL zherk('U', 'N', n_cols, n_active, 1.0_dp, scaled_coeff(i_col, 1, i_job), n_grid, &
+                                0.0_dp, gram(i_col, 1), n_grid)
+                     IF (i_col > 1) THEN
+                        CALL zgemm('N', 'C', i_col - 1, n_cols, n_active, z_one, scaled_coeff(:, :, i_job), n_grid, &
+                                   scaled_coeff(i_col, 1, i_job), n_grid, z_zero, gram, n_grid)
+                     END IF
+                  END IF
+                  CALL pack_grid_pair_panel(work, i_col, n_cols, gram, n_owned, i_batch, sent)
+               END DO
+            END DO
+            !$OMP END DO
          END DO
-         !$OMP END DO
-         DEALLOCATE (scaled_coeff, gram)
+         DEALLOCATE (gram)
          !$OMP END PARALLEL
-         ! Scaling and Gram construction overlap between k jobs; time their shared wall interval.
          IF (fft_profile_enabled) seconds(2) = seconds(2) + m_walltime() - started
-         offset = 0
-         DO i_rank = 0, n_rank - 1
-            recv_counts(i_rank) = n_local*MAX(0, (n_round + n_rank - 1 - i_rank)/n_rank)
-            recv_displs(i_rank) = offset
-            offset = offset + recv_counts(i_rank)
-         END DO
-         CPASSERT(offset == n_local*n_round)
-         received => unused_receive
-         IF (n_local > 0) received(1:n_local*n_round) => G_pairs(:, :, i_first:i_first + n_round - 1)
          IF (fft_profile_enabled) started = m_walltime()
-         CALL env%alltoall(sent, send_counts, send_displs, received, recv_counts, recv_displs)
+         CALL exchange_pair_round(work, work%green_source, env, i_first, n_round, 0, &
+                                  n_owned, sent, recv_counts, recv_displs, G_pairs)
          IF (fft_profile_enabled) seconds(3) = seconds(3) + m_walltime() - started
          CALL count_time_loop_k_points(bs_env, INT(n_round, int_8))
       END DO
+      IF (work%green_reuses > 0) THEN
+         IF (fft_profile_enabled) started = m_walltime()
+         CALL restore_pair_conjugates(work%green_source, G_pairs)
+         IF (fft_profile_enabled) seconds(3) = seconds(3) + m_walltime() - started
+      END IF
       IF (fft_profile_enabled) seconds(4) = m_walltime() - total_started
       unit_nr = 0
       IF (fft_profile_enabled) unit_nr = cp_logger_get_default_io_unit()
@@ -1658,6 +1670,7 @@ CONTAINS
          WRITE (unit_nr, '(T2,A,L2,2I12)') 'GW_GREEN_PROFILE| occupied / k points / local pairs: ', occupied, n_k, n_local
          WRITE (unit_nr, '(T2,A,2I16)') 'GW_GREEN_PROFILE| active / possible local band columns: ', active_bands, possible_bands
          WRITE (unit_nr, '(T2,A,I12)') 'GW_GREEN_PROFILE| k points per rank / exchange: ', k_batch
+         WRITE (unit_nr, '(T2,A,I12)') 'GW_GREEN_PROFILE| conjugate k points reused: ', work%green_reuses
          WRITE (unit_nr, '(T2,A,4F12.6)') 'GW_GREEN_PROFILE| setup/build/transfer/total: ', seconds
       END IF
 
@@ -2607,15 +2620,16 @@ CONTAINS
       INTEGER, INTENT(IN), OPTIONAL                      :: q_indices(:), w_q_partner(:)
 
       INTEGER :: count, fft_count, first, half_shift(3), i, i_col, i_extract, i_first, i_rank, &
-         ibatch, icell, idir, ik, il, ilp, iq, isource, lower(3), n_extract, n_k, n_round, &
-         n_segments, ngrid, nmesh(3), pair_first, pair_last, partner_output, rank_end, &
-         reflected(3), row_first, row_last, shift(3), width
+         i_time, ibatch, icell, idir, ik, il, ilp, iq, isource, lower(3), n_extract, n_k, n_occ, &
+         n_round, n_segments, ngrid, nmesh(3), pair_first, pair_last, partner, partner_native, &
+         partner_output, rank_end, reflected(3), row_first, row_last, shift(3), width
       INTEGER(KIND=int_8)                                :: nfft_grid, spectrum_columns
       INTEGER, ALLOCATABLE :: extract_partner(:), extract_q(:), grid_linear(:), &
          input_to_native(:), native_to_input(:), partner_linear(:), q_position(:)
       LOGICAL                                            :: tie(3)
       REAL(KIND=dp)                                      :: cutoff_squared, displacement(3), &
-                                                            started, total_started
+                                                            energy_tolerance, half_tau, started, &
+                                                            total_started
       REAL(KIND=dp), ALLOCATABLE                         :: fractional_grid(:, :)
       TYPE(gw_pair_fft_batch_type), POINTER              :: batch
 
@@ -2656,7 +2670,7 @@ CONTAINS
          IF (i_col < ngrid) pair_first = pair_last + 1
       END DO
       plan%column_segments(ngrid + 1) = n_segments + 1
-      ALLOCATE (input_to_native(n_k), native_to_input(n_k))
+      ALLOCATE (input_to_native(n_k), native_to_input(n_k), plan%green_source(n_k))
       i_extract = 0
       ! Receive contiguous source-rank blocks; the inverse FFT owns the resulting k permutation.
       DO i_first = 1, n_k, n_rank*plan%k_batch
@@ -2666,6 +2680,7 @@ CONTAINS
                i_extract = i_extract + 1
                input_to_native(i_extract) = ik
                native_to_input(ik) = i_extract
+               plan%green_source(i_extract) = i_extract
             END DO
          END DO
       END DO
@@ -2681,6 +2696,35 @@ CONTAINS
             ik = input_to_native(isource)
             plan%w_source(isource) = native_to_input(MIN(ik, w_q_partner(ik)))
          END DO
+      END IF
+      ! For the scalar KS problem H(-k)=H(k)* and S(-k)=S(k)*. Its spectral
+      ! projectors give G(-k,τ)=G(k,τ)* when the weights and selected subspaces
+      ! agree. Eigenvalue updates in evGW0 may give the two points different weights.
+      IF (bs_env%gw_flavour == G0W0 .AND. bs_env%n_spin == 1 .AND. .NOT. bs_env%do_soc) THEN
+         n_occ = bs_env%n_occ(1)
+         ASSOCIATE (energies => bs_env%gwkp_env%eigenvalues_G(:, :, 1))
+            DO isource = 1, n_k
+               partner = plan%inverse%k_partner(isource)
+               IF (partner <= isource) CYCLE
+               ik = input_to_native(isource)
+               partner_native = input_to_native(partner)
+               energy_tolerance = 1024.0_dp*EPSILON(1.0_dp)* &
+                                  MAX(1.0_dp, MAXVAL(ABS(energies(:, ik))), MAXVAL(ABS(energies(:, partner_native))))
+               IF (MAXVAL(ABS(energies(:, ik) - energies(:, partner_native))) > energy_tolerance) CYCLE
+               IF (n_occ > 0 .AND. n_occ < SIZE(energies, 1)) THEN
+                  ! A projector cannot select part of a degenerate eigenspace.
+                  IF (energies(n_occ + 1, ik) - energies(n_occ, ik) <= 2.0_dp*energy_tolerance) CYCLE
+               END IF
+               DO i_time = 1, bs_env%num_time_freq_points
+                  half_tau = 0.5_dp*ABS(bs_env%time_frequency_grid%imaginary_time(i_time))
+                  IF (ANY(ABS(ABS(half_tau*(energies(:, ik) - bs_env%e_fermi(1))) - bs_env%stabilize_exp) <= &
+                          half_tau*energy_tolerance)) EXIT
+               END DO
+               IF (i_time <= bs_env%num_time_freq_points) CYCLE
+               plan%green_source(partner) = isource
+               plan%green_reuses = plan%green_reuses + 1
+            END DO
+         END ASSOCIATE
       END IF
       ! The packed forward transform keeps its factor of 1/2 for the two-real unpacking.
       plan%product_phase(:) = plan%product_phase/(2.0_dp*grid_pair_stencil_denominator)
