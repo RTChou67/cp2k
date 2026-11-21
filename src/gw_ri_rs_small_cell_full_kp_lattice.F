@@ -76,7 +76,9 @@ MODULE gw_ri_rs_small_cell_full_kp_lattice
              gamma_auxiliary_charges, &
              grid_pair_indices, &
              grid_pair_gemm, &
+             grid_pair_multiply_panel, &
              grid_pair_upper_multiply, &
+             grid_pair_unpack_panel, &
              grid_pair_shift, &
              grid_pair_stencil_weight, &
              image_weight, &
@@ -191,21 +193,57 @@ CONTAINS
       COMPLEX(KIND=dp), INTENT(IN)                       :: pairs(:), Z(n, nrhs)
       COMPLEX(KIND=dp), INTENT(OUT) :: Y(n, nrhs), panel(n, MIN(grid_pair_panel_cols, n))
 
-      INTEGER                                            :: first, j, offset, width
+      INTEGER                                            :: first, width
 
       CPASSERT(SIZE(pairs, KIND=int_8) == INT(n, int_8)*(n + 1)/2)
       Y = z_zero
       DO first = 1, n, grid_pair_panel_cols
          width = MIN(grid_pair_panel_cols, n - first + 1)
-         DO j = first, first + width - 1
-            offset = INT(INT(j, int_8)*(j - 1)/2)
-            panel(1:j, j - first + 1) = pairs(offset + 1:offset + j)
-            panel(j, j - first + 1) = CMPLX(0.5_dp*REAL(panel(j, j - first + 1), dp), 0.0_dp, dp)
-            panel(j + 1:first + width - 1, j - first + 1) = z_zero
-         END DO
-         CALL zgemm('N', 'N', first + width - 1, nrhs, width, z_one, panel, n, Z(first, 1), n, z_one, Y, n)
+         CALL grid_pair_unpack_panel(pairs, first, width, panel)
+         CALL grid_pair_multiply_panel(n, nrhs, first, width, panel, Z, Y)
       END DO
    END SUBROUTINE grid_pair_upper_multiply
+
+! **************************************************************************************************
+!> \brief Accumulate the contribution of one unpacked triangular panel to Y=U Z.
+!> \param n grid points
+!> \param nrhs columns of Z and Y
+!> \param first first column of U in this panel
+!> \param width number of columns of U in this panel
+!> \param panel ...
+!> \param Z dense right-hand sides
+!> \param Y result
+! **************************************************************************************************
+   SUBROUTINE grid_pair_multiply_panel(n, nrhs, first, width, panel, Z, Y)
+      INTEGER, INTENT(IN)                                :: n, nrhs, first, width
+      COMPLEX(KIND=dp), INTENT(IN)                       :: panel(n, width), Z(n, nrhs)
+      COMPLEX(KIND=dp), INTENT(INOUT)                    :: Y(n, nrhs)
+
+      CALL zgemm('N', 'N', first + width - 1, nrhs, width, z_one, panel, n, Z(first, 1), n, z_one, Y, n)
+   END SUBROUTINE grid_pair_multiply_panel
+
+! **************************************************************************************************
+!> \brief Unpack columns of U=triu(H,1)+diag(H)/2 through the last row of the panel.
+!> \param pairs packed upper triangle of H
+!> \param first first column
+!> \param width number of columns
+!> \param panel ...
+! **************************************************************************************************
+   PURE SUBROUTINE grid_pair_unpack_panel(pairs, first, width, panel)
+      COMPLEX(KIND=dp), INTENT(IN)                       :: pairs(:)
+      INTEGER, INTENT(IN)                                :: first, width
+      COMPLEX(KIND=dp), INTENT(OUT)                      :: panel(:, :)
+
+      INTEGER                                            :: col, j, offset
+
+      DO col = 1, width
+         j = first + col - 1
+         offset = INT(INT(j, int_8)*INT(j - 1, int_8)/2_int_8)
+         panel(1:j - 1, col) = pairs(offset + 1:offset + j - 1)
+         panel(j, col) = CMPLX(0.5_dp*REAL(pairs(offset + j), dp), 0.0_dp, dp)
+         panel(j + 1:first + width - 1, col) = z_zero
+      END DO
+   END SUBROUTINE grid_pair_unpack_panel
 
 ! **************************************************************************************************
 !> \brief Finite-supercell image weight, averaged over equidistant pair centers.

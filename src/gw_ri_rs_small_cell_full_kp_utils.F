@@ -40,9 +40,9 @@ MODULE gw_ri_rs_small_cell_full_kp_utils
    USE gw_ri_rs_small_cell_full_kp_lattice,ONLY: &
         assemble_AA_contraction, block_range, build_full_cell_grid, build_ri_2c_lattice, &
         complex_bytes, gamma_auxiliary_charges, grid_pair_gemm, grid_pair_indices, &
-        grid_pair_panel_cols, grid_pair_shift, grid_pair_stencil_denominator, &
-        grid_pair_stencil_weight, grid_pair_upper_multiply, image_weight, owned_mo_coefficients, &
-        real_bytes, ri_2c_lattice_to_kp, ri_metric_head_zero
+        grid_pair_multiply_panel, grid_pair_panel_cols, grid_pair_shift, grid_pair_stencil_denominator, &
+        grid_pair_stencil_weight, grid_pair_unpack_panel, grid_pair_upper_multiply, image_weight, &
+        owned_mo_coefficients, real_bytes, ri_2c_lattice_to_kp, ri_metric_head_zero
    USE gw_ri_rs_small_cell_full_kp_q0_corr,ONLY: add_gamma_corr_pairs,&
                                               gamma_point_correction,&
                                               q_mesh_and_gamma_shell_average,&
@@ -104,6 +104,7 @@ MODULE gw_ri_rs_small_cell_full_kp_utils
    ! Blocking limits and named slots in the six existing CP2K matrix workspaces.
    INTEGER, PARAMETER :: column_block_cols = 32
    INTEGER, PARAMETER :: band_kpoints_per_pass = 64, pair_batch_size = 256
+   INTEGER, PARAMETER :: sigma_panels_per_group = 8
    INTEGER, PARAMETER :: w_chi = 1, w_metric = 2, w_tmp = 3, w_dielectric = 4, &
                          w_output = 5, n_w_matrices = 5
 
@@ -2104,13 +2105,14 @@ CONTAINS
 
       CHARACTER(LEN=*), PARAMETER :: routineN = 'self_energy_pairs_to_Bloch'
 
-      COMPLEX(KIND=dp), ALLOCATABLE                      :: panel(:, :), sigma_k(:, :), work(:, :)
+      COMPLEX(KIND=dp), ALLOCATABLE                      :: panels(:, :, :), sigma_k(:, :), &
+                                                            work(:, :)
       COMPLEX(KIND=dp), ALLOCATABLE, TARGET              :: send_buffer(:)
       COMPLEX(KIND=dp), CONTIGUOUS, POINTER              :: sent(:), sigma_columns(:, :)
       COMPLEX(KIND=dp), TARGET                           :: unused_send(1)
-      INTEGER                                            :: handle, i_band, i_batch, i_col, i_first, &
-                                                            i_kp, i_rank, j, m, n_batch, n_grid, &
-                                                            n_kp, n_local, n_rank, n_round, n_send
+      INTEGER :: first_col, first_panel, handle, i_band, i_batch, i_col, i_first, i_kp, i_local, &
+         i_panel, i_rank, j, m, n_batch, n_cols, n_grid, n_kp, n_local, n_panels, n_rank, n_rhs, &
+         n_round, n_send
       INTEGER, ALLOCATABLE                               :: pair_counts(:), pair_displs(:), &
                                                             recv_counts(:), send_counts(:), &
                                                             send_displs(:)
@@ -2127,6 +2129,9 @@ CONTAINS
       CALL grid_pair_blocks(n_grid, n_rank, pair_counts, pair_displs)
       ALLOCATE (sigma_k(INT(INT(n_grid, int_8)*(n_grid + 1)/2), m), recv_counts(0:n_rank - 1), &
                 send_counts(0:n_rank - 1), send_displs(0:n_rank - 1))
+      ALLOCATE (work(n_grid, bs_env%n_ao))
+      ALLOCATE (panels(n_grid, MIN(n_grid, grid_pair_panel_cols), &
+                       MIN(sigma_panels_per_group, 1 + (n_grid - 1)/grid_pair_panel_cols)))
       unused_send = z_zero
       send_displs(:) = [(i_rank*n_local, i_rank=0, n_rank - 1)]
       sigma_band = 0.0_dp
@@ -2169,25 +2174,46 @@ CONTAINS
             CALL env%alltoall(sent, send_counts, send_displs, sigma_k(:, j), recv_counts, pair_displs)
          END DO
          !$OMP PARALLEL DEFAULT(NONE) &
-         !$OMP SHARED(bs_env, env, i_first, m, n_batch, n_grid, n_kp, n_rank, orbitals, sigma_band, sigma_k) &
-         !$OMP PRIVATE(i_band, i_batch, i_kp, j, panel, work)
-         ALLOCATE (work(n_grid, n_batch), panel(n_grid, MIN(n_grid, grid_pair_panel_cols)))
-         !$OMP DO COLLAPSE(2) SCHEDULE(DYNAMIC)
+         !$OMP SHARED(bs_env, env, i_first, m, n_batch, n_grid, n_kp, n_rank, orbitals, panels, sigma_band, sigma_k, work) &
+         !$OMP PRIVATE(first_col, first_panel, i_band, i_batch, i_kp, i_local, i_panel, j, n_cols, n_panels, n_rhs)
          DO j = 1, m
-            DO i_batch = 1, bs_env%n_ao, n_batch
-               i_kp = i_first + (j - 1)*n_rank + env%mepos
-               IF (i_kp > n_kp) CYCLE
-               CALL grid_pair_upper_multiply(n_grid, MIN(n_batch, bs_env%n_ao - i_batch + 1), sigma_k(:, j), &
-                                             orbitals(:, i_batch:MIN(i_batch + n_batch - 1, bs_env%n_ao), (i_kp - 1)/n_rank + 1), &
-                                             work(:, 1:MIN(n_batch, bs_env%n_ao - i_batch + 1)), panel)
-               DO i_band = i_batch, MIN(i_batch + n_batch - 1, bs_env%n_ao)
-                  sigma_band(i_band, i_kp) = 2.0_dp*REAL(SUM(CONJG(orbitals(:, i_band, (i_kp - 1)/n_rank + 1))* &
-                                                             work(:, i_band - i_batch + 1)), dp)
-               END DO
+            i_kp = i_first + (j - 1)*n_rank + env%mepos
+            IF (i_kp > n_kp) EXIT
+            i_local = (i_kp - 1)/n_rank + 1
+            !$OMP DO SCHEDULE(STATIC)
+            DO i_band = 1, bs_env%n_ao
+               work(:, i_band) = z_zero
             END DO
+            !$OMP END DO NOWAIT
+            ! Publish one group of unpacked panels before updating the band blocks.
+            DO first_panel = 1, n_grid, sigma_panels_per_group*grid_pair_panel_cols
+               n_panels = MIN(sigma_panels_per_group, 1 + (n_grid - first_panel)/grid_pair_panel_cols)
+               !$OMP DO SCHEDULE(STATIC)
+               DO i_panel = 1, n_panels
+                  first_col = first_panel + (i_panel - 1)*grid_pair_panel_cols
+                  n_cols = MIN(grid_pair_panel_cols, n_grid - first_col + 1)
+                  CALL grid_pair_unpack_panel(sigma_k(:, j), first_col, n_cols, panels(:, :, i_panel))
+               END DO
+               !$OMP END DO
+               !$OMP DO SCHEDULE(STATIC)
+               DO i_batch = 1, bs_env%n_ao, n_batch
+                  n_rhs = MIN(n_batch, bs_env%n_ao - i_batch + 1)
+                  DO i_panel = 1, n_panels
+                     first_col = first_panel + (i_panel - 1)*grid_pair_panel_cols
+                     n_cols = MIN(grid_pair_panel_cols, n_grid - first_col + 1)
+                     CALL grid_pair_multiply_panel(n_grid, n_rhs, first_col, n_cols, panels(:, :, i_panel), &
+                                                   orbitals(:, i_batch:i_batch + n_rhs - 1, i_local), &
+                                                   work(:, i_batch:i_batch + n_rhs - 1))
+                  END DO
+               END DO
+               !$OMP END DO
+            END DO
+            !$OMP DO SCHEDULE(STATIC)
+            DO i_band = 1, bs_env%n_ao
+               sigma_band(i_band, i_kp) = 2.0_dp*REAL(SUM(CONJG(orbitals(:, i_band, i_local))*work(:, i_band)), dp)
+            END DO
+            !$OMP END DO
          END DO
-         !$OMP END DO
-         DEALLOCATE (work, panel)
          !$OMP END PARALLEL
          CALL count_time_loop_k_points(bs_env, INT(n_round, int_8))
       END DO
@@ -2214,14 +2240,16 @@ CONTAINS
       INTEGER, INTENT(IN)                                :: n_grid, n_rank, n_images, n_ao, n_threads
       REAL(dp)                                           :: bytes
 
+      INTEGER                                            :: panel_columns
       REAL(dp)                                           :: m, n_round
 
       m = REAL(projection_round_kpoints(n_grid, n_rank), dp)
       n_round = m*REAL(n_rank, dp)
+      panel_columns = MIN(n_grid, grid_pair_panel_cols)* &
+                      MIN(sigma_panels_per_group, 1 + (n_grid - 1)/grid_pair_panel_cols)
       bytes = complex_bytes*m*REAL(n_grid, dp)*REAL(n_grid + 1, dp) + complex_bytes*n_round*REAL(n_images, dp) + &
-              projection_workspace + &
-              REAL(n_threads, dp)*(complex_bytes*REAL(n_grid, dp)*REAL(MIN(16, n_ao) + MIN(n_grid, grid_pair_panel_cols), dp) + &
-                                   real_bytes*REAL(pair_batch_size, dp)*REAL(n_images, dp) + &
+              projection_workspace + complex_bytes*REAL(n_grid, dp)*REAL(n_ao + panel_columns, dp) + &
+              REAL(n_threads, dp)*(real_bytes*REAL(pair_batch_size, dp)*REAL(n_images, dp) + &
                                    complex_bytes*REAL(pair_batch_size, dp)*n_round)
       bytes = MAX(bytes, projection_workspace + &
                   complex_bytes*REAL(n_threads, dp)*REAL(n_grid, dp)*REAL(n_ao + 32, dp))
