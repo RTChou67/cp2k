@@ -76,6 +76,7 @@ MODULE gw_ri_rs_small_cell_full_kp_lattice
              gamma_auxiliary_charges, &
              grid_pair_indices, &
              grid_pair_gemm, &
+             grid_pair_gemm_panel, &
              grid_pair_multiply_panel, &
              grid_pair_upper_multiply, &
              grid_pair_unpack_panel, &
@@ -168,15 +169,38 @@ CONTAINS
       CPASSERT(SIZE(pairs, KIND=int_8) == INT(n, int_8)*(n + 1)/2)
       DO first = 1, n, grid_pair_panel_cols
          width = MIN(grid_pair_panel_cols, n - first + 1)
-         CALL zgemm('N', 'C', first + width - 1, width, ninner, z_one, left, n, &
-                    right(first, 1), n, z_zero, panel, n)
+         CALL grid_pair_gemm_panel(n, ninner, first, width, left, right, panel)
          DO j = first, first + width - 1
             offset = INT(INT(j, int_8)*(j - 1)/2)
             pairs(offset + 1:offset + j) = panel(1:j, j - first + 1)
-            pairs(offset + j) = CMPLX(REAL(pairs(offset + j), dp), 0.0_dp, dp)
          END DO
       END DO
    END SUBROUTINE grid_pair_gemm
+
+! **************************************************************************************************
+!> \brief Compute a column panel of A B^H through its last diagonal.
+!> \param n grid points
+!> \param ninner contracted dimension
+!> \param first first column of the panel
+!> \param width number of columns
+!> \param left A
+!> \param right B; the caller supplies a Hermitian product
+!> \param panel ...
+! **************************************************************************************************
+   SUBROUTINE grid_pair_gemm_panel(n, ninner, first, width, left, right, panel)
+      INTEGER, INTENT(IN)                                :: n, ninner, first, width
+      COMPLEX(KIND=dp), INTENT(IN)                       :: left(n, ninner), right(n, ninner)
+      COMPLEX(KIND=dp), INTENT(OUT)                      :: panel(n, width)
+
+      INTEGER                                            :: col, row
+
+      CALL zgemm('N', 'C', first + width - 1, width, ninner, z_one, left, n, &
+                 right(first, 1), n, z_zero, panel, n)
+      DO col = 1, width
+         row = first + col - 1
+         panel(row, col) = CMPLX(REAL(panel(row, col), dp), 0.0_dp, dp)
+      END DO
+   END SUBROUTINE grid_pair_gemm_panel
 
 ! **************************************************************************************************
 !> \brief Y=U Z with U=triu(H,1)+diag(H)/2, so that H=U+U^H.

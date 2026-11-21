@@ -66,6 +66,8 @@ MODULE gw_ri_rs_small_cell_full_kp_types
       REAL(dp)                                  :: progress_start = 0.0_dp
       CHARACTER(LEN=32)                         :: progress_label = ''
       TYPE(gamma_correction_type)               :: gamma_correction
+      ! W is stored only where q <= w_q_partner(q), in the original cyclic q slots.
+      INTEGER, ALLOCATABLE                      :: w_q_partner(:)
       TYPE(ri_q_matrix_block_type), ALLOCATABLE :: chi_q_frequency(:), W_PQ_tau(:)
       ! AO image operators retained only until the Gamma-correction contraction.
       TYPE(dbcsr_p_type), POINTER               :: gamma_corr_d(:, :) => NULL(), &
