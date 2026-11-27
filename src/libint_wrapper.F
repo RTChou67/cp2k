@@ -148,7 +148,7 @@ CONTAINS
 !> \param destination original block with the first Cartesian index varying fastest
 !> \param ncart Cartesian shell sizes in original center order
 !> \param permutation original center index for each canonical center
-!> \param ncomponents one integral component or twelve center derivatives
+!> \param ncomponents one integral component, three Cartesian virial rows or twelve center derivatives
 !> \param nplanes number of independent planes
 ! **************************************************************************************************
    PURE SUBROUTINE reorder_eri_block(source, destination, ncart, permutation, ncomponents, nplanes)

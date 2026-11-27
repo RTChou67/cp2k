@@ -59,7 +59,7 @@ CONTAINS
 !> \param abcd fixed internal bra and ket displacements
 !> \param cell cell for fractional-coordinate virial weighting
 !> \param virial whether to accumulate virial components
-!> \param derivatives Cartesian derivatives followed by three center-resolved virial planes
+!> \param derivatives twelve Cartesian derivatives followed by nine virial components
 ! **************************************************************************************************
    SUBROUTINE add_ssss_derivatives(records, abcd, cell, virial, derivatives)
       TYPE(eri_primitive_data_type), INTENT(IN)          :: records(:)
@@ -69,31 +69,40 @@ CONTAINS
       REAL(dp), CONTIGUOUS, INTENT(INOUT)                :: derivatives(:, :)
 
       INTEGER                                            :: first, first_order, i, j, k
-      LOGICAL                                            :: weighted
-      REAL(dp) :: ab(3), cd(3), d1(3), dg(3, 4), f0, f0_shift(3), f1(3), f1_shift(3, 3), frac(4), &
-         origin(3, 4), rel(3), scaled_f0(3), scaled_f1(3, 3), shift(3)
+      REAL(dp)                                           :: ab(3), cd(3), d1(3), dg(3, 4), f0, &
+                                                            f1(3), frac(4), moment(3, 3), rel(3), &
+                                                            x(3)
 
       first_order = MIN(1, records(1)%prepared_max_order) + 1
       CPASSERT(first_order == 2)
-      weighted = virial .AND. SIZE(records) > 1
+      x = records(1)%P - records(1)%Q
       f0 = records(1)%Fm(1)
-      f1 = (records(1)%P - records(1)%Q)*records(1)%Fm(first_order)
-      f0_shift = 0.0_dp
-      f1_shift = 0.0_dp
-      DO i = 2, SIZE(records)
-         ASSOCIATE (p => records(i))
-            d1 = (p%P - p%Q)*p%Fm(first_order)
-            f0 = f0 + p%Fm(1)
-            f1 = f1 + d1
-            IF (virial) THEN
-               shift = p%centers(:, 3) - records(1)%centers(:, 3)
-               f0_shift = f0_shift + p%Fm(1)*shift
+      f1 = x*records(1)%Fm(first_order)
+      IF (virial) THEN
+         ! Only the product-center separation varies within a displacement group.
+         DO j = 1, 3
+            moment(j:3, j) = f1(j:3)*x(j)
+         END DO
+         DO i = 2, SIZE(records)
+            ASSOCIATE (p => records(i))
+               x = p%P - p%Q
+               d1 = x*p%Fm(first_order)
+               f0 = f0 + p%Fm(1)
+               f1 = f1 + d1
                DO j = 1, 3
-                  f1_shift(:, j) = f1_shift(:, j) + d1*shift(j)
+                  moment(j:3, j) = moment(j:3, j) + d1(j:3)*x(j)
                END DO
-            END IF
-         END ASSOCIATE
-      END DO
+            END ASSOCIATE
+         END DO
+      ELSE
+         DO i = 2, SIZE(records)
+            ASSOCIATE (p => records(i))
+               d1 = (p%P - p%Q)*p%Fm(first_order)
+               f0 = f0 + p%Fm(1)
+               f1 = f1 + d1
+            END ASSOCIATE
+         END DO
+      END IF
 
       ASSOCIATE (p => records(1))
          ! Differentiate the pair attenuation and the product-center separation in the ssss seed.
@@ -111,22 +120,22 @@ CONTAINS
          END DO
 
          IF (virial) THEN
-            DO k = 1, 4
-               CALL real_to_scaled(origin(:, k), p%centers(:, k), cell)
+            moment(1, 2) = moment(2, 1)
+            moment(1, 3) = moment(3, 1)
+            moment(2, 3) = moment(3, 2)
+            DO j = 1, 3
+               moment(:, j) = f0*(ab*abcd(j, 1) + cd*abcd(j, 2)) - 2.0_dp*p%Rho*moment(:, j)
             END DO
-            IF (weighted) THEN
-               CALL real_to_scaled(scaled_f0, f0_shift, cell)
-               scaled_f1 = (-2.0_dp*p%Rho)*MATMUL(f1_shift, TRANSPOSE(cell%h_inv))
+            IF (cell%orthorhombic) THEN
+               DO j = 1, 3
+                  moment(:, j) = moment(:, j)*cell%h_inv(j, j)
+               END DO
+            ELSE
+               moment = MATMUL(moment, TRANSPOSE(cell%h_inv))
             END IF
             DO j = 1, 3
-               DO k = 1, 4
-                  first = 12*j + 3*k - 2
-                  derivatives(1, first:first + 2) = derivatives(1, first:first + 2) + dg(:, k)*origin(j, k)
-               END DO
-               IF (weighted) THEN
-                  derivatives(1, 12*j + 7:12*j + 9) = derivatives(1, 12*j + 7:12*j + 9) + cd*scaled_f0(j) - frac(3)*scaled_f1(:, j)
-               derivatives(1, 12*j + 10:12*j + 12) = derivatives(1, 12*j + 10:12*j + 12) - cd*scaled_f0(j) - frac(4)*scaled_f1(:, j)
-               END IF
+               first = 13 + 3*(j - 1)
+               derivatives(1, first:first + 2) = derivatives(1, first:first + 2) + moment(:, j)
             END DO
          END IF
       END ASSOCIATE
@@ -357,7 +366,7 @@ CONTAINS
 !> \param records prepared quartets with common exponents and pair displacements
 !> \param abcd fixed pair displacements
 !> \param cell cell for fractional-coordinate virial weighting
-!> \param derivatives Cartesian derivatives followed by three center-resolved virial planes
+!> \param derivatives twelve Cartesian derivatives followed by nine virial components
 !> \param nc active rows in the reusable derivatives buffer
 ! **************************************************************************************************
    SUBROUTINE add_hermite_derivatives(work, records, abcd, cell, derivatives, nc)
@@ -370,9 +379,9 @@ CONTAINS
 
       INTEGER                                            :: a, b, dha, dhb, dims(4), first, ha, hb, &
                                                             i, j, k, last, m, na, nb, p, plane, t
-      REAL(dp) :: delta(3), f, moments(3, max_hermites), mono(max_monomials), origin(3, 4), &
-         radial(max_radial_moments), rho_power(0:max_order), shifted(max_monomials), &
-         zero(max_hermites)
+      REAL(dp) :: delta(3), f, moments(3, max_hermites), mono(max_monomials), &
+         radial(max_radial_moments), relative(3, 3), rho_power(0:max_order), &
+         shifted(max_monomials), zero(max_hermites)
 
       radial(:work%nradial) = 0.0_dp
       rho_power(0) = 1.0_dp
@@ -415,9 +424,9 @@ CONTAINS
                     work%powers(:, j)*zero(work%lower_index(:, j)) - shifted(work%upper_index(:, j))
             CALL real_to_scaled(moments(:, j), delta, cell)
          END DO
-         DO j = 1, 4
-            CALL real_to_scaled(origin(:, j), records(1)%centers(:, j), cell)
-         END DO
+         CALL real_to_scaled(relative(:, 1), abcd(:, 1), cell)
+         CALL real_to_scaled(relative(:, 2), -abcd(:, 2), cell)
+         CALL real_to_scaled(relative(:, 3), records(1)%centers(:, 3) - records(1)%centers(:, 2), cell)
       END IF
 
       CALL pair_expansions(work%powers, work%lower(1:2), work%upper(1:2), records(1)%exponents(1:2), abcd(:, 1), work%bra)
@@ -468,16 +477,21 @@ CONTAINS
             END DO
             derivatives(:nc, :12) = derivatives(:nc, :12) + work%force(:nc, :)
             IF (work%virial) THEN
+               ! With B as the origin, the reference-cell virial uses A-B, D-C and C-B.
                DO m = 1, 3
-                  DO k = 1, 12
-                     first = 12*m + k
-                     derivatives(:nc, first) = derivatives(:nc, first) + origin(m, (k - 1)/3 + 1)*work%force(:nc, k)
+                  DO k = 1, 3
+                     first = 12 + 3*(m - 1) + k
+                     derivatives(:nc, first) = derivatives(:nc, first) + relative(m, 1)*work%force(:nc, k) + &
+                                               relative(m, 2)*work%force(:nc, k + 9) + &
+                                               relative(m, 3)*(work%force(:nc, k + 6) + work%force(:nc, k + 9))
                   END DO
                END DO
+               ! The ket pair translates together. Contract the C+D derivative against each image moment.
+               work%ket(:dhb, :nb, 1:3) = work%ket(:dhb, :nb, 1:3) + work%ket(:dhb, :nb, 4:6)
             END IF
          ELSE
-            DO k = 1, 6
-               last = 12*plane + 6 + k
+            DO k = 1, 3
+               last = 12 + 3*(plane - 1) + k
                CALL DGEMM('N', 'N', na, nb, dhb, 1.0_dp, work%intermediate, na, work%ket(1, 1, k), &
                           max_pair_hermites, 1.0_dp, derivatives(:nc, last), na)
             END DO
@@ -489,8 +503,8 @@ CONTAINS
 !> \brief Extract one angular block and its screening maxima from the group sums.
 !> \param work angular lookup tables
 !> \param l angular momenta in original center order
-!> \param derivatives Cartesian derivatives followed by three center-resolved virial planes
-!> \param virial whether planes are present
+!> \param derivatives twelve Cartesian derivatives followed by nine virial components
+!> \param virial whether virial components are present
 !> \param forces,stress destination blocks for the angular quartet
 !> \param force_max,stress_max maxima for Cartesian screening
 ! **************************************************************************************************
@@ -519,10 +533,10 @@ CONTAINS
       END DO
       IF (virial) THEN
          DO j = 1, 3
-            DO k = 1, 12
+            DO k = 1, 3
 !$OMP SIMD REDUCTION(MAX:stress_max)
                DO i = 1, ncart
-                  value = derivatives(work%cartesian_index(start + i), 12*j + k)
+                  value = derivatives(work%cartesian_index(start + i), 12 + 3*(j - 1) + k)
                   stress(i, k, j) = value
                   stress_max = MAX(stress_max, ABS(value))
                END DO

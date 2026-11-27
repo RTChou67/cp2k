@@ -161,7 +161,7 @@ CONTAINS
                   log10_pmax, log_2, max_contraction_val, max_val1, max_val2, max_val2_set, &
                   my_adiabatic_rescale_factor, pmax_atom, pmax_blocks, pmax_entry, pmax_tmp, ra(3), rab2, &
                   rb(3), rc(3), rcd2, rd(3), spherical_estimate, spherical_estimate_virial, symm_fac, &
-                  tmp_virial(3, 3), virial_terms(12, 3, 2)
+                  tmp_virial(3, 3), virial_terms(3, 3, 2)
       REAL(dp), ALLOCATABLE, DIMENSION(:) :: ede_buffer1, ede_buffer2, &
                                              ede_work, ede_work2, ede_work2_virial, ede_work_forces, &
                                              ede_work_virial, pac_buf, pac_buf_beta, pac_buf_resp, pac_buf_resp_beta, pad_buf, &
@@ -631,10 +631,10 @@ CONTAINS
       ALLOCATE (ede_buffer2(ncos_max**4))
 
       IF (use_virial) THEN
-         ALLOCATE (primitive_forces_virial(12*nsgf_max**4*3))
+         ALLOCATE (primitive_forces_virial(9*nsgf_max**4))
          primitive_forces_virial = 0.0_dp
-         ALLOCATE (ede_work_virial(ncos_max**4*12*3))
-         ALLOCATE (ede_work2_virial(ncos_max**4*12*3))
+         ALLOCATE (ede_work_virial(9*ncos_max**4))
+         ALLOCATE (ede_work2_virial(9*ncos_max**4))
          tmp_virial = 0.0_dp
       ELSE
          ! dummy allocation
@@ -1284,7 +1284,7 @@ CONTAINS
 
                            spherical_estimate_virial = 0.0_dp
                            IF (use_virial .AND. cartesian_estimate_virial /= 0.0_dp) THEN
-                              DO i = 1, 3*nints
+                              DO i = 1, 9*(nints/12)
                                  spherical_estimate_virial = MAX(spherical_estimate_virial, ABS(primitive_forces_virial(i)))
                               END DO
                            END IF
@@ -1410,13 +1410,8 @@ CONTAINS
                            END DO
                         END IF
                         IF (contract_virial) THEN
-                           DO coord = 1, 12
-                              direction = MOD(coord - 1, 3) + 1
-                              DO i = 1, 3
-                                 DO ispin = 1, my_nspins
-                                    tmp_virial(direction, i) = tmp_virial(direction, i) - virial_terms(coord, i, ispin)
-                                 END DO
-                              END DO
+                           DO ispin = 1, my_nspins
+                              tmp_virial = tmp_virial - virial_terms(:, :, ispin)
                            END DO
                         END IF
 
@@ -1848,7 +1843,7 @@ CONTAINS
 !> \param pac AC density block
 !> \param fac spin and shell-quartet symmetry factor
 !> \param prim contracted force integrals
-!> \param prim_virial contracted coordinate-weighted integrals, used only when requested
+!> \param prim_virial contracted virial integrals in Cartesian derivative and fractional coordinate order
 !> \param contract_forces whether force integrals passed screening
 !> \param contract_virial whether virial integrals passed screening
 !> \param force_terms density contractions in derivative order
@@ -1864,9 +1859,9 @@ CONTAINS
                                           virial_terms, pbd_resp, pbc_resp, pad_resp, pac_resp, resp_only)
       INTEGER, INTENT(IN) :: ma_max, mb_max, mc_max, md_max
       REAL(dp), INTENT(IN) :: pbd(mb_max, md_max), pbc(mb_max, mc_max), pad(ma_max, md_max), pac(ma_max, mc_max), fac
-      REAL(dp), INTENT(IN) :: prim(ma_max*mb_max*mc_max*md_max, 12), prim_virial(ma_max*mb_max*mc_max*md_max, 12, *)
+      REAL(dp), INTENT(IN) :: prim(ma_max*mb_max*mc_max*md_max, 12), prim_virial(ma_max*mb_max*mc_max*md_max, 3, *)
       LOGICAL, INTENT(IN) :: contract_forces, contract_virial
-      REAL(dp), INTENT(OUT) :: force_terms(12), virial_terms(12, 3)
+      REAL(dp), INTENT(OUT) :: force_terms(12), virial_terms(3, 3)
       REAL(dp), OPTIONAL, INTENT(IN) :: pbd_resp(mb_max, md_max), pbc_resp(mb_max, mc_max), &
                                         pad_resp(ma_max, md_max), pac_resp(ma_max, mc_max)
       LOGICAL, OPTIONAL, INTENT(IN) :: resp_only
@@ -1917,7 +1912,7 @@ CONTAINS
             END IF
             IF (contract_virial) THEN
                DO plane = 1, 3
-                  DO coord = 1, 12
+                  DO coord = 1, 3
                      total = virial_terms(coord, plane)
                      DO j = first, last
                         total = total + weights(j - first + 1)*prim_virial(j, coord, plane)

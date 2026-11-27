@@ -462,7 +462,7 @@ CONTAINS
       LOGICAL, INTENT(IN)                                :: do_periodic, use_virial
       REAL(dp), DIMENSION(*)                             :: ede_work_virial, ede_work2_virial
       REAL(dp), &
-         DIMENSION(nsgfa, nsgfb, nsgfc, nsgfd, 12, 3)    :: primitive_integrals_virial
+         DIMENSION(nsgfa, nsgfb, nsgfc, nsgfd, 3, 3)     :: primitive_integrals_virial
       REAL(dp)                                           :: cart_estimate_virial
 
       INTEGER :: ipgf, jpgf, kpgf, la, lb, lc, ld, list_ij, list_kl, lpgf, ncoa, ncob, ncoc, ncod, &

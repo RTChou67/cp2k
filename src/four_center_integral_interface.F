@@ -248,7 +248,7 @@ CONTAINS
 !> \param potential_parameter physical radial operator
 !> \param lower,upper angular range for the four centers
 !> \param do_periodic whether to enumerate periodic translations
-!> \param use_virial whether to compute center-resolved virial planes
+!> \param use_virial whether to compute the virial tensor
 ! **************************************************************************************************
    SUBROUTINE prepare_four_center_derivative_batch(context, list1, list2, nproducts, &
                                                    log10_pmax, log10_eps_schwarz, neighbor_cells, &
@@ -288,7 +288,7 @@ CONTAINS
       IF (.NOT. (ssss .OR. hermite)) RETURN
 
       ncart = PRODUCT(ncoset(upper) - ncoset(lower - 1))
-      ncomponents = MERGE(48, 12, use_virial)
+      ncomponents = MERGE(21, 12, use_virial)
       IF (ALLOCATED(context%derivative_blocks)) THEN
          IF (SIZE(context%derivative_blocks, 1) < ncart .OR. SIZE(context%derivative_blocks, 2) < ncomponents) THEN
             DEALLOCATE (context%derivative_blocks)
@@ -454,16 +454,17 @@ CONTAINS
       REAL(dp), DIMENSION(ncoa*ncob*ncoc*ncod, 12)       :: work, work2, work_forces
       REAL(dp), DIMENSION(ncoa*ncob*ncoc*ncod)           :: buffer1, buffer2
       LOGICAL, INTENT(IN)                                :: use_virial
-      REAL(dp) :: work_virial(ncoa*ncob*ncoc*ncod, 12, 3), work2_virial(ncoa*ncob*ncoc*ncod, 12, 3)
+      REAL(dp) :: work_virial(ncoa*ncob*ncoc*ncod, 3, 3), work2_virial(ncoa*ncob*ncoc*ncod, 3, 3)
       REAL(dp), &
-         DIMENSION(nsgfa, nsgfb, nsgfc, nsgfd, 12, 3)    :: primitives_virial
+         DIMENSION(nsgfa, nsgfb, nsgfc, nsgfd, 3, 3)     :: primitives_virial
       TYPE(cell_type), POINTER                           :: cell
       REAL(dp)                                           :: tmp_max_all_virial
 
       INTEGER                                            :: angular_momenta(4), group_index, i, j, &
                                                             k, m, mysize, next_group, &
                                                             permutation(4)
-      REAL(dp)                                           :: force_max, scoord(12), stress_max
+      REAL(dp)                                           :: force_max, origin(3), relative(3, 3), &
+                                                            stress_max
 
       mysize = ncoa*ncob*ncoc*ncod
 
@@ -472,7 +473,7 @@ CONTAINS
             work2(1, :) = context%derivative_blocks(1, :12)
             force_max = MAXVAL(ABS(work2))
             IF (use_virial) THEN
-               work2_virial(1, :, :) = RESHAPE(context%derivative_blocks(1, 13:48), [12, 3])
+               work2_virial(1, :, :) = RESHAPE(context%derivative_blocks(1, 13:21), [3, 3])
                stress_max = MAXVAL(ABS(work2_virial))
             END IF
          ELSE
@@ -521,13 +522,18 @@ CONTAINS
                END DO
             END DO
             IF (use_virial) THEN
-               DO j = 1, 4
-                  CALL real_to_scaled(scoord(3*j - 2:3*j), context%products(i)%centers(:, permutation(j)), cell)
-               END DO
-               DO k = 1, 12
-                  DO j = 1, mysize
-                     DO m = 1, 3
-                        work_virial(j, k, m) = work_virial(j, k, m) + work_forces(j, k)*scoord(INT((k - 1)/3)*3 + m)
+               ! The four center derivatives sum to zero. Use the canonical second center as the origin.
+               ASSOCIATE (centers => context%products(i)%centers)
+                  origin = centers(:, permutation(2))
+                  CALL real_to_scaled(relative(:, 1), centers(:, permutation(1)) - origin, cell)
+                  CALL real_to_scaled(relative(:, 2), centers(:, permutation(3)) - origin, cell)
+                  CALL real_to_scaled(relative(:, 3), centers(:, permutation(4)) - origin, cell)
+               END ASSOCIATE
+               DO m = 1, 3
+                  DO k = 1, 3
+                     DO j = 1, mysize
+                        work_virial(j, k, m) = work_virial(j, k, m) + work_forces(j, k)*relative(m, 1) + &
+                                               work_forces(j, k + 6)*relative(m, 2) + work_forces(j, k + 9)*relative(m, 3)
                      END DO
                   END DO
                END DO
@@ -559,9 +565,9 @@ CONTAINS
 
       IF (use_virial .AND. tmp_max_all_virial >= eps_schwarz) THEN
          IF (.NOT. context%derivatives_prepared) THEN
-            CALL reorder_eri_block(work_virial, work2_virial, [ncoa, ncob, ncoc, ncod], permutation, 12, 3)
+            CALL reorder_eri_block(work_virial, work2_virial, [ncoa, ncob, ncoc, ncod], permutation, 3, 3)
          END IF
-         DO i = 1, 12
+         DO i = 1, 3
             DO m = 1, 3
                CALL contract(ncoa, ncob, ncoc, ncod, nsoa, nsob, nsoc, nsod, &
                              n_a, n_b, n_c, n_d, nl_a, nl_b, nl_c, nl_d, work2_virial(1, i, m), &
