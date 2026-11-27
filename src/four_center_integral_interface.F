@@ -17,6 +17,11 @@ MODULE four_center_integral_interface
    USE cell_types,                      ONLY: cell_type,&
                                               pbc,&
                                               real_to_scaled
+   USE four_center_integral_derivatives,ONLY: add_hermite_derivatives,&
+                                              add_ssss_derivatives,&
+                                              eri4_hermite_workspace_type,&
+                                              extract_hermite_derivatives,&
+                                              prepare_hermite_workspace
    USE four_center_integral_preparation,ONLY: min_image_gap_sq,&
                                               prepare_eri4_pair,&
                                               prepare_eri4_primitive,&
@@ -26,7 +31,8 @@ MODULE four_center_integral_interface
                                               eri4_pgf_image_type,&
                                               eri4_pgf_pair_type
    USE hfx_contraction_methods,         ONLY: contract
-   USE input_constants,                 ONLY: do_potential_mix_cl_trunc,&
+   USE input_constants,                 ONLY: do_potential_id,&
+                                              do_potential_mix_cl_trunc,&
                                               do_potential_short,&
                                               do_potential_truncated
    USE integral_library_types,          ONLY: coulomb_operator_type
@@ -38,13 +44,14 @@ MODULE four_center_integral_interface
         cp_libint_init_eri, cp_libint_init_eri1, cp_libint_set_contrdepth, &
         cp_libint_set_params_eri, cp_libint_set_params_eri_deriv, cp_libint_t, &
         eri_primitive_data_type, get_eri_permutation, libint_can_contract_images, reorder_eri_block
-   USE orbital_pointers,                ONLY: nco
+   USE orbital_pointers,                ONLY: nco,&
+                                              ncoset
 #include "./base/base_uses.f90"
 
    IMPLICIT NONE
    PRIVATE
    PUBLIC :: four_center_integral_init, four_center_integral_cleanup, &
-             prepare_four_center_batch, evaluate_eri, &
+             prepare_four_center_batch, prepare_four_center_derivative_batch, evaluate_eri, &
              evaluate_deriv_eri, &
              evaluate_eri_screen
 
@@ -56,6 +63,9 @@ MODULE four_center_integral_interface
       TYPE(cp_libint_image_workspace_type), ALLOCATABLE :: image_workspace
       TYPE(eri_primitive_data_type), ALLOCATABLE :: products(:)
       TYPE(eri4_image_group_type), ALLOCATABLE :: image_groups(:)
+      TYPE(eri4_hermite_workspace_type), ALLOCATABLE :: hermite
+      REAL(dp), ALLOCATABLE :: derivative_blocks(:, :)
+      LOGICAL :: derivatives_prepared = .FALSE.
       INTEGER :: nproducts = 0, nimage_groups = 0
    END TYPE four_center_integral_context_type
 
@@ -74,15 +84,16 @@ CONTAINS
 !> \param potential_parameter physical radial operator
 !> \param m_max maximum radial order including any derivative increment
 !> \param do_periodic whether to enumerate periodic translations
-!> \param group_images whether the caller can consume unweighted sums over images
+!> \param group_images whether the caller can use Libint-contracted groups
+!> \param force_image_groups whether the caller needs the groups independently of Libint support
 ! **************************************************************************************************
    SUBROUTINE prepare_four_center_batch(context, list1, list2, nproducts, &
                                         log10_pmax, log10_eps_schwarz, neighbor_cells, &
-                                        cell, potential_parameter, m_max, do_periodic, group_images)
+                                        cell, potential_parameter, m_max, do_periodic, group_images, force_image_groups)
 
       TYPE(four_center_integral_context_type), &
          INTENT(INOUT)                                   :: context
-      TYPE(eri4_pgf_pair_type)                           :: list1, list2
+      TYPE(eri4_pgf_pair_type), INTENT(IN)               :: list1, list2
       INTEGER, INTENT(OUT)                               :: nproducts
       REAL(dp), INTENT(IN)                               :: log10_pmax, log10_eps_schwarz
       TYPE(eri4_cell_type), DIMENSION(:), POINTER        :: neighbor_cells
@@ -90,12 +101,13 @@ CONTAINS
       TYPE(coulomb_operator_type)                        :: potential_parameter
       INTEGER, INTENT(IN)                                :: m_max
       LOGICAL, INTENT(IN)                                :: do_periodic, group_images
+      LOGICAL, INTENT(IN), OPTIONAL                      :: force_image_groups
 
       REAL(dp), PARAMETER                                :: r_cutoff_eps = 1.0E-12_dp
 
       INTEGER                                            :: first, i, j, k, k_max, nimages1, &
                                                             nimages2, tmp_i4
-      LOGICAL                                            :: has_r_cutoff
+      LOGICAL                                            :: collect_groups, has_r_cutoff
       REAL(dp) :: C11(3), EtaInv, min_img_delta, P(3), pgf_max_1, pgf_max_2, PQ(3), pq2, Q(3), R1, &
          R2, r_cutoff_sq, r_cutoff_sq_guard, rc(3), rcut_eff, rd(3), rpq2, S1234, S1234a, S1234b, &
          shift(3), temp(3), temp_CC(3), temp_DD(3), tmp_D(3), Zeta_C, Zeta_D
@@ -110,7 +122,10 @@ CONTAINS
       nproducts = 0
       context%nproducts = 0
       context%nimage_groups = 0
+      context%derivatives_prepared = .FALSE.
       IF (nimages1 == 0 .OR. nimages2 == 0) RETURN
+      collect_groups = libint_can_contract_images .AND. group_images
+      IF (PRESENT(force_image_groups)) collect_groups = collect_groups .OR. force_image_groups
       CALL prepare_eri4_product(list1, list2, m_max, product)
       EtaInv = list2%ZetaInv
       Zeta_C = list2%zeta
@@ -200,7 +215,8 @@ CONTAINS
                                            context%products(nproducts))
             END DO
 
-            IF (libint_can_contract_images .AND. group_images .AND. do_periodic .AND. nproducts > first) THEN
+            IF (collect_groups .AND. do_periodic .AND. nproducts > first) THEN
+               IF (.NOT. ALLOCATED(context%image_groups)) ALLOCATE (context%image_groups(16))
                IF (context%nimage_groups == SIZE(context%image_groups)) THEN
                   ALLOCATE (tmp_groups((3*context%nimage_groups + 2)/2))
                   tmp_groups(1:context%nimage_groups) = context%image_groups
@@ -219,6 +235,96 @@ CONTAINS
 
       context%nproducts = nproducts
    END SUBROUTINE prepare_four_center_batch
+
+! **************************************************************************************************
+!> \brief Prepare a primitive quartet and its Cartesian derivatives when image sums can be reused.
+!> \param context owning per-thread geometry and derivative workspace
+!> \param list1,list2 bra and ket primitive pairs
+!> \param nproducts number of retained image quartets
+!> \param log10_pmax logarithmic density bound
+!> \param log10_eps_schwarz logarithmic integral screening threshold
+!> \param neighbor_cells periodic image translations
+!> \param cell simulation cell
+!> \param potential_parameter physical radial operator
+!> \param lower,upper angular range for the four centers
+!> \param do_periodic whether to enumerate periodic translations
+!> \param use_virial whether to compute center-resolved virial planes
+! **************************************************************************************************
+   SUBROUTINE prepare_four_center_derivative_batch(context, list1, list2, nproducts, &
+                                                   log10_pmax, log10_eps_schwarz, neighbor_cells, &
+                                                   cell, potential_parameter, lower, upper, do_periodic, use_virial)
+      TYPE(four_center_integral_context_type), &
+         INTENT(INOUT)                                   :: context
+      TYPE(eri4_pgf_pair_type), INTENT(IN)               :: list1, list2
+      INTEGER, INTENT(OUT)                               :: nproducts
+      REAL(dp), INTENT(IN)                               :: log10_pmax, log10_eps_schwarz
+      TYPE(eri4_cell_type), POINTER                      :: neighbor_cells(:)
+      TYPE(cell_type), POINTER                           :: cell
+      TYPE(coulomb_operator_type), INTENT(IN)            :: potential_parameter
+      INTEGER, INTENT(IN)                                :: lower(4), upper(4)
+      LOGICAL, INTENT(IN)                                :: do_periodic, use_virial
+
+      INTEGER, PARAMETER                                 :: min_images_per_group = 4
+
+      INTEGER                                            :: group, i, j, ncart, ncomponents, ngroups
+      LOGICAL                                            :: hermite, radial_moments, ssss
+      REAL(dp)                                           :: abcd(3, 2)
+
+      radial_moments = potential_parameter%potential_type /= do_potential_id
+      ssss = radial_moments .AND. ALL(upper == 0)
+      hermite = radial_moments .AND. do_periodic .AND. ALL(upper <= 2) .AND. .NOT. ssss
+      CALL prepare_four_center_batch(context, list1, list2, nproducts, log10_pmax, log10_eps_schwarz, neighbor_cells, &
+                                     cell, potential_parameter, SUM(upper) + 1, do_periodic, &
+                                     group_images=.NOT. use_virial, force_image_groups=ssss .OR. hermite)
+      IF (nproducts == 0) RETURN
+
+      IF (hermite) THEN
+         ngroups = nproducts
+         DO group = 1, context%nimage_groups
+            ngroups = ngroups - (context%image_groups(group)%last - context%image_groups(group)%first)
+         END DO
+         hermite = nproducts/ngroups >= min_images_per_group
+      END IF
+      IF (.NOT. (ssss .OR. hermite)) RETURN
+
+      ncart = PRODUCT(ncoset(upper) - ncoset(lower - 1))
+      ncomponents = MERGE(48, 12, use_virial)
+      IF (ALLOCATED(context%derivative_blocks)) THEN
+         IF (SIZE(context%derivative_blocks, 1) < ncart .OR. SIZE(context%derivative_blocks, 2) < ncomponents) THEN
+            DEALLOCATE (context%derivative_blocks)
+         END IF
+      END IF
+      IF (.NOT. ALLOCATED(context%derivative_blocks)) ALLOCATE (context%derivative_blocks(ncart, ncomponents))
+      context%derivative_blocks(:ncart, :ncomponents) = 0.0_dp
+      IF (hermite) THEN
+         IF (.NOT. ALLOCATED(context%hermite)) ALLOCATE (context%hermite)
+         CALL prepare_hermite_workspace(context%hermite, lower, upper, use_virial)
+      END IF
+
+      i = 1
+      group = 1
+      DO WHILE (i <= nproducts)
+         j = i
+         IF (group <= context%nimage_groups) THEN
+            IF (i == context%image_groups(group)%first) THEN
+               j = context%image_groups(group)%last
+               abcd = context%image_groups(group)%displacements
+               group = group + 1
+            END IF
+         END IF
+         IF (j == i) THEN
+            abcd(:, 1) = context%products(i)%centers(:, 1) - context%products(i)%centers(:, 2)
+            abcd(:, 2) = context%products(i)%centers(:, 3) - context%products(i)%centers(:, 4)
+         END IF
+         IF (ssss) THEN
+            CALL add_ssss_derivatives(context%products(i:j), abcd, cell, use_virial, context%derivative_blocks)
+         ELSE
+            CALL add_hermite_derivatives(context%hermite, context%products(i:j), abcd, cell, context%derivative_blocks, ncart)
+         END IF
+         i = j + 1
+      END DO
+      context%derivatives_prepared = .TRUE.
+   END SUBROUTINE prepare_four_center_derivative_batch
 
 ! **************************************************************************************************
 !> \brief Initialize the four-center energy and first-derivative workspaces.
@@ -246,7 +352,11 @@ CONTAINS
       TYPE(four_center_integral_context_type), &
          INTENT(INOUT)                                   :: context
 
-      IF (ALLOCATED(context%image_workspace)) DEALLOCATE (context%image_workspace, context%image_groups)
+      IF (ALLOCATED(context%image_workspace)) DEALLOCATE (context%image_workspace)
+      IF (ALLOCATED(context%image_groups)) DEALLOCATE (context%image_groups)
+      IF (ALLOCATED(context%hermite)) DEALLOCATE (context%hermite)
+      IF (ALLOCATED(context%derivative_blocks)) DEALLOCATE (context%derivative_blocks)
+      context%derivatives_prepared = .FALSE.
       CALL cp_libint_cleanup_eri(context%eri)
       CALL cp_libint_cleanup_eri1(context%deriv)
       DEALLOCATE (context%products)
@@ -341,12 +451,10 @@ CONTAINS
       REAL(dp), DIMENSION(ncod, nsod), INTENT(IN)        :: angular_d
       REAL(dp), INTENT(IN)                               :: weight_a(nl_a), weight_b(nl_b), &
                                                             weight_c(nl_c), weight_d(nl_d)
-      REAL(dp) :: work(ncoa*ncob*ncoc*ncod, 12), work2(ncoa, ncob, ncoc, ncod, 12), &
-         work_forces(ncoa*ncob*ncoc*ncod, 12)
+      REAL(dp), DIMENSION(ncoa*ncob*ncoc*ncod, 12)       :: work, work2, work_forces
       REAL(dp), DIMENSION(ncoa*ncob*ncoc*ncod)           :: buffer1, buffer2
       LOGICAL, INTENT(IN)                                :: use_virial
-      REAL(dp) :: work_virial(ncoa*ncob*ncoc*ncod, 12, 3), &
-         work2_virial(ncoa, ncob, ncoc, ncod, 12, 3)
+      REAL(dp) :: work_virial(ncoa*ncob*ncoc*ncod, 12, 3), work2_virial(ncoa*ncob*ncoc*ncod, 12, 3)
       REAL(dp), &
          DIMENSION(nsgfa, nsgfb, nsgfc, nsgfd, 12, 3)    :: primitives_virial
       TYPE(cell_type), POINTER                           :: cell
@@ -355,72 +463,93 @@ CONTAINS
       INTEGER                                            :: angular_momenta(4), group_index, i, j, &
                                                             k, m, mysize, next_group, &
                                                             permutation(4)
-      REAL(dp)                                           :: scoord(12)
+      REAL(dp)                                           :: force_max, scoord(12), stress_max
 
       mysize = ncoa*ncob*ncoc*ncod
 
-      work = 0.0_dp
-
-      IF (use_virial) THEN
-         work_virial = 0.0_dp
-      END IF
-
-      CALL get_eri_permutation(n_a, n_b, n_c, n_d, permutation)
-      angular_momenta = [n_a, n_b, n_c, n_d]
-      angular_momenta = angular_momenta(permutation)
-
-      i = 1
-      group_index = 1
-      next_group = 0
-      IF (.NOT. use_virial .AND. context%nimage_groups > 0) next_group = context%image_groups(1)%first
-      DO WHILE (i <= context%nproducts)
-         IF (i == next_group) THEN
-            ASSOCIATE (group => context%image_groups(group_index))
-               CALL cp_libint_get_image_derivs(context%deriv, context%image_workspace, angular_momenta, &
-                                               context%products(i:group%last), &
-                                               permutation, group%displacements, work_forces)
-               i = group%last
-            END ASSOCIATE
-            group_index = group_index + 1
-            next_group = 0
-            IF (group_index <= context%nimage_groups) next_group = context%image_groups(group_index)%first
+      IF (context%derivatives_prepared) THEN
+         IF (mysize == 1 .AND. SUM([n_a, n_b, n_c, n_d]) == 0) THEN
+            work2(1, :) = context%derivative_blocks(1, :12)
+            force_max = MAXVAL(ABS(work2))
+            IF (use_virial) THEN
+               work2_virial(1, :, :) = RESHAPE(context%derivative_blocks(1, 13:48), [12, 3])
+               stress_max = MAXVAL(ABS(work2_virial))
+            END IF
          ELSE
-            CALL cp_libint_set_params_eri_deriv(context%deriv, context%products(i), &
-                                                permutation, SUM(angular_momenta) + 1)
-            CALL cp_libint_get_derivs(angular_momenta(4), angular_momenta(3), angular_momenta(2), &
-                                      angular_momenta(1), context%deriv, work_forces)
+            CALL extract_hermite_derivatives(context%hermite, [n_a, n_b, n_c, n_d], context%derivative_blocks, &
+                                             use_virial, work2, work2_virial, force_max, stress_max)
          END IF
-         DO k = 1, 12
-            DO j = 1, mysize
-               work(j, k) = work(j, k) + work_forces(j, k)
-            END DO
-         END DO
+         tmp_max_all = MAX(tmp_max_all, max_contraction*force_max)
+         IF (use_virial) tmp_max_all_virial = MAX(tmp_max_all_virial, max_contraction*stress_max)
+      ELSE
+         work = 0.0_dp
+
          IF (use_virial) THEN
-            DO j = 1, 4
-               CALL real_to_scaled(scoord(3*j - 2:3*j), context%products(i)%centers(:, permutation(j)), cell)
-            END DO
+            work_virial = 0.0_dp
+         END IF
+
+         CALL get_eri_permutation(n_a, n_b, n_c, n_d, permutation)
+         angular_momenta = [n_a, n_b, n_c, n_d]
+         angular_momenta = angular_momenta(permutation)
+
+         i = 1
+         group_index = 1
+         next_group = 0
+         IF (libint_can_contract_images .AND. .NOT. use_virial .AND. context%nimage_groups > 0) THEN
+            next_group = context%image_groups(1)%first
+         END IF
+         DO WHILE (i <= context%nproducts)
+            IF (i == next_group) THEN
+               ASSOCIATE (group => context%image_groups(group_index))
+                  CALL cp_libint_get_image_derivs(context%deriv, context%image_workspace, angular_momenta, &
+                                                  context%products(i:group%last), &
+                                                  permutation, group%displacements, work_forces)
+                  i = group%last
+               END ASSOCIATE
+               group_index = group_index + 1
+               next_group = 0
+               IF (group_index <= context%nimage_groups) next_group = context%image_groups(group_index)%first
+            ELSE
+               CALL cp_libint_set_params_eri_deriv(context%deriv, context%products(i), &
+                                                   permutation, SUM(angular_momenta) + 1)
+               CALL cp_libint_get_derivs(angular_momenta(4), angular_momenta(3), angular_momenta(2), &
+                                         angular_momenta(1), context%deriv, work_forces)
+            END IF
             DO k = 1, 12
                DO j = 1, mysize
-                  DO m = 1, 3
-                     work_virial(j, k, m) = work_virial(j, k, m) + work_forces(j, k)*scoord(INT((k - 1)/3)*3 + m)
-                  END DO
+                  work(j, k) = work(j, k) + work_forces(j, k)
                END DO
             END DO
+            IF (use_virial) THEN
+               DO j = 1, 4
+                  CALL real_to_scaled(scoord(3*j - 2:3*j), context%products(i)%centers(:, permutation(j)), cell)
+               END DO
+               DO k = 1, 12
+                  DO j = 1, mysize
+                     DO m = 1, 3
+                        work_virial(j, k, m) = work_virial(j, k, m) + work_forces(j, k)*scoord(INT((k - 1)/3)*3 + m)
+                     END DO
+                  END DO
+               END DO
+            END IF
+            i = i + 1
+         END DO
+
+         tmp_max_all = MAX(tmp_max_all, max_contraction*MAXVAL(ABS(work)))
+         IF (use_virial) THEN
+            tmp_max_all_virial = MAX(tmp_max_all_virial, max_contraction*MAXVAL(ABS(work_virial)))
          END IF
-         i = i + 1
-      END DO
+
+      END IF
       neris = neris + INT(context%nproducts, int_8)*12*mysize
 
-      tmp_max_all = MAX(tmp_max_all, max_contraction*MAXVAL(ABS(work)))
-      IF (use_virial) THEN
-         tmp_max_all_virial = MAX(tmp_max_all_virial, max_contraction*MAXVAL(ABS(work_virial)))
-      END IF
-
       IF (tmp_max_all >= eps_schwarz) THEN
-         CALL reorder_eri_block(work, work2, [ncoa, ncob, ncoc, ncod], permutation, 12, 1)
+         IF (.NOT. context%derivatives_prepared) THEN
+            CALL reorder_eri_block(work, work2, [ncoa, ncob, ncoc, ncod], permutation, 12, 1)
+         END IF
          DO i = 1, 12
             CALL contract(ncoa, ncob, ncoc, ncod, nsoa, nsob, nsoc, nsod, &
-                          n_a, n_b, n_c, n_d, nl_a, nl_b, nl_c, nl_d, work2(1, 1, 1, 1, i), &
+                          n_a, n_b, n_c, n_d, nl_a, nl_b, nl_c, nl_d, work2(1, i), &
                           angular_a, angular_b, angular_c, angular_d, &
                           weight_a, weight_b, weight_c, weight_d, nsgfa, nsgfb, nsgfc, &
                           primitives(s_offset_a + 1, s_offset_b + 1, s_offset_c + 1, s_offset_d + 1, i), &
@@ -429,11 +558,13 @@ CONTAINS
       END IF
 
       IF (use_virial .AND. tmp_max_all_virial >= eps_schwarz) THEN
-         CALL reorder_eri_block(work_virial, work2_virial, [ncoa, ncob, ncoc, ncod], permutation, 12, 3)
+         IF (.NOT. context%derivatives_prepared) THEN
+            CALL reorder_eri_block(work_virial, work2_virial, [ncoa, ncob, ncoc, ncod], permutation, 12, 3)
+         END IF
          DO i = 1, 12
             DO m = 1, 3
                CALL contract(ncoa, ncob, ncoc, ncod, nsoa, nsob, nsoc, nsod, &
-                             n_a, n_b, n_c, n_d, nl_a, nl_b, nl_c, nl_d, work2_virial(1, 1, 1, 1, i, m), &
+                             n_a, n_b, n_c, n_d, nl_a, nl_b, nl_c, nl_d, work2_virial(1, i, m), &
                              angular_a, angular_b, angular_c, angular_d, &
                              weight_a, weight_b, weight_c, weight_d, nsgfa, nsgfb, nsgfc, &
                              primitives_virial(s_offset_a + 1, s_offset_b + 1, s_offset_c + 1, s_offset_d + 1, i, m), &

@@ -226,6 +226,7 @@ list(
   force_fields_input.F
   force_fields_util.F
   force_field_types.F
+  four_center_integral_derivatives.F
   four_center_integral_interface.F
   four_center_integral_methods.F
   four_center_integral_preparation.F

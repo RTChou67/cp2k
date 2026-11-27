@@ -13,7 +13,8 @@ MODULE four_center_integral_methods
    USE four_center_integral_interface,  ONLY: evaluate_deriv_eri,&
                                               evaluate_eri,&
                                               four_center_integral_context_type,&
-                                              prepare_four_center_batch
+                                              prepare_four_center_batch,&
+                                              prepare_four_center_derivative_batch
    USE four_center_integral_preparation,ONLY: min_image_gap_sq,&
                                               prepare_eri4_pair
    USE four_center_integral_types,      ONLY: eri4_cell_type,&
@@ -464,9 +465,9 @@ CONTAINS
          DIMENSION(nsgfa, nsgfb, nsgfc, nsgfd, 12, 3)    :: primitive_integrals_virial
       REAL(dp)                                           :: cart_estimate_virial
 
-      INTEGER :: ipgf, jpgf, kpgf, la, lb, lc, ld, list_ij, list_kl, lpgf, max_l, ncoa, ncob, &
-         ncoc, ncod, nelements_ij, nelements_kl, nproducts, nsgfla, nsgflb, nsgflc, nsgfld, nsoa, &
-         nsob, nsoc, nsod, s_offset_a, s_offset_b, s_offset_c, s_offset_d
+      INTEGER :: ipgf, jpgf, kpgf, la, lb, lc, ld, list_ij, list_kl, lpgf, ncoa, ncob, ncoc, ncod, &
+         nelements_ij, nelements_kl, nproducts, nsgfla, nsgflb, nsgflc, nsgfld, nsoa, nsob, nsoc, &
+         nsod, s_offset_a, s_offset_b, s_offset_c, s_offset_d
       REAL(dp)                                           :: tmp_max, tmp_max_virial
 
       cart_estimate = 0.0_dp
@@ -488,7 +489,6 @@ CONTAINS
                                neighbor_cells, nimages, do_periodic, cell)
       IF (nelements_kl == 0) RETURN
 
-      max_l = la_max + lb_max + lc_max + ld_max + 1
       DO list_ij = 1, nelements_ij
          ipgf = pgf_list_ij(list_ij)%ipgf
          jpgf = pgf_list_ij(list_ij)%jpgf
@@ -497,9 +497,10 @@ CONTAINS
             kpgf = pgf_list_kl(list_kl)%ipgf
             lpgf = pgf_list_kl(list_kl)%jpgf
 
-            CALL prepare_four_center_batch(context, pgf_list_ij(list_ij), pgf_list_kl(list_kl), &
-                                           nproducts, log10_pmax, log10_eps_schwarz, neighbor_cells, cell, &
-                                           potential_parameter, max_l, do_periodic, group_images=.NOT. use_virial)
+            CALL prepare_four_center_derivative_batch(context, pgf_list_ij(list_ij), pgf_list_kl(list_kl), nproducts, &
+                                                      log10_pmax, log10_eps_schwarz, neighbor_cells, cell, &
+                                                      potential_parameter, [la_min, lb_min, lc_min, ld_min], &
+                                                      [la_max, lb_max, lc_max, ld_max], do_periodic, use_virial)
             IF (nproducts == 0) CYCLE
             s_offset_a = 0
             DO la = la_min, la_max
