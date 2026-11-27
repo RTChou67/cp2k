@@ -36,7 +36,7 @@ MODULE four_center_integral_derivatives
       LOGICAL :: virial = .FALSE.
       INTEGER :: powers(3, max_monomials) = 0
       INTEGER :: parent(max_monomials) = 0, axis(max_monomials) = 0
-      INTEGER :: monomial(max_radial_moments) = 0, radial_offset(0:max_order + 1) = 0
+      INTEGER :: monomial_start(0:max_order) = 0, radial_offset(0:max_order + 1) = 0
       INTEGER :: term_offset(max_hermites + max_monomials + 1) = 0
       INTEGER :: term_index(max_polynomial_terms) = 0
       REAL(dp) :: term_factor(max_polynomial_terms) = 0.0_dp
@@ -153,9 +153,9 @@ CONTAINS
       LOGICAL, INTENT(IN)                                :: virial
 
       INTEGER :: a, aa, axis, b, bb, c, cc, d, dc, degree, dims(4), dst, h, i, j, k, l, &
-         lookup(0:max_order + 1, 0:max_order + 1, 0:max_order + 1), m, nh, nslot, nt, nterms, &
-         start(4), stride(4), t(3), term_slot(max_polynomial_terms), u(3), &
-         usage(max_monomials, 0:max_order), x, y, z
+         lookup(0:max_order + 1, 0:max_order + 1, 0:max_order + 1), m, max_degree, min_degree, nh, &
+         nslot, nt, nterms, start(4), stride(4), t(3), term_slot(max_polynomial_terms), u(3), x, &
+         y, z
       REAL(dp) :: coefficient(0:max_order + 1, 0:(max_order + 1)/2)
 
       IF (ALL(lower == work%lower) .AND. ALL(upper == work%upper)) THEN
@@ -196,7 +196,6 @@ CONTAINS
 
       ! Each Cartesian derivative of a radial seed is a sum of monomials times radial orders.
       ! Store only the distinct (order, monomial) pairs accumulated inside the image loop.
-      usage = 0
       nterms = 0
       DO k = 0, MERGE(1, 0, virial)
          nt = MERGE(work%nshift, work%nherm, k == 1)
@@ -214,7 +213,6 @@ CONTAINS
                      nterms = nterms + 1
                      term_slot(nterms) = j + m*max_monomials
                      work%term_factor(nterms) = coefficient(t(1), x)*coefficient(t(2), y)*coefficient(t(3), z)
-                     usage(j, m) = 1
                   END DO
                END DO
             END DO
@@ -223,19 +221,20 @@ CONTAINS
       END DO
       nslot = 0
       DO m = 0, work%order
+         ! At radial order m, trace terms give all degrees from MAX(0, 2*m - order) to m.
+         ! The shifted virial auxiliary also needs degree m + 1. Degrees are stored consecutively.
+         min_degree = MAX(0, 2*m - work%order)
+         max_degree = m + MERGE(1, 0, virial)
+         work%monomial_start(m) = 1 + min_degree*(min_degree + 1)*(min_degree + 2)/6
          work%radial_offset(m) = nslot + 1
-         DO j = 1, work%nshift
-            IF (usage(j, m) == 0) CYCLE
-            nslot = nslot + 1
-            usage(j, m) = nslot
-            work%monomial(nslot) = j
-         END DO
+         nslot = nslot + (max_degree + 1)*(max_degree + 2)*(max_degree + 3)/6 - work%monomial_start(m) + 1
       END DO
       work%radial_offset(work%order + 1) = nslot + 1
       work%nradial = nslot
       DO i = 1, nterms
          j = term_slot(i) - 1
-         work%term_index(i) = usage(MOD(j, max_monomials) + 1, j/max_monomials)
+         m = j/max_monomials
+         work%term_index(i) = work%radial_offset(m) + MOD(j, max_monomials) + 1 - work%monomial_start(m)
       END DO
 
       IF (virial) THEN
@@ -378,7 +377,8 @@ CONTAINS
       INTEGER, INTENT(IN)                                :: nc
 
       INTEGER                                            :: a, b, dha, dhb, dims(4), first, ha, hb, &
-                                                            i, j, k, last, m, na, nb, p, plane, t
+                                                            i, j, k, last, m, na, nb, offset, p, &
+                                                            plane, t
       REAL(dp) :: delta(3), f, moments(3, max_hermites), mono(max_monomials), &
          radial(max_radial_moments), relative(3, 3), rho_power(0:max_order), &
          shifted(max_monomials), zero(max_hermites)
@@ -396,8 +396,11 @@ CONTAINS
          END DO
          DO m = 0, work%order
             f = rho_power(m)*records(i)%Fm(m + 1)
-            DO j = work%radial_offset(m), work%radial_offset(m + 1) - 1
-               radial(j) = radial(j) + f*mono(work%monomial(j))
+            first = work%radial_offset(m)
+            last = work%radial_offset(m + 1) - first - 1
+            offset = work%monomial_start(m)
+            DO j = 0, last
+               radial(first + j) = radial(first + j) + f*mono(offset + j)
             END DO
          END DO
       END DO
