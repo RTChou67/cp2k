@@ -125,11 +125,11 @@ CONTAINS
       CHARACTER(LEN=*), PARAMETER :: routineN = 'derivatives_four_center'
 
       INTEGER :: atomic_offset_ac, atomic_offset_ad, atomic_offset_bc, atomic_offset_bd, bin, &
-                 bits_max_val, buffer_left, buffer_size, buffer_start, cache_size, coord, current_counter, &
+                 bits_max_val, buffer_left, buffer_size, buffer_start, cache_size, center, coord, current_counter, direction, &
                  forces_map(4, 2), handle, handle_bin, handle_getP, handle_load, handle_main, i, i_atom, &
                  i_list_ij, i_list_kl, i_set_list_ij, i_set_list_ij_start, i_set_list_ij_stop, &
                  i_set_list_kl, i_set_list_kl_start, i_set_list_kl_stop, i_thread, iatom, iatom_block, &
-                 iatom_end, iatom_start, ikind, iset, iw, j, j_atom, jatom, jatom_block, jatom_end, &
+                 iatom_end, iatom_start, ikind, iset, ispin, iw, j, j_atom, jatom, jatom_block, jatom_end, &
                  jatom_start, jkind, jset, k, k_atom, katom, katom_block, katom_end, katom_start
       INTEGER :: kind_kind_idx, kkind, kset, l_atom, l_max, latom, latom_block, latom_end, &
                  latom_start, lkind, lset, max_am, max_pgf, max_set, my_bin_id, my_bin_size, my_thread_id, &
@@ -152,24 +152,24 @@ CONTAINS
       INTEGER, DIMENSION(:, :), POINTER, SAVE            :: shm_is_assoc_atomic_block
       INTEGER, DIMENSION(:, :, :, :), POINTER            :: shm_set_offset
       INTEGER, SAVE                                      :: shm_number_of_p_entries
-      LOGICAL :: bins_left, buffer_overflow, do_dynamic_load_balancing, do_it, do_periodic, &
+      LOGICAL :: bins_left, buffer_overflow, contract_forces, contract_virial, do_dynamic_load_balancing, do_it, do_periodic, &
                  do_print_load_balance_info, is_anti_symmetric, my_resp_only, screen_pmat_forces, &
                  treat_forces_in_core, use_disk_storage, with_resp_density
       LOGICAL, DIMENSION(:, :), POINTER                  :: shm_atomic_pair_list
       REAL(dp) :: bintime_start, bintime_stop, cartesian_estimate, cartesian_estimate_virial, &
-                  compression_factor, eps_schwarz, eps_storage, fac, hf_fraction, ln_10, log10_eps_schwarz, &
+                  compression_factor, eps_schwarz, eps_storage, fac, force_terms(12, 2), hf_fraction, ln_10, log10_eps_schwarz, &
                   log10_pmax, log_2, max_contraction_val, max_val1, max_val2, max_val2_set, &
                   my_adiabatic_rescale_factor, pmax_atom, pmax_blocks, pmax_entry, pmax_tmp, ra(3), rab2, &
                   rb(3), rc(3), rcd2, rd(3), spherical_estimate, spherical_estimate_virial, symm_fac, &
-                  tmp_virial(3, 3)
+                  tmp_virial(3, 3), virial_terms(12, 3, 2)
       REAL(dp), ALLOCATABLE, DIMENSION(:) :: ede_buffer1, ede_buffer2, &
                                              ede_work, ede_work2, ede_work2_virial, ede_work_forces, &
                                              ede_work_virial, pac_buf, pac_buf_beta, pac_buf_resp, pac_buf_resp_beta, pad_buf, &
                                              pad_buf_beta, pad_buf_resp, pad_buf_resp_beta, pbc_buf, pbc_buf_beta, pbc_buf_resp, &
                                              pbc_buf_resp_beta, pbd_buf, pbd_buf_beta, pbd_buf_resp, pbd_buf_resp_beta
-      REAL(dp), ALLOCATABLE, DIMENSION(:), TARGET        :: primitive_forces, primitive_forces_virial
+      REAL(dp), ALLOCATABLE, DIMENSION(:)                :: primitive_forces, primitive_forces_virial
       REAL(dp), DIMENSION(:), POINTER                    :: full_density_resp, &
-                                                            full_density_resp_beta, T2
+                                                            full_density_resp_beta
       REAL(dp), DIMENSION(:, :), POINTER :: full_density_alpha, full_density_beta, &
                                             max_contraction, ptr_p_1, ptr_p_2, ptr_p_3, ptr_p_4, shm_pmax_atom, shm_pmax_block, &
                                             sphi_b, zeta, zetb, zetc, zetd
@@ -322,13 +322,13 @@ CONTAINS
 !$OMP  PRIVATE(actual_x_data,atomic_kind_set,atomic_offset_ac,atomic_offset_ad,atomic_offset_bc,&
 !$OMP  atomic_offset_bd,atom_of_kind,basis_info,&
 !$OMP  basis_parameter,bin,bins_left,bintime_start,bintime_stop,bits_max_val,buffer_left,buffer_overflow,buffer_size,&
-!$OMP  buffer_start,cache_size,cartesian_estimate,cartesian_estimate_virial,&
+!$OMP  buffer_start,cache_size,cartesian_estimate,cartesian_estimate_virial,center,contract_forces,contract_virial,&
 !$OMP  coeffs_kind_max0,compression_factor,counter,current_counter,&
-!$OMP  distribution_forces,do_dynamic_load_balancing,do_it,do_periodic,ede_buffer1,ede_buffer2,&
+!$OMP  direction,distribution_forces,do_dynamic_load_balancing,do_it,do_periodic,ede_buffer1,ede_buffer2,&
 !$OMP  ede_work,ede_work2,ede_work2_virial,ede_work_forces,ede_work_virial,eps_schwarz,eps_storage,estimate_to_store_int,&
-!$OMP  fac,first_sgfb,forces_map,general_parameter,handle_bin,handle_getp,handle_load,&
+!$OMP  fac,first_sgfb,force_terms,forces_map,general_parameter,handle_bin,handle_getp,handle_load,&
 !$OMP  handle_main,hf_fraction,i_atom,iatom_end,iatom_start,ikind,integral_caches,integral_containers,&
-!$OMP  i_set_list_ij_start,i_set_list_ij_stop,i_set_list_kl_start,i_set_list_kl_stop,i_thread,iw,j_atom,jatom_end,&
+!$OMP  i_set_list_ij_start,i_set_list_ij_stop,i_set_list_kl_start,i_set_list_kl_stop,i_thread,ispin,iw,j_atom,jatom_end,&
 !$OMP  jatom_start,jkind,katom,k_atom,katom_block,katom_end,katom_start,kind_kind_idx,&
 !$OMP  kind_of,kkind,kset,la_max,la_min,last_sgf_global,latom,l_atom,&
 !$OMP  latom_block,latom_end,latom_start,lb_max,lb_min,lc_max,lc_min,ld_max,&
@@ -348,9 +348,9 @@ CONTAINS
 !$OMP  rb,rc,rcd2,rd,screening_parameter,screen_pmat_forces,set_list_ij,set_list_kl,&
 !$OMP  sgfb,spherical_estimate,spherical_estimate_virial,&
 !$OMP  sphi_b,&
-!$OMP  storage_counter_integrals,stor_count_max_val,swap_id,symm_fac,t2,tmp_block,tmp_i8, tmp_i4,&
+!$OMP  storage_counter_integrals,stor_count_max_val,swap_id,symm_fac,tmp_block,tmp_i8, tmp_i4,&
 !$OMP  tmp_index,tmp_r_1,tmp_r_2,tmp_screen_pgf1,tmp_screen_pgf2,tmp_task_list,tmp_task_list_cost,tmp_virial,&
-!$OMP  treat_forces_in_core,use_disk_storage,zeta,zetb,zetc,zetd)
+!$OMP  treat_forces_in_core,use_disk_storage,virial_terms,zeta,zetb,zetc,zetd)
 
       i_thread = 0
 !$    i_thread = omp_get_thread_num()
@@ -1338,115 +1338,86 @@ CONTAINS
                            IF (cartesian_estimate == 0.0_dp .AND. &
                                (.NOT. use_virial .OR. cartesian_estimate_virial == 0.0_dp)) CYCLE
                         END IF
+                        contract_forces = spherical_estimate*pmax_entry >= eps_schwarz
+                        contract_virial = .FALSE.
+                        IF (use_virial) contract_virial = spherical_estimate_virial*pmax_entry >= eps_schwarz
+                        IF (.NOT. (contract_forces .OR. contract_virial)) CYCLE
+
+                        CALL prefetch_density_matrix(nsgfa(iset), nsgfb(jset), nsgfc(kset), nsgfd(lset), &
+                                                     full_density_alpha(:, 1), pbd_buf, pbc_buf, pad_buf, pac_buf, &
+                                                     iatom, jatom, katom, latom, &
+                                                     iset, jset, kset, lset, offset_bd_set, offset_bc_set, &
+                                                     offset_ad_set, offset_ac_set, atomic_offset_bd, atomic_offset_bc, &
+                                                     atomic_offset_ad, atomic_offset_ac, is_anti_symmetric)
                         IF (with_resp_density) THEN
-                           CALL prefetch_density_matrix(nsgfa(iset), nsgfb(jset), nsgfc(kset), nsgfd(lset), &
-                                                        full_density_alpha(:, 1), pbd_buf, pbc_buf, pad_buf, pac_buf, &
-                                                        iatom, jatom, katom, latom, &
-                                                        iset, jset, kset, lset, offset_bd_set, offset_bc_set, &
-                                                        offset_ad_set, offset_ac_set, atomic_offset_bd, atomic_offset_bc, &
-                                                        atomic_offset_ad, atomic_offset_ac, is_anti_symmetric)
                            CALL prefetch_density_matrix(nsgfa(iset), nsgfb(jset), nsgfc(kset), nsgfd(lset), &
                                                         full_density_resp, pbd_buf_resp, pbc_buf_resp, pad_buf_resp, pac_buf_resp, &
                                                         iatom, jatom, katom, latom, &
                                                         iset, jset, kset, lset, offset_bd_set, offset_bc_set, &
                                                         offset_ad_set, offset_ac_set, atomic_offset_bd, atomic_offset_bc, &
                                                         atomic_offset_ad, atomic_offset_ac, is_anti_symmetric)
+                           CALL contract_derivative_density(nsgfa(iset), nsgfb(jset), nsgfc(kset), nsgfd(lset), &
+                                                            pbd_buf, pbc_buf, pad_buf, pac_buf, fac, &
+                                                            primitive_forces, primitive_forces_virial, &
+                                                            contract_forces, contract_virial, force_terms(:, 1), &
+                                                            virial_terms(:, :, 1), pbd_buf_resp, pbc_buf_resp, &
+                                                            pad_buf_resp, pac_buf_resp, my_resp_only)
                         ELSE
+                           CALL contract_derivative_density(nsgfa(iset), nsgfb(jset), nsgfc(kset), nsgfd(lset), &
+                                                            pbd_buf, pbc_buf, pad_buf, pac_buf, fac, &
+                                                            primitive_forces, primitive_forces_virial, &
+                                                            contract_forces, contract_virial, force_terms(:, 1), &
+                                                            virial_terms(:, :, 1))
+                        END IF
+                        IF (my_nspins == 2) THEN
                            CALL prefetch_density_matrix(nsgfa(iset), nsgfb(jset), nsgfc(kset), nsgfd(lset), &
-                                                        full_density_alpha(:, 1), pbd_buf, pbc_buf, pad_buf, pac_buf, &
-                                                        iatom, jatom, katom, latom, &
+                                                        full_density_beta(:, 1), pbd_buf_beta, pbc_buf_beta, &
+                                                        pad_buf_beta, pac_buf_beta, iatom, jatom, katom, latom, &
                                                         iset, jset, kset, lset, offset_bd_set, offset_bc_set, &
                                                         offset_ad_set, offset_ac_set, atomic_offset_bd, atomic_offset_bc, &
                                                         atomic_offset_ad, atomic_offset_ac, is_anti_symmetric)
-                        END IF
-                        IF (my_nspins == 2) THEN
                            IF (with_resp_density) THEN
-                              CALL prefetch_density_matrix(nsgfa(iset), nsgfb(jset), nsgfc(kset), nsgfd(lset), &
-                                                           full_density_beta(:, 1), pbd_buf_beta, pbc_buf_beta, &
-                                                           pad_buf_beta, pac_buf_beta, iatom, jatom, katom, latom, &
-                                                           iset, jset, kset, lset, offset_bd_set, offset_bc_set, &
-                                                           offset_ad_set, offset_ac_set, atomic_offset_bd, atomic_offset_bc, &
-                                                           atomic_offset_ad, atomic_offset_ac, is_anti_symmetric)
                               CALL prefetch_density_matrix(nsgfa(iset), nsgfb(jset), nsgfc(kset), nsgfd(lset), &
                                                            full_density_resp_beta, pbd_buf_resp_beta, pbc_buf_resp_beta, &
                                                            pad_buf_resp_beta, pac_buf_resp_beta, iatom, jatom, katom, latom, &
                                                            iset, jset, kset, lset, offset_bd_set, offset_bc_set, &
                                                            offset_ad_set, offset_ac_set, atomic_offset_bd, atomic_offset_bc, &
                                                            atomic_offset_ad, atomic_offset_ac, is_anti_symmetric)
+                              CALL contract_derivative_density(nsgfa(iset), nsgfb(jset), nsgfc(kset), nsgfd(lset), &
+                                                               pbd_buf_beta, pbc_buf_beta, pad_buf_beta, pac_buf_beta, fac, &
+                                                               primitive_forces, primitive_forces_virial, contract_forces, &
+                                                               contract_virial, force_terms(:, 2), virial_terms(:, :, 2), &
+                                                               pbd_buf_resp_beta, pbc_buf_resp_beta, pad_buf_resp_beta, &
+                                                               pac_buf_resp_beta, my_resp_only)
                            ELSE
-                              CALL prefetch_density_matrix(nsgfa(iset), nsgfb(jset), nsgfc(kset), nsgfd(lset), &
-                                                           full_density_beta(:, 1), pbd_buf_beta, pbc_buf_beta, pad_buf_beta, &
-                                                           pac_buf_beta, iatom, jatom, katom, latom, &
-                                                           iset, jset, kset, lset, offset_bd_set, offset_bc_set, &
-                                                           offset_ad_set, offset_ac_set, atomic_offset_bd, atomic_offset_bc, &
-                                                           atomic_offset_ad, atomic_offset_ac, is_anti_symmetric)
+                              CALL contract_derivative_density(nsgfa(iset), nsgfb(jset), nsgfc(kset), nsgfd(lset), &
+                                                               pbd_buf_beta, pbc_buf_beta, pad_buf_beta, pac_buf_beta, fac, &
+                                                               primitive_forces, primitive_forces_virial, contract_forces, &
+                                                               contract_virial, force_terms(:, 2), virial_terms(:, :, 2))
                            END IF
                         END IF
-                        IF (spherical_estimate*pmax_entry >= eps_schwarz) THEN
-                           DO coord = 1, 12
-                              T2 => primitive_forces((coord - 1)*nsgfa(iset)*nsgfb(jset)*nsgfc(kset)*nsgfd(lset) + 1: &
-                                                     coord*nsgfa(iset)*nsgfb(jset)*nsgfc(kset)*nsgfd(lset))
 
-                              IF (with_resp_density) THEN
-                                 CALL update_forces(nsgfa(iset), nsgfb(jset), nsgfc(kset), nsgfd(lset), &
-                                                    pbd_buf, pbc_buf, pad_buf, pac_buf, fac, &
-                                                    T2, force, forces_map, coord, &
-                                                    pbd_buf_resp, pbc_buf_resp, pad_buf_resp, pac_buf_resp, &
-                                                    my_resp_only)
-                              ELSE
-                                 CALL update_forces(nsgfa(iset), nsgfb(jset), nsgfc(kset), nsgfd(lset), &
-                                                    pbd_buf, pbc_buf, pad_buf, pac_buf, fac, &
-                                                    T2, force, forces_map, coord)
-                              END IF
-                              IF (my_nspins == 2) THEN
-                                 IF (with_resp_density) THEN
-                                    CALL update_forces(nsgfa(iset), nsgfb(jset), nsgfc(kset), nsgfd(lset), &
-                                                       pbd_buf_beta, pbc_buf_beta, pad_buf_beta, pac_buf_beta, &
-                                                       fac, T2, force, forces_map, coord, &
-                                                       pbd_buf_resp_beta, pbc_buf_resp_beta, &
-                                                       pad_buf_resp_beta, pac_buf_resp_beta, &
-                                                       my_resp_only)
-                                 ELSE
-                                    CALL update_forces(nsgfa(iset), nsgfb(jset), nsgfc(kset), nsgfd(lset), &
-                                                       pbd_buf_beta, pbc_buf_beta, pad_buf_beta, pac_buf_beta, fac, &
-                                                       T2, force, forces_map, coord)
-                                 END IF
-                              END IF
-                           END DO !coord
-                        END IF
-                        IF (use_virial .AND. spherical_estimate_virial*pmax_entry >= eps_schwarz) THEN
+                        IF (contract_forces) THEN
                            DO coord = 1, 12
-                              DO i = 1, 3
-                                 T2 => primitive_forces_virial( &
-                                       ((i - 1)*12 + coord - 1)*nsgfa(iset)*nsgfb(jset)*nsgfc(kset)*nsgfd(lset) + 1: &
-                                       ((i - 1)*12 + coord)*nsgfa(iset)*nsgfb(jset)*nsgfc(kset)*nsgfd(lset))
-                                 IF (with_resp_density) THEN
-                                    CALL update_virial(nsgfa(iset), nsgfb(jset), nsgfc(kset), nsgfd(lset), &
-                                                       pbd_buf, pbc_buf, pad_buf, pac_buf, fac, &
-                                                       T2, tmp_virial, coord, i, &
-                                                       pbd_buf_resp, pbc_buf_resp, pad_buf_resp, &
-                                                       pac_buf_resp, my_resp_only)
-                                 ELSE
-                                    CALL update_virial(nsgfa(iset), nsgfb(jset), nsgfc(kset), nsgfd(lset), &
-                                                       pbd_buf, pbc_buf, pad_buf, pac_buf, fac, &
-                                                       T2, tmp_virial, coord, i)
-                                 END IF
-                                 IF (my_nspins == 2) THEN
-                                    IF (with_resp_density) THEN
-                                       CALL update_virial(nsgfa(iset), nsgfb(jset), nsgfc(kset), nsgfd(lset), &
-                                                          pbd_buf_beta, pbc_buf_beta, pad_buf_beta, pac_buf_beta, &
-                                                          fac, T2, tmp_virial, coord, i, &
-                                                          pbd_buf_resp_beta, pbc_buf_resp_beta, &
-                                                          pad_buf_resp_beta, pac_buf_resp_beta, &
-                                                          my_resp_only)
-                                    ELSE
-                                       CALL update_virial(nsgfa(iset), nsgfb(jset), nsgfc(kset), nsgfd(lset), &
-                                                          pbd_buf_beta, pbc_buf_beta, pad_buf_beta, pac_buf_beta, &
-                                                          fac, T2, tmp_virial, coord, i)
-                                    END IF
-                                 END IF
+                              center = (coord - 1)/3 + 1
+                              direction = MOD(coord - 1, 3) + 1
+                              DO ispin = 1, my_nspins
+!$OMP ATOMIC
+                                 force(forces_map(center, 1))%fock_4c(direction, forces_map(center, 2)) = &
+                                    force(forces_map(center, 1))%fock_4c(direction, forces_map(center, 2)) - &
+                                    force_terms(coord, ispin)
                               END DO
-                           END DO !coord
+                           END DO
+                        END IF
+                        IF (contract_virial) THEN
+                           DO coord = 1, 12
+                              direction = MOD(coord - 1, 3) + 1
+                              DO i = 1, 3
+                                 DO ispin = 1, my_nspins
+                                    tmp_virial(direction, i) = tmp_virial(direction, i) - virial_terms(coord, i, ispin)
+                                 END DO
+                              END DO
+                           END DO
                         END IF
 
                      END DO !i_set_list_kl
@@ -1866,219 +1837,99 @@ CONTAINS
    END SUBROUTINE prefetch_density_matrix
 
 ! **************************************************************************************************
-!> \brief This routine updates the forces using buffered density matrices
-!> \param ma_max Size of matrix blocks
-!> \param mb_max Size of matrix blocks
-!> \param mc_max Size of matrix blocks
-!> \param md_max Size of matrix blocks
-!> \param pbd buffer that will contain P(b,d)
-!> \param pbc buffer that will contain P(b,c)
-!> \param pad buffer that will contain P(a,d)
-!> \param pac buffer that will contain P(a,c)
-!> \param fac mulitplication factor (spin, symmetry)
-!> \param prim primitive forces
-!> \param force storage loacation for forces
-!> \param forces_map index table
-!> \param coord which of the 12 coords to be updated
-!> \param pbd_resp ...
-!> \param pbc_resp ...
-!> \param pad_resp ...
-!> \param pac_resp ...
-!> \param resp_only ...
-!> \par History
-!>      03.2009 created [Manuel Guidon]
-!> \author Manuel Guidon
+!> \brief Reuse the density weights of each AB plane across force and virial components.
+!> \param ma_max number of spherical A functions
+!> \param mb_max number of spherical B functions
+!> \param mc_max number of spherical C functions
+!> \param md_max number of spherical D functions
+!> \param pbd BD density block
+!> \param pbc BC density block
+!> \param pad AD density block
+!> \param pac AC density block
+!> \param fac spin and shell-quartet symmetry factor
+!> \param prim contracted force integrals
+!> \param prim_virial contracted coordinate-weighted integrals, used only when requested
+!> \param contract_forces whether force integrals passed screening
+!> \param contract_virial whether virial integrals passed screening
+!> \param force_terms density contractions in derivative order
+!> \param virial_terms density contractions in derivative and coordinate order
+!> \param pbd_resp BD response density block
+!> \param pbc_resp BC response density block
+!> \param pad_resp AD response density block
+!> \param pac_resp AC response density block
+!> \param resp_only whether to omit the SCF term
 ! **************************************************************************************************
-   SUBROUTINE update_forces(ma_max, mb_max, mc_max, md_max, &
-                            pbd, pbc, pad, pac, fac, &
-                            prim, force, forces_map, coord, &
-                            pbd_resp, pbc_resp, pad_resp, pac_resp, resp_only)
+   SUBROUTINE contract_derivative_density(ma_max, mb_max, mc_max, md_max, pbd, pbc, pad, pac, fac, &
+                                          prim, prim_virial, contract_forces, contract_virial, force_terms, &
+                                          virial_terms, pbd_resp, pbc_resp, pad_resp, pac_resp, resp_only)
+      INTEGER, INTENT(IN) :: ma_max, mb_max, mc_max, md_max
+      REAL(dp), INTENT(IN) :: pbd(mb_max, md_max), pbc(mb_max, mc_max), pad(ma_max, md_max), pac(ma_max, mc_max), fac
+      REAL(dp), INTENT(IN) :: prim(ma_max*mb_max*mc_max*md_max, 12), prim_virial(ma_max*mb_max*mc_max*md_max, 12, *)
+      LOGICAL, INTENT(IN) :: contract_forces, contract_virial
+      REAL(dp), INTENT(OUT) :: force_terms(12), virial_terms(12, 3)
+      REAL(dp), OPTIONAL, INTENT(IN) :: pbd_resp(mb_max, md_max), pbc_resp(mb_max, mc_max), &
+                                        pad_resp(ma_max, md_max), pac_resp(ma_max, mc_max)
+      LOGICAL, OPTIONAL, INTENT(IN) :: resp_only
 
-      INTEGER, INTENT(IN)                                :: ma_max, mb_max, mc_max, md_max
-      REAL(dp), DIMENSION(*), INTENT(IN)                 :: pbd, pbc, pad, pac
-      REAL(dp), INTENT(IN)                               :: fac
-      REAL(dp), DIMENSION(ma_max*mb_max*mc_max*md_max), &
-         INTENT(IN)                                      :: prim
-      TYPE(qs_force_type), DIMENSION(:), POINTER         :: force
-      INTEGER, INTENT(IN)                                :: forces_map(4, 2), coord
-      REAL(dp), DIMENSION(*), INTENT(IN), OPTIONAL       :: pbd_resp, pbc_resp, pad_resp, pac_resp
-      LOGICAL, INTENT(IN), OPTIONAL                      :: resp_only
+      INTEGER :: coord, first, j, last, ma, mb, mc, md, plane
+      LOGICAL :: full_force, with_resp_density
+      REAL(dp) :: bc, bd, bc_resp, bd_resp, total, weights(ma_max*mb_max)
 
-      INTEGER                                            :: ma, mb, mc, md, p_index
-      LOGICAL                                            :: full_force, with_resp_density
-      REAL(dp)                                           :: temp1, temp1_resp, temp3, temp3_resp, &
-                                                            temp4, teresp
+      with_resp_density = PRESENT(pbd_resp) .AND. PRESENT(pbc_resp) .AND. PRESENT(pad_resp) .AND. PRESENT(pac_resp)
+      full_force = .TRUE.
+      IF (with_resp_density .AND. PRESENT(resp_only)) full_force = .NOT. resp_only
 
-      with_resp_density = .FALSE.
-      IF (PRESENT(pbd_resp) .AND. &
-          PRESENT(pbc_resp) .AND. &
-          PRESENT(pad_resp) .AND. &
-          PRESENT(pac_resp)) with_resp_density = .TRUE.
-
-      IF (with_resp_density) THEN
-         full_force = .TRUE.
-         IF (PRESENT(resp_only)) full_force = .NOT. resp_only
-         p_index = 0
-         temp4 = 0.0_dp
-         DO md = 1, md_max
-            DO mc = 1, mc_max
-               DO mb = 1, mb_max
-                  temp1 = pbc((mc - 1)*mb_max + mb)*fac
-                  temp3 = pbd((md - 1)*mb_max + mb)*fac
-                  temp1_resp = pbc_resp((mc - 1)*mb_max + mb)*fac
-                  temp3_resp = pbd_resp((md - 1)*mb_max + mb)*fac
+      force_terms = 0.0_dp
+      virial_terms = 0.0_dp
+      first = 1
+      DO md = 1, md_max
+         DO mc = 1, mc_max
+            last = first + SIZE(weights) - 1
+            DO mb = 1, mb_max
+               bc = pbc(mb, mc)*fac
+               bd = pbd(mb, md)*fac
+               IF (full_force) THEN
                   DO ma = 1, ma_max
-                     p_index = p_index + 1
-                     ! HF-SCF
-                     IF (full_force) THEN
-                        teresp = temp1*pad((md - 1)*ma_max + ma) + &
-                                 temp3*pac((mc - 1)*ma_max + ma)
-                     ELSE
-                        teresp = 0.0_dp
-                     END IF
-                     ! RESP+HF
-                     teresp = teresp + &
-                              pac((mc - 1)*ma_max + ma)*temp3_resp + &
-                              pac_resp((mc - 1)*ma_max + ma)*temp3 + &
-                              pad((md - 1)*ma_max + ma)*temp1_resp + &
-                              pad_resp((md - 1)*ma_max + ma)*temp1
-                     temp4 = temp4 + teresp*prim(p_index)
-                  END DO !ma
-               END DO !mb
-            END DO !mc
-         END DO !md
-      ELSE
-         p_index = 0
-         temp4 = 0.0_dp
-         DO md = 1, md_max
-            DO mc = 1, mc_max
-               DO mb = 1, mb_max
-                  temp1 = pbc((mc - 1)*mb_max + mb)*fac
-                  temp3 = pbd((md - 1)*mb_max + mb)*fac
+                     weights((mb - 1)*ma_max + ma) = bc*pad(ma, md) + bd*pac(ma, mc)
+                  END DO
+               ELSE
+                  weights((mb - 1)*ma_max + 1:mb*ma_max) = 0.0_dp
+               END IF
+               IF (with_resp_density) THEN
+                  bc_resp = pbc_resp(mb, mc)*fac
+                  bd_resp = pbd_resp(mb, md)*fac
                   DO ma = 1, ma_max
-                     p_index = p_index + 1
-                     teresp = temp1*pad((md - 1)*ma_max + ma) + &
-                              temp3*pac((mc - 1)*ma_max + ma)
-                     temp4 = temp4 + teresp*prim(p_index)
-                  END DO !ma
-               END DO !mb
-            END DO !mc
-         END DO !md
-      END IF
-
-!$OMP ATOMIC
-      force(forces_map((coord - 1)/3 + 1, 1))%fock_4c(MOD(coord - 1, 3) + 1, &
-                                                      forces_map((coord - 1)/3 + 1, 2)) = &
-         force(forces_map((coord - 1)/3 + 1, 1))%fock_4c(MOD(coord - 1, 3) + 1, &
-                                                         forces_map((coord - 1)/3 + 1, 2)) - &
-         temp4
-
-   END SUBROUTINE update_forces
-
-! **************************************************************************************************
-!> \brief This routine updates the virial using buffered density matrices
-!> \param ma_max Size of matrix blocks
-!> \param mb_max Size of matrix blocks
-!> \param mc_max Size of matrix blocks
-!> \param md_max Size of matrix blocks
-!> \param pbd buffer that will contain P(b,d)
-!> \param pbc buffer that will contain P(b,c)
-!> \param pad buffer that will contain P(a,d)
-!> \param pac buffer that will contain P(a,c)
-!> \param fac mulitplication factor (spin, symmetry)
-!> \param prim primitive forces
-!> \param tmp_virial ...
-!> \param coord which of the 12 coords to be updated
-!> \param l ...
-!> \param pbd_resp ...
-!> \param pbc_resp ...
-!> \param pad_resp ...
-!> \param pac_resp ...
-!> \par History
-!>      03.2009 created [Manuel Guidon]
-!> \author Manuel Guidon
-! **************************************************************************************************
-   SUBROUTINE update_virial(ma_max, mb_max, mc_max, md_max, &
-                            pbd, pbc, pad, pac, fac, &
-                            prim, tmp_virial, coord, l, &
-                            pbd_resp, pbc_resp, pad_resp, pac_resp, resp_only)
-
-      INTEGER, INTENT(IN)                                :: ma_max, mb_max, mc_max, md_max
-      REAL(dp), DIMENSION(*), INTENT(IN)                 :: pbd, pbc, pad, pac
-      REAL(dp), INTENT(IN)                               :: fac
-      REAL(dp), DIMENSION(ma_max*mb_max*mc_max*md_max), &
-         INTENT(IN)                                      :: prim
-      REAL(dp)                                           :: tmp_virial(3, 3)
-      INTEGER, INTENT(IN)                                :: coord, l
-      REAL(dp), DIMENSION(*), INTENT(IN), OPTIONAL       :: pbd_resp, pbc_resp, pad_resp, pac_resp
-      LOGICAL, INTENT(IN), OPTIONAL                      :: resp_only
-
-      INTEGER                                            :: i, j, ma, mb, mc, md, p_index
-      LOGICAL                                            :: with_resp_density, full_force
-      REAL(dp)                                           :: temp1, temp1_resp, temp3, temp3_resp, &
-                                                            temp4, teresp
-
-      with_resp_density = .FALSE.
-      IF (PRESENT(pbd_resp) .AND. &
-          PRESENT(pbc_resp) .AND. &
-          PRESENT(pad_resp) .AND. &
-          PRESENT(pac_resp)) with_resp_density = .TRUE.
-
-      IF (with_resp_density) THEN
-         full_force = .TRUE.
-         IF (PRESENT(resp_only)) full_force = .NOT. resp_only
-         p_index = 0
-         temp4 = 0.0_dp
-         DO md = 1, md_max
-            DO mc = 1, mc_max
-               DO mb = 1, mb_max
-                  temp1 = pbc((mc - 1)*mb_max + mb)*fac
-                  temp3 = pbd((md - 1)*mb_max + mb)*fac
-                  temp1_resp = pbc_resp((mc - 1)*mb_max + mb)*fac
-                  temp3_resp = pbd_resp((md - 1)*mb_max + mb)*fac
-                  DO ma = 1, ma_max
-                     p_index = p_index + 1
-                     ! HF-SCF
-                     IF (full_force) THEN
-                        teresp = temp1*pad((md - 1)*ma_max + ma) + &
-                                 temp3*pac((mc - 1)*ma_max + ma)
-                     ELSE
-                        teresp = 0.0_dp
-                     END IF
-                     ! RESP+HF
-                     teresp = teresp + &
-                              pac((mc - 1)*ma_max + ma)*temp3_resp + &
-                              pac_resp((mc - 1)*ma_max + ma)*temp3 + &
-                              pad((md - 1)*ma_max + ma)*temp1_resp + &
-                              pad_resp((md - 1)*ma_max + ma)*temp1
-                     temp4 = temp4 + teresp*prim(p_index)
-                  END DO !ma
-               END DO !mb
-            END DO !mc
-         END DO !md
-      ELSE
-         p_index = 0
-         temp4 = 0.0_dp
-         DO md = 1, md_max
-            DO mc = 1, mc_max
-               DO mb = 1, mb_max
-                  temp1 = pbc((mc - 1)*mb_max + mb)*fac
-                  temp3 = pbd((md - 1)*mb_max + mb)*fac
-                  DO ma = 1, ma_max
-                     p_index = p_index + 1
-                     teresp = temp1*pad((md - 1)*ma_max + ma) + &
-                              temp3*pac((mc - 1)*ma_max + ma)
-                     temp4 = temp4 + teresp*prim(p_index)
-                  END DO !ma
-               END DO !mb
-            END DO !mc
-         END DO !md
-      END IF
-
-      j = l
-      i = MOD(coord - 1, 3) + 1
-      tmp_virial(i, j) = tmp_virial(i, j) - temp4
-   END SUBROUTINE update_virial
+                     weights((mb - 1)*ma_max + ma) = weights((mb - 1)*ma_max + ma) + &
+                                                     pac(ma, mc)*bd_resp + pac_resp(ma, mc)*bd + &
+                                                     pad(ma, md)*bc_resp + pad_resp(ma, md)*bc
+                  END DO
+               END IF
+            END DO
+            ! Continue each component's sum in AO order across the planes.
+            IF (contract_forces) THEN
+               DO coord = 1, 12
+                  total = force_terms(coord)
+                  DO j = first, last
+                     total = total + weights(j - first + 1)*prim(j, coord)
+                  END DO
+                  force_terms(coord) = total
+               END DO
+            END IF
+            IF (contract_virial) THEN
+               DO plane = 1, 3
+                  DO coord = 1, 12
+                     total = virial_terms(coord, plane)
+                     DO j = first, last
+                        total = total + weights(j - first + 1)*prim_virial(j, coord, plane)
+                     END DO
+                     virial_terms(coord, plane) = total
+                  END DO
+               END DO
+            END IF
+            first = last + 1
+         END DO
+      END DO
+   END SUBROUTINE contract_derivative_density
 
    #:include 'hfx_get_pmax_val.fypp'
 
