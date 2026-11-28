@@ -47,6 +47,7 @@ MODULE four_center_integral_derivatives
       REAL(dp) :: term_factor(max_polynomial_terms) = 0.0_dp
       INTEGER :: lower_index(3, max_hermites) = 0, upper_index(3, max_hermites) = 0
       INTEGER :: pair_index(max_pair_hermites, max_pair_hermites) = 0
+      INTEGER :: moment_count(max_hermites) = 0
       REAL(dp) :: ket_sign(max_pair_hermites) = 0.0_dp
       INTEGER :: block_start(0:80) = 0, cartesian_index(max_cartesian) = 0
       REAL(dp) :: bra(max_pair_hermites, max_pair_cartesian, 0:3) = 0.0_dp
@@ -374,12 +375,17 @@ CONTAINS
 
       a = SUM(upper(1:2)) + 1
       b = SUM(upper(3:4)) + 1
+      IF (virial) work%moment_count(:work%nherm) = 0
       DO j = 1, (b + 1)*(b + 2)*(b + 3)/6
          work%ket_sign(j) = REAL((-1)**SUM(work%powers(:, j)), dp)
          DO i = 1, (a + 1)*(a + 2)*(a + 3)/6
             t = work%powers(:, i) + work%powers(:, j)
             IF (SUM(t) > work%order) CYCLE
             work%pair_index(i, j) = lookup(t(1), t(2), t(3))
+            IF (virial .AND. i <= a*(a + 1)*(a + 2)/6) THEN
+               dst = work%pair_index(i, j)
+               work%moment_count(dst) = work%moment_count(dst) + 1
+            END IF
          END DO
       END DO
 
@@ -506,11 +512,10 @@ CONTAINS
 
       INTEGER                                            :: a, b, dha, dhb, dims(4), first, ha, hb, &
                                                             i, j, k, last, m, na, nb, offset, p, t
-      REAL(dp) :: bound, bra_norm, bw(max_pair_hermites*max_pair_cartesian), delta(3), f, f_a, &
-         f_c, f_d, f_norm(3, 3), ket_norm, moment_norm(3), moments(3, max_hermites), &
-         mono(max_monomials), q, qk(max_pair_hermites, max_pair_hermites), &
-         radial(max_radial_moments), ref_norm(3, 3), relative(3, 3), rho_power(0:max_order), &
-         shifted(max_monomials), zero(max_hermites)
+      REAL(dp) :: bound, bra_norm, delta(3), f, f_a, f_d, f_norm(3, 2), ket_norm, moment_norm(3), &
+         moments(3, max_hermites), mono(max_monomials), projected(max_hermites), &
+         radial(max_radial_moments), ref_norm(3, 3), reference(3), relative(3, 2), &
+         rho_power(0:max_order), shifted(max_monomials), zero(max_hermites)
 
       radial(:work%nradial) = 0.0_dp
       rho_power(0) = 1.0_dp
@@ -548,17 +553,17 @@ CONTAINS
                shifted(j) = shifted(j) + work%term_factor(t)*radial(work%term_index(t))
             END DO
          END DO
+         ! Weight the ket translation by C-B for every image, including the reference image.
+         reference = (records(1)%P - records(1)%Q) + (records(1)%centers(:, 3) - records(1)%centers(:, 2))
          DO j = 1, work%nherm
-            ! R = delta(first) - delta(image) for translations relative to the first retained image.
-            ! The product of delta and a derivative is an order-raised shifted auxiliary
-            ! minus the derivative of the coordinate factor. No additional radial seed is needed.
-            delta = (records(1)%P - records(1)%Q)*zero(j) + &
+            ! Multiplying a Hermite derivative by P-Q raises its auxiliary order
+            ! and subtracts the derivative of the coordinate factor.
+            delta = reference*zero(j) + &
                     work%powers(:, j)*zero(work%lower_index(:, j)) - shifted(work%upper_index(:, j))
             CALL real_to_scaled(moments(:, j), delta, cell)
          END DO
          CALL real_to_scaled(relative(:, 1), abcd(:, 1), cell)
          CALL real_to_scaled(relative(:, 2), -abcd(:, 2), cell)
-         CALL real_to_scaled(relative(:, 3), records(1)%centers(:, 3) - records(1)%centers(:, 2), cell)
       END IF
 
       CALL pair_expansions(work%powers, work%lower(1:2), work%upper(1:2), records(1)%exponents(1:2), abcd(:, 1), work%bra)
@@ -604,28 +609,24 @@ CONTAINS
       IF (.NOT. work%virial) RETURN
       IF (density%norm == 0.0_dp) RETURN
 
-      ! The C+D derivative couples to the translation of the ket pair.
-      work%ket(:dhb, :nb, 1:3) = work%ket(:dhb, :nb, 1:3) + work%ket(:dhb, :nb, 4:6)
       IF (density%remaining > 0.0_dp) THEN
          DO k = 1, 3
             f_norm(k, 1) = NORM2(work%force(:nc, k))
             f_norm(k, 2) = NORM2(work%force(:nc, k + 9))
-            f_norm(k, 3) = NORM2(work%force(:nc, k + 6) + work%force(:nc, k + 9))
          END DO
          ref_norm = MATMUL(f_norm, TRANSPOSE(ABS(relative)))
          moment_norm = 0.0_dp
-         DO j = 1, dhb
-            DO i = 1, ha
-               moment_norm = moment_norm + moments(:, work%pair_index(i, j))**2
-            END DO
+         DO j = 1, work%nherm
+            moment_norm = moment_norm + work%moment_count(j)*moments(:, j)**2
          END DO
          moment_norm = SQRT(moment_norm)
          bra_norm = NORM2(work%bra(:ha, :na, 0))
-         bound = 0.0_dp
-         DO k = 1, 3
-            ket_norm = NORM2(work%ket(:dhb, :nb, k))
-            bound = MAX(bound, MAXVAL(ref_norm(k, :) + (bra_norm*ket_norm)*moment_norm))
+         ! A translation shifts the ket expansion into distinct rows and preserves its norm.
+         ket_norm = NORM2(work%ket(:hb, :nb, 0))
+         DO m = 1, 3
+            ref_norm(:, m) = ref_norm(:, m) + (bra_norm*ket_norm)*moment_norm(m)
          END DO
+         bound = MAXVAL(ref_norm)
          ! Include roundoff in the componentwise bound before charging it to the budget.
          bound = bound*density%norm*(1.0_dp + 1.0E-12_dp)
          IF (bound <= density%remaining) THEN
@@ -637,22 +638,29 @@ CONTAINS
 
       DO k = 1, 3
          f_a = DOT_PRODUCT(density%weight(:nc), work%force(:nc, k))
-         f_c = DOT_PRODUCT(density%weight(:nc), work%force(:nc, k + 6))
          f_d = DOT_PRODUCT(density%weight(:nc), work%force(:nc, k + 9))
-         virial(k, :) = virial(k, :) + relative(:, 1)*f_a + relative(:, 2)*f_d + relative(:, 3)*(f_c + f_d)
+         virial(k, :) = virial(k, :) + relative(:, 1)*f_a + relative(:, 2)*f_d
       END DO
 
-      ! Move the density contraction to the Hermite side of the image moments.
+      ! Both ket centers translate together, so the ket derivative is an index shift.
       CALL DGEMM('N', 'N', ha, nb, na, 1.0_dp, work%bra(1, 1, 0), max_pair_hermites, &
-                 density%weight, na, 0.0_dp, bw, ha)
+                 density%weight, na, 0.0_dp, work%intermediate, ha)
+      CALL DGEMM('N', 'T', ha, hb, nb, 1.0_dp, work%intermediate, ha, work%ket(1, 1, 0), &
+                 max_pair_hermites, 0.0_dp, work%auxiliary, max_pair_hermites)
+
+      ! All entries with the same total Hermite index use the same translated moment.
+      ! Raising the ket index flips its parity.
+      p = work%order*(work%order + 1)*(work%order + 2)/6
+      projected(:p) = 0.0_dp
+      DO j = 1, hb
+         DO i = 1, ha
+            t = work%pair_index(i, j)
+            projected(t) = projected(t) - work%ket_sign(j)*work%auxiliary(i, j)
+         END DO
+      END DO
       DO k = 1, 3
-         CALL DGEMM('N', 'T', ha, dhb, nb, 1.0_dp, bw, ha, work%ket(1, 1, k), &
-                    max_pair_hermites, 0.0_dp, qk, max_pair_hermites)
-         DO j = 1, dhb
-            DO i = 1, ha
-               q = work%ket_sign(j)*qk(i, j)
-               virial(k, :) = virial(k, :) + q*moments(:, work%pair_index(i, j))
-            END DO
+         DO j = 1, p
+            virial(k, :) = virial(k, :) + projected(j)*moments(:, work%upper_index(k, j))
          END DO
       END DO
    END SUBROUTINE add_hermite_derivatives
