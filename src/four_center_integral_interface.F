@@ -17,12 +17,9 @@ MODULE four_center_integral_interface
    USE cell_types,                      ONLY: cell_type,&
                                               pbc,&
                                               real_to_scaled
-   USE four_center_integral_derivatives,ONLY: add_hermite_derivatives,&
-                                              add_ssss_derivatives,&
-                                              eri4_hermite_workspace_type,&
-                                              expand_ssss_virial,&
+   USE four_center_integral_derivatives,ONLY: eri4_hermite_batch_type,&
                                               extract_hermite_derivatives,&
-                                              prepare_hermite_workspace
+                                              prepare_hermite_derivatives
    USE four_center_integral_preparation,ONLY: min_image_gap_sq,&
                                               prepare_eri4_pair,&
                                               prepare_eri4_primitive,&
@@ -45,8 +42,7 @@ MODULE four_center_integral_interface
         cp_libint_init_eri, cp_libint_init_eri1, cp_libint_set_contrdepth, &
         cp_libint_set_params_eri, cp_libint_set_params_eri_deriv, cp_libint_t, &
         eri_primitive_data_type, get_eri_permutation, libint_can_contract_images, reorder_eri_block
-   USE orbital_pointers,                ONLY: nco,&
-                                              ncoset
+   USE orbital_pointers,                ONLY: nco
 #include "./base/base_uses.f90"
 
    IMPLICIT NONE
@@ -64,11 +60,8 @@ MODULE four_center_integral_interface
       TYPE(cp_libint_image_workspace_type), ALLOCATABLE :: image_workspace
       TYPE(eri_primitive_data_type), ALLOCATABLE :: products(:)
       TYPE(eri4_image_group_type), ALLOCATABLE :: image_groups(:)
-      TYPE(eri4_hermite_workspace_type), ALLOCATABLE :: hermite
-      REAL(dp), ALLOCATABLE :: derivative_blocks(:, :)
-      LOGICAL :: derivatives_prepared = .FALSE., ssss_prepared = .FALSE.
-      ! A, C, and D gradients followed by the lower triangle of the Cartesian strain derivative.
-      REAL(dp) :: ssss_derivatives(15) = 0.0_dp
+      TYPE(eri4_hermite_batch_type), ALLOCATABLE :: hermite
+      LOGICAL :: hermite_ready = .FALSE.
       INTEGER :: nproducts = 0, nimage_groups = 0
    END TYPE four_center_integral_context_type
 
@@ -125,7 +118,7 @@ CONTAINS
       nproducts = 0
       context%nproducts = 0
       context%nimage_groups = 0
-      context%derivatives_prepared = .FALSE.
+      context%hermite_ready = .FALSE.
       IF (nimages1 == 0 .OR. nimages2 == 0) RETURN
       collect_groups = libint_can_contract_images .AND. group_images
       IF (PRESENT(force_image_groups)) collect_groups = collect_groups .OR. force_image_groups
@@ -254,10 +247,11 @@ CONTAINS
 !> \param upper maximum angular momentum at each center
 !> \param do_periodic whether to enumerate periodic translations
 !> \param use_virial whether to compute the virial tensor
+!> \param symmetric_strain whether the shell quartet uses the lower strain triangle
 ! **************************************************************************************************
    SUBROUTINE prepare_four_center_derivative_batch(context, list1, list2, nproducts, &
                                                    log10_pmax, log10_eps_schwarz, neighbor_cells, &
-                                                   cell, potential_parameter, lower, upper, do_periodic, use_virial)
+                                                 cell, potential_parameter, lower, upper, do_periodic, use_virial, symmetric_strain)
       TYPE(four_center_integral_context_type), &
          INTENT(INOUT)                                   :: context
       TYPE(eri4_pgf_pair_type), INTENT(IN)               :: list1, list2
@@ -268,20 +262,20 @@ CONTAINS
       TYPE(coulomb_operator_type), INTENT(IN)            :: potential_parameter
       INTEGER, INTENT(IN)                                :: lower(4), upper(4)
       LOGICAL, INTENT(IN)                                :: do_periodic, use_virial
+      LOGICAL, INTENT(OUT)                               :: symmetric_strain
 
       INTEGER, PARAMETER                                 :: min_images_per_group = 4
 
-      INTEGER                                            :: group, i, j, ncart, ncomponents, ngroups
-      LOGICAL                                            :: hermite, radial_moments, ssss
-      REAL(dp)                                           :: abcd(3, 2)
+      INTEGER                                            :: group, ngroups
+      LOGICAL                                            :: hermite, radial_moments
 
-      context%ssss_prepared = .FALSE.
       radial_moments = potential_parameter%potential_type /= do_potential_id
-      ssss = radial_moments .AND. ALL(upper == 0)
-      hermite = radial_moments .AND. do_periodic .AND. ALL(upper <= 2) .AND. .NOT. ssss
+      symmetric_strain = radial_moments .AND. ALL(upper == 0)
+      hermite = radial_moments .AND. do_periodic .AND. ALL(upper <= 2) .AND. .NOT. symmetric_strain
+      ! Libint's grouped kernels omit per-image coordinates needed for the virial.
       CALL prepare_four_center_batch(context, list1, list2, nproducts, log10_pmax, log10_eps_schwarz, neighbor_cells, &
                                      cell, potential_parameter, SUM(upper) + 1, do_periodic, &
-                                     group_images=.NOT. use_virial, force_image_groups=ssss .OR. hermite)
+                                     group_images=.NOT. use_virial, force_image_groups=symmetric_strain .OR. hermite)
       IF (nproducts == 0) RETURN
 
       IF (hermite) THEN
@@ -291,48 +285,12 @@ CONTAINS
          END DO
          hermite = nproducts/ngroups >= min_images_per_group
       END IF
-      IF (.NOT. (ssss .OR. hermite)) RETURN
+      IF (.NOT. (symmetric_strain .OR. hermite)) RETURN
 
-      IF (ssss) THEN
-         context%ssss_derivatives = 0.0_dp
-      ELSE
-         ncart = PRODUCT(ncoset(upper) - ncoset(lower - 1))
-         ncomponents = MERGE(21, 12, use_virial)
-         IF (ALLOCATED(context%derivative_blocks)) THEN
-            IF (SIZE(context%derivative_blocks, 1) < ncart .OR. SIZE(context%derivative_blocks, 2) < ncomponents) THEN
-               DEALLOCATE (context%derivative_blocks)
-            END IF
-         END IF
-         IF (.NOT. ALLOCATED(context%derivative_blocks)) ALLOCATE (context%derivative_blocks(ncart, ncomponents))
-         context%derivative_blocks(:ncart, :ncomponents) = 0.0_dp
-         IF (.NOT. ALLOCATED(context%hermite)) ALLOCATE (context%hermite)
-         CALL prepare_hermite_workspace(context%hermite, lower, upper, use_virial)
-      END IF
-
-      i = 1
-      group = 1
-      DO WHILE (i <= nproducts)
-         j = i
-         IF (group <= context%nimage_groups) THEN
-            IF (i == context%image_groups(group)%first) THEN
-               j = context%image_groups(group)%last
-               abcd = context%image_groups(group)%displacements
-               group = group + 1
-            END IF
-         END IF
-         IF (j == i) THEN
-            abcd(:, 1) = context%products(i)%centers(:, 1) - context%products(i)%centers(:, 2)
-            abcd(:, 2) = context%products(i)%centers(:, 3) - context%products(i)%centers(:, 4)
-         END IF
-         IF (ssss) THEN
-            CALL add_ssss_derivatives(context%products(i:j), abcd, use_virial, context%ssss_derivatives)
-         ELSE
-            CALL add_hermite_derivatives(context%hermite, context%products(i:j), abcd, cell, context%derivative_blocks, ncart)
-         END IF
-         i = j + 1
-      END DO
-      context%ssss_prepared = ssss
-      context%derivatives_prepared = .TRUE.
+      IF (.NOT. ALLOCATED(context%hermite)) ALLOCATE (context%hermite)
+      CALL prepare_hermite_derivatives(context%hermite, context%products(:nproducts), context%image_groups, &
+                                       context%nimage_groups, lower, upper, symmetric_strain, cell, use_virial)
+      context%hermite_ready = .TRUE.
    END SUBROUTINE prepare_four_center_derivative_batch
 
 ! **************************************************************************************************
@@ -364,9 +322,7 @@ CONTAINS
       IF (ALLOCATED(context%image_workspace)) DEALLOCATE (context%image_workspace)
       IF (ALLOCATED(context%image_groups)) DEALLOCATE (context%image_groups)
       IF (ALLOCATED(context%hermite)) DEALLOCATE (context%hermite)
-      IF (ALLOCATED(context%derivative_blocks)) DEALLOCATE (context%derivative_blocks)
-      context%derivatives_prepared = .FALSE.
-      context%ssss_prepared = .FALSE.
+      context%hermite_ready = .FALSE.
       CALL cp_libint_cleanup_eri(context%eri)
       CALL cp_libint_cleanup_eri1(context%deriv)
       DEALLOCATE (context%products)
@@ -420,6 +376,7 @@ CONTAINS
 !> \param buffer1 ...
 !> \param buffer2 ...
 !> \param use_virial ...
+!> \param reconstruct_b whether the caller reconstructs center B after contraction
 !> \param work_virial ...
 !> \param work2_virial ...
 !> \param primitives_virial ...
@@ -441,7 +398,7 @@ CONTAINS
                                  angular_a, angular_b, angular_c, angular_d, &
                                  weight_a, weight_b, weight_c, weight_d, &
                                  work, work2, work_forces, buffer1, buffer2, &
-                                 use_virial, work_virial, work2_virial, &
+                                 use_virial, reconstruct_b, work_virial, work2_virial, &
                                  primitives_virial, cell, tmp_max_all_virial)
 
       TYPE(four_center_integral_context_type), &
@@ -463,7 +420,7 @@ CONTAINS
                                                             weight_c(nl_c), weight_d(nl_d)
       REAL(dp), DIMENSION(ncoa*ncob*ncoc*ncod, 12)       :: work, work2, work_forces
       REAL(dp), DIMENSION(ncoa*ncob*ncoc*ncod)           :: buffer1, buffer2
-      LOGICAL, INTENT(IN)                                :: use_virial
+      LOGICAL, INTENT(IN)                                :: use_virial, reconstruct_b
       REAL(dp) :: work_virial(ncoa*ncob*ncoc*ncod, 3, 3), work2_virial(ncoa*ncob*ncoc*ncod, 3, 3)
       REAL(dp), &
          DIMENSION(nsgfa, nsgfb, nsgfc, nsgfd, 3, 3)     :: primitives_virial
@@ -473,52 +430,16 @@ CONTAINS
       INTEGER                                            :: angular_momenta(4), group_index, i, j, &
                                                             k, m, mysize, next_group, &
                                                             permutation(4)
-      LOGICAL                                            :: compact_ssss
-      REAL(dp)                                           :: cell_derivative(3, 3), cell_scale(3), &
-                                                            force_max, origin(3), relative(3, 3), &
-                                                            strain(6), stress_max
+      LOGICAL                                            :: symmetric_strain
+      REAL(dp)                                           :: force_max, origin(3), relative(3, 3), &
+                                                            stress_max
 
       mysize = ncoa*ncob*ncoc*ncod
-      compact_ssss = context%derivatives_prepared .AND. context%ssss_prepared
+      symmetric_strain = .FALSE.
 
-      IF (context%derivatives_prepared) THEN
-         IF (compact_ssss) THEN
-            work2(1, 1:3) = context%ssss_derivatives(1:3)
-            work2(1, 7:12) = context%ssss_derivatives(4:9)
-            work2(1, 4:6) = -(work2(1, 1:3) + work2(1, 7:9) + work2(1, 10:12))
-            force_max = MAXVAL(ABS(work2(1, :)))
-            IF (use_virial) THEN
-               strain = context%ssss_derivatives(10:15)
-               work2_virial(1, :, 1) = strain(1:3)
-               work2_virial(1, 2:3, 2) = strain(4:5)
-               work2_virial(1, 3, 3) = strain(6)
-               ! Screen the full cell derivative and contract only the strain lower triangle.
-               IF (cell%orthorhombic) THEN
-                  cell_scale = ABS([cell%h_inv(1, 1), cell%h_inv(2, 2), cell%h_inv(3, 3)])
-                  stress_max = MAXVAL(ABS(strain)*[cell_scale(1), MAX(cell_scale(1), cell_scale(2)), &
-                                                   MAX(cell_scale(1), cell_scale(3)), cell_scale(2), &
-                                                   MAX(cell_scale(2), cell_scale(3)), cell_scale(3)])
-               ELSE
-                  cell_derivative(:, 1) = strain(1:3)
-                  cell_derivative(2:3, 2) = strain(4:5)
-                  cell_derivative(3, 3) = strain(6)
-                  CALL expand_ssss_virial(1, cell_derivative, cell)
-                  stress_max = MAXVAL(ABS(cell_derivative))
-               END IF
-            END IF
-         ELSE IF (n_a + n_b + n_c + n_d == 0) THEN
-            work2(1, :) = context%derivative_blocks(1, :12)
-            force_max = MAXVAL(ABS(work2))
-            IF (use_virial) THEN
-               work2_virial(1, :, :) = RESHAPE(context%derivative_blocks(1, 13:21), [3, 3])
-               stress_max = MAXVAL(ABS(work2_virial))
-            END IF
-         ELSE
-            CALL extract_hermite_derivatives(context%hermite, [n_a, n_b, n_c, n_d], context%derivative_blocks, &
-                                             use_virial, work2, work2_virial, force_max, stress_max)
-         END IF
-         tmp_max_all = MAX(tmp_max_all, max_contraction*force_max)
-         IF (use_virial) tmp_max_all_virial = MAX(tmp_max_all_virial, max_contraction*stress_max)
+      IF (context%hermite_ready) THEN
+         CALL extract_hermite_derivatives(context%hermite, [n_a, n_b, n_c, n_d], cell, use_virial, &
+                                          work2, work2_virial, force_max, stress_max, symmetric_strain)
       ELSE
          work = 0.0_dp
 
@@ -578,21 +499,19 @@ CONTAINS
             i = i + 1
          END DO
 
-         tmp_max_all = MAX(tmp_max_all, max_contraction*MAXVAL(ABS(work)))
-         IF (use_virial) THEN
-            tmp_max_all_virial = MAX(tmp_max_all_virial, max_contraction*MAXVAL(ABS(work_virial)))
-         END IF
-
+         force_max = MAXVAL(ABS(work))
+         IF (use_virial) stress_max = MAXVAL(ABS(work_virial))
       END IF
+      tmp_max_all = MAX(tmp_max_all, max_contraction*force_max)
+      IF (use_virial) tmp_max_all_virial = MAX(tmp_max_all_virial, max_contraction*stress_max)
       neris = neris + INT(context%nproducts, int_8)*12*mysize
 
       IF (tmp_max_all >= eps_schwarz) THEN
-         IF (.NOT. context%derivatives_prepared) THEN
+         IF (.NOT. context%hermite_ready) THEN
             CALL reorder_eri_block(work, work2, [ncoa, ncob, ncoc, ncod], permutation, 12, 1)
          END IF
          DO i = 1, 12
-            ! forces4 recovers center B after contraction for compact ssss and mixed shell sets.
-            IF ((mysize > 1 .OR. context%derivatives_prepared) .AND. i >= 4 .AND. i <= 6) CYCLE
+            IF (reconstruct_b .AND. i >= 4 .AND. i <= 6) CYCLE
             CALL contract(ncoa, ncob, ncoc, ncod, nsoa, nsob, nsoc, nsod, &
                           n_a, n_b, n_c, n_d, nl_a, nl_b, nl_c, nl_d, work2(1, i), &
                           angular_a, angular_b, angular_c, angular_d, &
@@ -603,11 +522,11 @@ CONTAINS
       END IF
 
       IF (use_virial .AND. tmp_max_all_virial >= eps_schwarz) THEN
-         IF (.NOT. context%derivatives_prepared) THEN
+         IF (.NOT. context%hermite_ready) THEN
             CALL reorder_eri_block(work_virial, work2_virial, [ncoa, ncob, ncoc, ncod], permutation, 3, 3)
          END IF
          DO i = 1, 3
-            DO m = 1, MERGE(i, 3, compact_ssss)
+            DO m = 1, MERGE(i, 3, symmetric_strain)
                CALL contract(ncoa, ncob, ncoc, ncod, nsoa, nsob, nsoc, nsod, &
                              n_a, n_b, n_c, n_d, nl_a, nl_b, nl_c, nl_d, work2_virial(1, i, m), &
                              angular_a, angular_b, angular_c, angular_d, &

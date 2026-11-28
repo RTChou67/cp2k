@@ -11,6 +11,7 @@
 MODULE four_center_integral_derivatives
    USE cell_types,                      ONLY: cell_type,&
                                               real_to_scaled
+   USE four_center_integral_types,      ONLY: eri4_image_group_type
    USE kinds,                           ONLY: dp
    USE libint_wrapper,                  ONLY: eri_primitive_data_type
    USE orbital_pointers,                ONLY: indco,&
@@ -21,8 +22,7 @@ MODULE four_center_integral_derivatives
    IMPLICIT NONE
    PRIVATE
 
-   PUBLIC :: add_ssss_derivatives, add_hermite_derivatives, expand_ssss_virial, &
-             prepare_hermite_workspace, extract_hermite_derivatives
+   PUBLIC :: prepare_hermite_derivatives, extract_hermite_derivatives, expand_symmetric_virial
 
    ! Polynomial degrees for a first derivative of (dd|dd) and its coordinate moment.
    INTEGER, PARAMETER :: max_order = 9, max_monomials = 286, max_hermites = 220, max_pair_hermites = 56
@@ -31,7 +31,7 @@ MODULE four_center_integral_derivatives
    INTEGER, PARAMETER :: max_polynomial_terms = 2*max_monomials*(max_order/2 + 2)
 
 !> \brief Reusable polynomial, basis transform and gather data for one angular range.
-   TYPE, PUBLIC :: eri4_hermite_workspace_type
+   TYPE :: eri4_hermite_workspace_type
       PRIVATE
       INTEGER :: lower(4) = -1, upper(4) = -1, order = 0, nherm = 0, nshift = 0, nradial = 0
       LOGICAL :: virial = .FALSE.
@@ -52,7 +52,83 @@ MODULE four_center_integral_derivatives
       REAL(dp) :: force(max_cartesian, 12) = 0.0_dp
    END TYPE eri4_hermite_workspace_type
 
+!> \brief Derivative blocks for a prepared primitive quartet.
+   TYPE, PUBLIC :: eri4_hermite_batch_type
+      PRIVATE
+      TYPE(eri4_hermite_workspace_type), ALLOCATABLE :: workspace
+      REAL(dp), ALLOCATABLE :: cartesian(:, :)
+      ! A, C, and D gradients followed by the lower triangle of the strain derivative.
+      REAL(dp) :: all_s(15) = 0.0_dp
+      LOGICAL :: symmetric_strain = .FALSE.
+   END TYPE eri4_hermite_batch_type
+
 CONTAINS
+
+! **************************************************************************************************
+!> \brief Accumulate the retained displacement groups with the Hermite or all-s kernel.
+!> \param batch reusable derivative buffers
+!> \param records prepared quartet images
+!> \param groups ranges and displacements of multi-image groups
+!> \param ngroups number of active entries in groups
+!> \param lower minimum angular momentum per center
+!> \param upper maximum angular momentum per center
+!> \param symmetric_strain use the all-s specialization and accumulate the lower strain triangle
+!> \param cell simulation cell
+!> \param use_virial whether to include cell derivatives
+! **************************************************************************************************
+   SUBROUTINE prepare_hermite_derivatives(batch, records, groups, ngroups, lower, upper, symmetric_strain, cell, use_virial)
+      TYPE(eri4_hermite_batch_type), INTENT(INOUT)       :: batch
+      TYPE(eri_primitive_data_type), INTENT(IN)          :: records(:)
+      TYPE(eri4_image_group_type), ALLOCATABLE, &
+         INTENT(IN)                                      :: groups(:)
+      INTEGER, INTENT(IN)                                :: ngroups, lower(4), upper(4)
+      LOGICAL, INTENT(IN)                                :: symmetric_strain
+      TYPE(cell_type), POINTER                           :: cell
+      LOGICAL, INTENT(IN)                                :: use_virial
+
+      INTEGER                                            :: group, i, j, ncart, ncomponents
+      REAL(dp)                                           :: abcd(3, 2)
+
+      batch%symmetric_strain = symmetric_strain
+      IF (symmetric_strain) THEN
+         batch%all_s = 0.0_dp
+      ELSE
+         ncart = PRODUCT(ncoset(upper) - ncoset(lower - 1))
+         ncomponents = MERGE(21, 12, use_virial)
+         IF (ALLOCATED(batch%cartesian)) THEN
+            IF (SIZE(batch%cartesian, 1) < ncart .OR. SIZE(batch%cartesian, 2) < ncomponents) THEN
+               DEALLOCATE (batch%cartesian)
+            END IF
+         END IF
+         IF (.NOT. ALLOCATED(batch%cartesian)) ALLOCATE (batch%cartesian(ncart, ncomponents))
+         batch%cartesian(:ncart, :ncomponents) = 0.0_dp
+         IF (.NOT. ALLOCATED(batch%workspace)) ALLOCATE (batch%workspace)
+         CALL prepare_hermite_workspace(batch%workspace, lower, upper, use_virial)
+      END IF
+
+      i = 1
+      group = 1
+      DO WHILE (i <= SIZE(records))
+         j = i
+         IF (group <= ngroups) THEN
+            IF (i == groups(group)%first) THEN
+               j = groups(group)%last
+               abcd = groups(group)%displacements
+               group = group + 1
+            END IF
+         END IF
+         IF (j == i) THEN
+            abcd(:, 1) = records(i)%centers(:, 1) - records(i)%centers(:, 2)
+            abcd(:, 2) = records(i)%centers(:, 3) - records(i)%centers(:, 4)
+         END IF
+         IF (symmetric_strain) THEN
+            CALL add_ssss_derivatives(records(i:j), abcd, use_virial, batch%all_s)
+         ELSE
+            CALL add_hermite_derivatives(batch%workspace, records(i:j), abcd, cell, batch%cartesian, ncart)
+         END IF
+         i = j + 1
+      END DO
+   END SUBROUTINE prepare_hermite_derivatives
 
 ! **************************************************************************************************
 !> \brief Accumulate forces on A, C, and D and the lower triangle of the all-s strain derivative.
@@ -130,7 +206,7 @@ CONTAINS
 !> \param virial lower triangle on input, full cell derivatives on output
 !> \param cell simulation cell
 ! **************************************************************************************************
-   SUBROUTINE expand_ssss_virial(n, virial, cell)
+   SUBROUTINE expand_symmetric_virial(n, virial, cell)
       INTEGER, INTENT(IN)                                :: n
       REAL(dp), INTENT(INOUT)                            :: virial(n, 3, 3)
       TYPE(cell_type), INTENT(IN)                        :: cell
@@ -159,7 +235,7 @@ CONTAINS
             END DO
          END DO
       END IF
-   END SUBROUTINE expand_ssss_virial
+   END SUBROUTINE expand_symmetric_virial
 
 ! **************************************************************************************************
 !> \brief Initialize angular and polynomial lookup tables for the current shell ranges.
@@ -526,34 +602,73 @@ CONTAINS
 
 ! **************************************************************************************************
 !> \brief Extract one angular block and its screening maxima from the group sums.
-!> \param work angular lookup tables
+!> \param batch the accumulated derivative blocks
 !> \param l angular momenta in original center order
-!> \param derivatives twelve Cartesian derivatives followed by nine virial components
+!> \param cell simulation cell
 !> \param virial whether virial components are present
 !> \param forces force block for the angular quartet
 !> \param stress virial block for the angular quartet
 !> \param force_max force maximum for Cartesian screening
 !> \param stress_max virial maximum for Cartesian screening
+!> \param symmetric_strain whether stress holds the lower triangle of strain derivatives
 ! **************************************************************************************************
-   SUBROUTINE extract_hermite_derivatives(work, l, derivatives, virial, forces, stress, force_max, stress_max)
-      TYPE(eri4_hermite_workspace_type), INTENT(IN)      :: work
+   SUBROUTINE extract_hermite_derivatives(batch, l, cell, virial, forces, stress, force_max, stress_max, symmetric_strain)
+      TYPE(eri4_hermite_batch_type), INTENT(IN)          :: batch
       INTEGER, INTENT(IN)                                :: l(4)
-      REAL(dp), INTENT(IN)                               :: derivatives(:, :)
+      TYPE(cell_type), POINTER                           :: cell
       LOGICAL, INTENT(IN)                                :: virial
       REAL(dp), INTENT(OUT)                              :: forces(:, :), stress(:, :, :), &
                                                             force_max, stress_max
+      LOGICAL, INTENT(OUT)                               :: symmetric_strain
 
       INTEGER                                            :: i, j, k, ncart, start
-      REAL(dp)                                           :: value
+      REAL(dp)                                           :: cell_derivative(3, 3), cell_scale(3), &
+                                                            strain(6), value
+
+      symmetric_strain = batch%symmetric_strain
+      stress_max = 0.0_dp
+      IF (symmetric_strain) THEN
+         forces(1, 1:3) = batch%all_s(1:3)
+         forces(1, 7:12) = batch%all_s(4:9)
+         forces(1, 4:6) = -(forces(1, 1:3) + forces(1, 7:9) + forces(1, 10:12))
+         force_max = MAXVAL(ABS(forces(1, :)))
+         IF (virial) THEN
+            strain = batch%all_s(10:15)
+            stress(1, :, 1) = strain(1:3)
+            stress(1, 2:3, 2) = strain(4:5)
+            stress(1, 3, 3) = strain(6)
+            ! Screen the full cell derivative and contract only the strain lower triangle.
+            IF (cell%orthorhombic) THEN
+               cell_scale = ABS([cell%h_inv(1, 1), cell%h_inv(2, 2), cell%h_inv(3, 3)])
+               stress_max = MAXVAL(ABS(strain)*[cell_scale(1), MAX(cell_scale(1), cell_scale(2)), &
+                                                MAX(cell_scale(1), cell_scale(3)), cell_scale(2), &
+                                                MAX(cell_scale(2), cell_scale(3)), cell_scale(3)])
+            ELSE
+               cell_derivative(:, 1) = strain(1:3)
+               cell_derivative(2:3, 2) = strain(4:5)
+               cell_derivative(3, 3) = strain(6)
+               CALL expand_symmetric_virial(1, cell_derivative, cell)
+               stress_max = MAXVAL(ABS(cell_derivative))
+            END IF
+         END IF
+         RETURN
+      ELSE IF (ALL(l == 0)) THEN
+         forces(1, :) = batch%cartesian(1, :12)
+         force_max = MAXVAL(ABS(forces))
+         IF (virial) THEN
+            stress(1, :, :) = RESHAPE(batch%cartesian(1, 13:21), [3, 3])
+            stress_max = MAXVAL(ABS(stress))
+         END IF
+         RETURN
+      END IF
 
       ncart = SIZE(forces, 1)
-      start = work%block_start(l(1) + 3*l(2) + 9*l(3) + 27*l(4)) - 1
+      start = batch%workspace%block_start(l(1) + 3*l(2) + 9*l(3) + 27*l(4)) - 1
       force_max = 0.0_dp
-      stress_max = 0.0_dp
       DO k = 1, 12
 !$OMP SIMD REDUCTION(MAX:force_max)
          DO i = 1, ncart
-            value = derivatives(work%cartesian_index(start + i), k)
+            value = batch%cartesian(batch%workspace%cartesian_index(start + i), k)
             forces(i, k) = value
             force_max = MAX(force_max, ABS(value))
          END DO
@@ -563,7 +678,7 @@ CONTAINS
             DO k = 1, 3
 !$OMP SIMD REDUCTION(MAX:stress_max)
                DO i = 1, ncart
-                  value = derivatives(work%cartesian_index(start + i), 12 + 3*(j - 1) + k)
+                  value = batch%cartesian(batch%workspace%cartesian_index(start + i), 12 + 3*(j - 1) + k)
                   stress(i, k, j) = value
                   stress_max = MAX(stress_max, ABS(value))
                END DO

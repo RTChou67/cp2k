@@ -10,7 +10,7 @@
 ! **************************************************************************************************
 MODULE four_center_integral_methods
    USE cell_types,                      ONLY: cell_type
-   USE four_center_integral_derivatives,ONLY: expand_ssss_virial
+   USE four_center_integral_derivatives,ONLY: expand_symmetric_virial
    USE four_center_integral_interface,  ONLY: evaluate_deriv_eri,&
                                               evaluate_eri,&
                                               four_center_integral_context_type,&
@@ -22,7 +22,6 @@ MODULE four_center_integral_methods
                                               eri4_contraction_type,&
                                               eri4_pgf_pair_type,&
                                               eri4_screen_coeff_type
-   USE input_constants,                 ONLY: do_potential_id
    USE integral_library_types,          ONLY: coulomb_operator_type
    USE kinds,                           ONLY: dp,&
                                               int_8
@@ -470,11 +469,11 @@ CONTAINS
       INTEGER :: ipgf, jpgf, kpgf, la, lb, lc, ld, list_ij, list_kl, lpgf, ncoa, ncob, ncoc, ncod, &
          nelements_ij, nelements_kl, nproducts, nsgfla, nsgflb, nsgflc, nsgfld, nsoa, nsob, nsoc, &
          nsod, s_offset_a, s_offset_b, s_offset_c, s_offset_d
-      LOGICAL                                            :: all_s, compact_ssss
+      LOGICAL                                            :: reconstruct_b, symmetric_strain
       REAL(dp)                                           :: tmp_max, tmp_max_virial
 
-      all_s = la_max + lb_max + lc_max + ld_max == 0
-      compact_ssss = all_s .AND. potential_parameter%potential_type /= do_potential_id
+      reconstruct_b = la_max + lb_max + lc_max + ld_max > 0
+      symmetric_strain = .FALSE.
       cart_estimate = 0.0_dp
       primitive_integrals = 0.0_dp
       IF (use_virial) THEN
@@ -505,7 +504,8 @@ CONTAINS
             CALL prepare_four_center_derivative_batch(context, pgf_list_ij(list_ij), pgf_list_kl(list_kl), nproducts, &
                                                       log10_pmax, log10_eps_schwarz, neighbor_cells, cell, &
                                                       potential_parameter, [la_min, lb_min, lc_min, ld_min], &
-                                                      [la_max, lb_max, lc_max, ld_max], do_periodic, use_virial)
+                                                      [la_max, lb_max, lc_max, ld_max], do_periodic, use_virial, symmetric_strain)
+            reconstruct_b = reconstruct_b .OR. symmetric_strain
             IF (nproducts == 0) CYCLE
             s_offset_a = 0
             DO la = la_min, la_max
@@ -545,7 +545,7 @@ CONTAINS
                                                 contraction_a(la)%weights(:, ipgf), contraction_b(lb)%weights(:, jpgf), &
                                                 contraction_c(lc)%weights(:, kpgf), contraction_d(ld)%weights(:, lpgf), &
                                                 ede_work, ede_work2, ede_work_forces, &
-                                                ede_buffer1, ede_buffer2, use_virial, &
+                                                ede_buffer1, ede_buffer2, use_virial, reconstruct_b, &
                                                 ede_work_virial, ede_work2_virial, &
                                                 primitive_integrals_virial, cell, tmp_max_virial)
                         cart_estimate = MAX(tmp_max, cart_estimate)
@@ -562,15 +562,15 @@ CONTAINS
       END DO
 
       ! Translation invariance survives the common basis and radial contractions.
-      IF (cart_estimate >= eps_schwarz .AND. (compact_ssss .OR. .NOT. all_s)) THEN
+      IF (cart_estimate >= eps_schwarz .AND. reconstruct_b) THEN
          primitive_integrals(:, :, :, :, 4:6) = -(primitive_integrals(:, :, :, :, 1:3) + &
                                                   primitive_integrals(:, :, :, :, 7:9) + &
                                                   primitive_integrals(:, :, :, :, 10:12))
       END IF
       ! Restore the cell derivative before the AO screening and density contraction.
-      IF (compact_ssss .AND. use_virial) THEN
+      IF (symmetric_strain .AND. use_virial) THEN
          IF (cart_estimate_virial >= eps_schwarz) THEN
-            CALL expand_ssss_virial(nsgfa*nsgfb*nsgfc*nsgfd, primitive_integrals_virial, cell)
+            CALL expand_symmetric_virial(nsgfa*nsgfb*nsgfc*nsgfd, primitive_integrals_virial, cell)
          END IF
       END IF
    END SUBROUTINE forces4
