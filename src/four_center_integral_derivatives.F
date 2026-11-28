@@ -21,7 +21,8 @@ MODULE four_center_integral_derivatives
    IMPLICIT NONE
    PRIVATE
 
-   PUBLIC :: add_ssss_derivatives, add_hermite_derivatives, prepare_hermite_workspace, extract_hermite_derivatives
+   PUBLIC :: add_ssss_derivatives, add_hermite_derivatives, expand_ssss_virial, &
+             prepare_hermite_workspace, extract_hermite_derivatives
 
    ! Polynomial degrees for a first derivative of (dd|dd) and its coordinate moment.
    INTEGER, PARAMETER :: max_order = 9, max_monomials = 286, max_hermites = 220, max_pair_hermites = 56
@@ -54,30 +55,26 @@ MODULE four_center_integral_derivatives
 CONTAINS
 
 ! **************************************************************************************************
-!> \brief Sum one displacement group of all-s derivatives in Cartesian center order.
+!> \brief Accumulate forces on A, C, and D and the lower triangle of the all-s strain derivative.
 !> \param records prepared quartets with common exponents and internal pair displacements
 !> \param abcd fixed internal bra and ket displacements
-!> \param cell cell for fractional-coordinate virial weighting
-!> \param virial whether to accumulate virial components
-!> \param derivatives twelve Cartesian derivatives followed by nine virial components
+!> \param virial whether to accumulate strain components
+!> \param derivatives Cartesian force derivatives for A, C, D followed by the strain lower triangle
 ! **************************************************************************************************
-   SUBROUTINE add_ssss_derivatives(records, abcd, cell, virial, derivatives)
+   SUBROUTINE add_ssss_derivatives(records, abcd, virial, derivatives)
       TYPE(eri_primitive_data_type), INTENT(IN)          :: records(:)
       REAL(dp), INTENT(IN)                               :: abcd(3, 2)
-      TYPE(cell_type), POINTER                           :: cell
       LOGICAL, INTENT(IN)                                :: virial
-      REAL(dp), CONTIGUOUS, INTENT(INOUT)                :: derivatives(:, :)
+      REAL(dp), INTENT(INOUT)                            :: derivatives(15)
 
-      INTEGER                                            :: first, first_order, i, j, k
-      REAL(dp)                                           :: ab(3), cd(3), d1(3), dg(3, 4), f0, &
-                                                            f1(3), frac(4), moment(3, 3), rel(3), &
-                                                            x(3)
+      INTEGER                                            :: component, i, j
+      REAL(dp)                                           :: ab(3), cd(3), d1(3), f0, f1(3), frac(4), &
+                                                            moment(3, 3), rel(3), rho2, x(3)
 
-      first_order = MIN(1, records(1)%prepared_max_order) + 1
-      CPASSERT(first_order == 2)
+      CPASSERT(records(1)%prepared_max_order >= 1)
       x = records(1)%P - records(1)%Q
       f0 = records(1)%Fm(1)
-      f1 = x*records(1)%Fm(first_order)
+      f1 = x*records(1)%Fm(2)
       IF (virial) THEN
          ! Only the product-center separation varies within a displacement group.
          DO j = 1, 3
@@ -86,7 +83,7 @@ CONTAINS
          DO i = 2, SIZE(records)
             ASSOCIATE (p => records(i))
                x = p%P - p%Q
-               d1 = x*p%Fm(first_order)
+               d1 = x*p%Fm(2)
                f0 = f0 + p%Fm(1)
                f1 = f1 + d1
                DO j = 1, 3
@@ -97,7 +94,7 @@ CONTAINS
       ELSE
          DO i = 2, SIZE(records)
             ASSOCIATE (p => records(i))
-               d1 = (p%P - p%Q)*p%Fm(first_order)
+               d1 = (p%P - p%Q)*p%Fm(2)
                f0 = f0 + p%Fm(1)
                f1 = f1 + d1
             END ASSOCIATE
@@ -105,46 +102,70 @@ CONTAINS
       END IF
 
       ASSOCIATE (p => records(1))
-         ! Differentiate the pair attenuation and the product-center separation in the ssss seed.
          frac = p%exponents*[p%ZetaInv, p%ZetaInv, p%EtaInv, p%EtaInv]
          ab = (-2.0_dp*p%exponents(1)*frac(2))*abcd(:, 1)
          cd = (-2.0_dp*p%exponents(3)*frac(4))*abcd(:, 2)
-         rel = (-2.0_dp*p%Rho)*f1
-         dg(:, 1) = ab*f0 + frac(1)*rel
-         dg(:, 2) = -ab*f0 + frac(2)*rel
-         dg(:, 3) = cd*f0 - frac(3)*rel
-         dg(:, 4) = -cd*f0 - frac(4)*rel
-         DO k = 1, 4
-            first = 3*k - 2
-            derivatives(1, first:first + 2) = derivatives(1, first:first + 2) + dg(:, k)
-         END DO
+         rho2 = -2.0_dp*p%Rho
+         rel = rho2*f1
+         derivatives(1:3) = derivatives(1:3) + (ab*f0 + frac(1)*rel)
+         derivatives(4:6) = derivatives(4:6) + (cd*f0 - frac(3)*rel)
+         derivatives(7:9) = derivatives(7:9) + (-cd*f0 - frac(4)*rel)
 
          IF (virial) THEN
-            moment(1, 2) = moment(2, 1)
-            moment(1, 3) = moment(3, 1)
-            moment(2, 3) = moment(3, 2)
+            component = 9
             DO j = 1, 3
-               moment(:, j) = f0*(ab*abcd(j, 1) + cd*abcd(j, 2)) - 2.0_dp*p%Rho*moment(:, j)
-            END DO
-            IF (cell%orthorhombic) THEN
-               DO j = 1, 3
-                  moment(:, j) = moment(:, j)*cell%h_inv(j, j)
+               DO i = j, 3
+                  component = component + 1
+                  derivatives(component) = derivatives(component) + &
+                                           (f0*(ab(i)*abcd(j, 1) + cd(i)*abcd(j, 2)) + rho2*moment(i, j))
                END DO
-            ELSE
-               moment = MATMUL(moment, TRANSPOSE(cell%h_inv))
-            END IF
-            DO j = 1, 3
-               first = 13 + 3*(j - 1)
-               derivatives(1, first:first + 2) = derivatives(1, first:first + 2) + moment(:, j)
             END DO
          END IF
       END ASSOCIATE
    END SUBROUTINE add_ssss_derivatives
 
 ! **************************************************************************************************
+!> \brief Expand all contracted strain tensors and transform them to cell derivatives.
+!> \param n number of contracted AO quartets
+!> \param virial lower triangle on input, full cell derivatives on output
+!> \param cell simulation cell
+! **************************************************************************************************
+   SUBROUTINE expand_ssss_virial(n, virial, cell)
+      INTEGER, INTENT(IN)                                :: n
+      REAL(dp), INTENT(INOUT)                            :: virial(n, 3, 3)
+      TYPE(cell_type), INTENT(IN)                        :: cell
+
+      INTEGER                                            :: i, j, k
+      REAL(dp)                                           :: row(3)
+
+      IF (cell%orthorhombic) THEN
+         DO j = 1, 3
+            DO i = j + 1, 3
+               virial(:, j, i) = virial(:, i, j)*cell%h_inv(i, i)
+            END DO
+            virial(:, j:3, j) = virial(:, j:3, j)*cell%h_inv(j, j)
+         END DO
+      ELSE
+         virial(:, 1, 2) = virial(:, 2, 1)
+         virial(:, 1, 3) = virial(:, 3, 1)
+         virial(:, 2, 3) = virial(:, 3, 2)
+         DO j = 1, 3
+!$OMP SIMD PRIVATE(row)
+            DO i = 1, n
+               row = virial(i, j, :)
+               DO k = 1, 3
+                  virial(i, j, k) = SUM(row*cell%h_inv(k, :))
+               END DO
+            END DO
+         END DO
+      END IF
+   END SUBROUTINE expand_ssss_virial
+
+! **************************************************************************************************
 !> \brief Initialize angular and polynomial lookup tables for the current shell ranges.
 !> \param work context-owned workspace reused between primitive quartets
-!> \param lower,upper minimum and maximum angular momentum per center
+!> \param lower minimum angular momentum per center
+!> \param upper maximum angular momentum per center
 !> \param virial whether to include the shifted radial moments
 ! **************************************************************************************************
    SUBROUTINE prepare_hermite_workspace(work, lower, upper, virial)
@@ -288,7 +309,8 @@ CONTAINS
 ! **************************************************************************************************
 !> \brief Construct Hermite expansions of the pair and its Gaussian-center derivatives.
 !> \param powers Hermite multi-indices
-!> \param lower,upper angular range for the two centers
+!> \param lower minimum angular momentum at each center
+!> \param upper maximum angular momentum at each center
 !> \param exponents the pair's two Gaussian exponents
 !> \param displacement displacement from the second center to the first
 !> \param expansion pair expansion matrices with the undifferentiated matrix first
@@ -508,8 +530,10 @@ CONTAINS
 !> \param l angular momenta in original center order
 !> \param derivatives twelve Cartesian derivatives followed by nine virial components
 !> \param virial whether virial components are present
-!> \param forces,stress destination blocks for the angular quartet
-!> \param force_max,stress_max maxima for Cartesian screening
+!> \param forces force block for the angular quartet
+!> \param stress virial block for the angular quartet
+!> \param force_max force maximum for Cartesian screening
+!> \param stress_max virial maximum for Cartesian screening
 ! **************************************************************************************************
    SUBROUTINE extract_hermite_derivatives(work, l, derivatives, virial, forces, stress, force_max, stress_max)
       TYPE(eri4_hermite_workspace_type), INTENT(IN)      :: work

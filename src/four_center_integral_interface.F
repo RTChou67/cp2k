@@ -20,6 +20,7 @@ MODULE four_center_integral_interface
    USE four_center_integral_derivatives,ONLY: add_hermite_derivatives,&
                                               add_ssss_derivatives,&
                                               eri4_hermite_workspace_type,&
+                                              expand_ssss_virial,&
                                               extract_hermite_derivatives,&
                                               prepare_hermite_workspace
    USE four_center_integral_preparation,ONLY: min_image_gap_sq,&
@@ -65,7 +66,9 @@ MODULE four_center_integral_interface
       TYPE(eri4_image_group_type), ALLOCATABLE :: image_groups(:)
       TYPE(eri4_hermite_workspace_type), ALLOCATABLE :: hermite
       REAL(dp), ALLOCATABLE :: derivative_blocks(:, :)
-      LOGICAL :: derivatives_prepared = .FALSE.
+      LOGICAL :: derivatives_prepared = .FALSE., ssss_prepared = .FALSE.
+      ! A, C, and D gradients followed by the lower triangle of the Cartesian strain derivative.
+      REAL(dp) :: ssss_derivatives(15) = 0.0_dp
       INTEGER :: nproducts = 0, nimage_groups = 0
    END TYPE four_center_integral_context_type
 
@@ -239,14 +242,16 @@ CONTAINS
 ! **************************************************************************************************
 !> \brief Prepare a primitive quartet and its Cartesian derivatives when image sums can be reused.
 !> \param context owning per-thread geometry and derivative workspace
-!> \param list1,list2 bra and ket primitive pairs
+!> \param list1 bra primitive pair
+!> \param list2 ket primitive pair
 !> \param nproducts number of retained image quartets
 !> \param log10_pmax logarithmic density bound
 !> \param log10_eps_schwarz logarithmic integral screening threshold
 !> \param neighbor_cells periodic image translations
 !> \param cell simulation cell
 !> \param potential_parameter physical radial operator
-!> \param lower,upper angular range for the four centers
+!> \param lower minimum angular momentum at each center
+!> \param upper maximum angular momentum at each center
 !> \param do_periodic whether to enumerate periodic translations
 !> \param use_virial whether to compute the virial tensor
 ! **************************************************************************************************
@@ -270,6 +275,7 @@ CONTAINS
       LOGICAL                                            :: hermite, radial_moments, ssss
       REAL(dp)                                           :: abcd(3, 2)
 
+      context%ssss_prepared = .FALSE.
       radial_moments = potential_parameter%potential_type /= do_potential_id
       ssss = radial_moments .AND. ALL(upper == 0)
       hermite = radial_moments .AND. do_periodic .AND. ALL(upper <= 2) .AND. .NOT. ssss
@@ -287,16 +293,18 @@ CONTAINS
       END IF
       IF (.NOT. (ssss .OR. hermite)) RETURN
 
-      ncart = PRODUCT(ncoset(upper) - ncoset(lower - 1))
-      ncomponents = MERGE(21, 12, use_virial)
-      IF (ALLOCATED(context%derivative_blocks)) THEN
-         IF (SIZE(context%derivative_blocks, 1) < ncart .OR. SIZE(context%derivative_blocks, 2) < ncomponents) THEN
-            DEALLOCATE (context%derivative_blocks)
+      IF (ssss) THEN
+         context%ssss_derivatives = 0.0_dp
+      ELSE
+         ncart = PRODUCT(ncoset(upper) - ncoset(lower - 1))
+         ncomponents = MERGE(21, 12, use_virial)
+         IF (ALLOCATED(context%derivative_blocks)) THEN
+            IF (SIZE(context%derivative_blocks, 1) < ncart .OR. SIZE(context%derivative_blocks, 2) < ncomponents) THEN
+               DEALLOCATE (context%derivative_blocks)
+            END IF
          END IF
-      END IF
-      IF (.NOT. ALLOCATED(context%derivative_blocks)) ALLOCATE (context%derivative_blocks(ncart, ncomponents))
-      context%derivative_blocks(:ncart, :ncomponents) = 0.0_dp
-      IF (hermite) THEN
+         IF (.NOT. ALLOCATED(context%derivative_blocks)) ALLOCATE (context%derivative_blocks(ncart, ncomponents))
+         context%derivative_blocks(:ncart, :ncomponents) = 0.0_dp
          IF (.NOT. ALLOCATED(context%hermite)) ALLOCATE (context%hermite)
          CALL prepare_hermite_workspace(context%hermite, lower, upper, use_virial)
       END IF
@@ -317,12 +325,13 @@ CONTAINS
             abcd(:, 2) = context%products(i)%centers(:, 3) - context%products(i)%centers(:, 4)
          END IF
          IF (ssss) THEN
-            CALL add_ssss_derivatives(context%products(i:j), abcd, cell, use_virial, context%derivative_blocks)
+            CALL add_ssss_derivatives(context%products(i:j), abcd, use_virial, context%ssss_derivatives)
          ELSE
             CALL add_hermite_derivatives(context%hermite, context%products(i:j), abcd, cell, context%derivative_blocks, ncart)
          END IF
          i = j + 1
       END DO
+      context%ssss_prepared = ssss
       context%derivatives_prepared = .TRUE.
    END SUBROUTINE prepare_four_center_derivative_batch
 
@@ -357,6 +366,7 @@ CONTAINS
       IF (ALLOCATED(context%hermite)) DEALLOCATE (context%hermite)
       IF (ALLOCATED(context%derivative_blocks)) DEALLOCATE (context%derivative_blocks)
       context%derivatives_prepared = .FALSE.
+      context%ssss_prepared = .FALSE.
       CALL cp_libint_cleanup_eri(context%eri)
       CALL cp_libint_cleanup_eri1(context%deriv)
       DEALLOCATE (context%products)
@@ -463,13 +473,40 @@ CONTAINS
       INTEGER                                            :: angular_momenta(4), group_index, i, j, &
                                                             k, m, mysize, next_group, &
                                                             permutation(4)
-      REAL(dp)                                           :: force_max, origin(3), relative(3, 3), &
-                                                            stress_max
+      LOGICAL                                            :: compact_ssss
+      REAL(dp)                                           :: cell_derivative(3, 3), cell_scale(3), &
+                                                            force_max, origin(3), relative(3, 3), &
+                                                            strain(6), stress_max
 
       mysize = ncoa*ncob*ncoc*ncod
+      compact_ssss = context%derivatives_prepared .AND. context%ssss_prepared
 
       IF (context%derivatives_prepared) THEN
-         IF (mysize == 1 .AND. SUM([n_a, n_b, n_c, n_d]) == 0) THEN
+         IF (compact_ssss) THEN
+            work2(1, 1:3) = context%ssss_derivatives(1:3)
+            work2(1, 7:12) = context%ssss_derivatives(4:9)
+            work2(1, 4:6) = -(work2(1, 1:3) + work2(1, 7:9) + work2(1, 10:12))
+            force_max = MAXVAL(ABS(work2(1, :)))
+            IF (use_virial) THEN
+               strain = context%ssss_derivatives(10:15)
+               work2_virial(1, :, 1) = strain(1:3)
+               work2_virial(1, 2:3, 2) = strain(4:5)
+               work2_virial(1, 3, 3) = strain(6)
+               ! Screen the full cell derivative and contract only the strain lower triangle.
+               IF (cell%orthorhombic) THEN
+                  cell_scale = ABS([cell%h_inv(1, 1), cell%h_inv(2, 2), cell%h_inv(3, 3)])
+                  stress_max = MAXVAL(ABS(strain)*[cell_scale(1), MAX(cell_scale(1), cell_scale(2)), &
+                                                   MAX(cell_scale(1), cell_scale(3)), cell_scale(2), &
+                                                   MAX(cell_scale(2), cell_scale(3)), cell_scale(3)])
+               ELSE
+                  cell_derivative(:, 1) = strain(1:3)
+                  cell_derivative(2:3, 2) = strain(4:5)
+                  cell_derivative(3, 3) = strain(6)
+                  CALL expand_ssss_virial(1, cell_derivative, cell)
+                  stress_max = MAXVAL(ABS(cell_derivative))
+               END IF
+            END IF
+         ELSE IF (n_a + n_b + n_c + n_d == 0) THEN
             work2(1, :) = context%derivative_blocks(1, :12)
             force_max = MAXVAL(ABS(work2))
             IF (use_virial) THEN
@@ -554,8 +591,8 @@ CONTAINS
             CALL reorder_eri_block(work, work2, [ncoa, ncob, ncoc, ncod], permutation, 12, 1)
          END IF
          DO i = 1, 12
-            ! For non-s blocks, forces4 recovers center B after contraction from A, C, and D.
-            IF (mysize > 1 .AND. i >= 4 .AND. i <= 6) CYCLE
+            ! forces4 recovers center B after contraction for compact ssss and mixed shell sets.
+            IF ((mysize > 1 .OR. context%derivatives_prepared) .AND. i >= 4 .AND. i <= 6) CYCLE
             CALL contract(ncoa, ncob, ncoc, ncod, nsoa, nsob, nsoc, nsod, &
                           n_a, n_b, n_c, n_d, nl_a, nl_b, nl_c, nl_d, work2(1, i), &
                           angular_a, angular_b, angular_c, angular_d, &
@@ -570,7 +607,7 @@ CONTAINS
             CALL reorder_eri_block(work_virial, work2_virial, [ncoa, ncob, ncoc, ncod], permutation, 3, 3)
          END IF
          DO i = 1, 3
-            DO m = 1, 3
+            DO m = 1, MERGE(i, 3, compact_ssss)
                CALL contract(ncoa, ncob, ncoc, ncod, nsoa, nsob, nsoc, nsod, &
                              n_a, n_b, n_c, n_d, nl_a, nl_b, nl_c, nl_d, work2_virial(1, i, m), &
                              angular_a, angular_b, angular_c, angular_d, &
