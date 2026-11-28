@@ -10,22 +10,28 @@
 ! **************************************************************************************************
 MODULE four_center_integral_methods
    USE cell_types,                      ONLY: cell_type
-   USE four_center_integral_derivatives,ONLY: expand_symmetric_virial
+   USE four_center_integral_derivatives,ONLY: eri4_hermite_density_type,&
+                                              expand_symmetric_virial,&
+                                              prepare_hermite_density,&
+                                              select_hermite_density
    USE four_center_integral_interface,  ONLY: evaluate_deriv_eri,&
                                               evaluate_eri,&
                                               four_center_integral_context_type,&
                                               prepare_four_center_batch,&
-                                              prepare_four_center_derivative_batch
+                                              prepare_four_center_derivative_batch,&
+                                              prepare_hermite_batch
    USE four_center_integral_preparation,ONLY: min_image_gap_sq,&
                                               prepare_eri4_pair
    USE four_center_integral_types,      ONLY: eri4_cell_type,&
                                               eri4_contraction_type,&
+                                              eri4_density_type,&
                                               eri4_pgf_pair_type,&
                                               eri4_screen_coeff_type
    USE integral_library_types,          ONLY: coulomb_operator_type
    USE kinds,                           ONLY: dp,&
                                               int_8
    USE orbital_pointers,                ONLY: nco,&
+                                              ncoset,&
                                               nso
 #include "./base/base_uses.f90"
 
@@ -412,7 +418,10 @@ CONTAINS
 !> \param ede_work_virial ...
 !> \param ede_work2_virial ...
 !> \param primitive_integrals_virial ...
-!> \param cart_estimate_virial ...
+!> \param cart_estimate_virial maximum of the uncontracted stress on the remaining backends
+!> \param density AO exchange density
+!> \param exchange_factor exchange and quartet symmetry coefficient
+!> \param hermite_virial cell derivative already contracted with the exchange density
 ! **************************************************************************************************
    SUBROUTINE forces4(context, ra, rb, rc, rd, npgfa, npgfb, npgfc, npgfd, &
                       la_min, la_max, lb_min, lb_max, &
@@ -429,7 +438,7 @@ CONTAINS
                       ede_buffer1, ede_buffer2, &
                       nimages, do_periodic, use_virial, ede_work_virial, &
                       ede_work2_virial, primitive_integrals_virial, &
-                      cart_estimate_virial)
+                      cart_estimate_virial, density, exchange_factor, hermite_virial)
 
       TYPE(four_center_integral_context_type), &
          INTENT(INOUT)                                   :: context
@@ -465,21 +474,30 @@ CONTAINS
       REAL(dp), &
          DIMENSION(nsgfa, nsgfb, nsgfc, nsgfd, 3, 3)     :: primitive_integrals_virial
       REAL(dp)                                           :: cart_estimate_virial
+      TYPE(eri4_density_type), INTENT(IN)                :: density
+      REAL(dp), INTENT(IN)                               :: exchange_factor
+      REAL(dp), INTENT(OUT)                              :: hermite_virial(3, 3)
 
-      INTEGER :: ipgf, jpgf, kpgf, la, lb, lc, ld, list_ij, list_kl, lpgf, ncoa, ncob, ncoc, ncod, &
-         nelements_ij, nelements_kl, nproducts, nsgfla, nsgflb, nsgflc, nsgfld, nsoa, nsob, nsoc, &
-         nsod, s_offset_a, s_offset_b, s_offset_c, s_offset_d
-      LOGICAL                                            :: reconstruct_b, symmetric_strain
-      REAL(dp)                                           :: tmp_max, tmp_max_virial
+      INTEGER :: ipgf, jpgf, kpgf, la, lb, lc, ld, list_ij, list_kl, lower(4), lpgf, ncart(4), &
+         ncoa, ncob, ncoc, ncod, nelements_ij, nelements_kl, nproducts, nsgfla, nsgflb, nsgflc, &
+         nsgfld, nsoa, nsob, nsoc, nsod, s_offset_a, s_offset_b, s_offset_c, s_offset_d, upper(4)
+      LOGICAL                                            :: batch_virial, density_ready, hermite, &
+                                                            reconstruct_b, symmetric_strain, &
+                                                            virial_initialized
+      REAL(dp)                                           :: tmp_max, tmp_max_virial, virial_budget
+      TYPE(eri4_hermite_density_type)                    :: primitive_density
 
+      hermite_virial = 0.0_dp
+      density_ready = .FALSE.
+      virial_initialized = .FALSE.
+      lower = [la_min, lb_min, lc_min, ld_min]
+      upper = [la_max, lb_max, lc_max, ld_max]
+      ncart = ncoset(upper) - ncoset(lower - 1)
       reconstruct_b = la_max + lb_max + lc_max + ld_max > 0
       symmetric_strain = .FALSE.
       cart_estimate = 0.0_dp
       primitive_integrals = 0.0_dp
-      IF (use_virial) THEN
-         primitive_integrals_virial = 0.0_dp
-         cart_estimate_virial = 0.0_dp
-      END IF
+      IF (use_virial) cart_estimate_virial = 0.0_dp
       neris_tmp = 0_int_8
 
       CALL build_pair_list_pgf(npgfa, npgfb, pgf_list_ij, zeta, zetb, screen1, screen2, &
@@ -493,6 +511,14 @@ CONTAINS
                                neighbor_cells, nimages, do_periodic, cell)
       IF (nelements_kl == 0) RETURN
 
+      ! Share the shell-quartet error budget among all candidate primitive quartets.
+      ! The cell matrix factor bounds conversion from cell derivatives to virial components.
+      virial_budget = 0.0_dp
+      IF (use_virial) THEN
+         virial_budget = MAX(0.0_dp, eps_schwarz)/(REAL(nelements_ij, dp)*REAL(nelements_kl, dp)* &
+                                                   MAXVAL(SUM(ABS(cell%hmat), DIM=2)))
+      END IF
+
       DO list_ij = 1, nelements_ij
          ipgf = pgf_list_ij(list_ij)%ipgf
          jpgf = pgf_list_ij(list_ij)%jpgf
@@ -503,10 +529,28 @@ CONTAINS
 
             CALL prepare_four_center_derivative_batch(context, pgf_list_ij(list_ij), pgf_list_kl(list_kl), nproducts, &
                                                       log10_pmax, log10_eps_schwarz, neighbor_cells, cell, &
-                                                      potential_parameter, [la_min, lb_min, lc_min, ld_min], &
-                                                      [la_max, lb_max, lc_max, ld_max], do_periodic, use_virial, symmetric_strain)
+                                                      potential_parameter, upper, do_periodic, use_virial, &
+                                                      symmetric_strain, hermite)
             reconstruct_b = reconstruct_b .OR. symmetric_strain
             IF (nproducts == 0) CYCLE
+            IF (use_virial .AND. hermite) THEN
+               IF (.NOT. density_ready) THEN
+                  CALL prepare_hermite_density(primitive_density, density, exchange_factor, lower, upper, &
+                                               [npgfa, npgfb, npgfc, npgfd], [nsgfa, nsgfb, nsgfc, nsgfd], &
+                                               contraction_a, contraction_b, contraction_c, contraction_d)
+                  density_ready = .TRUE.
+               END IF
+               CALL select_hermite_density(primitive_density, [ipgf, jpgf, kpgf, lpgf], ncart, virial_budget)
+            END IF
+            IF (symmetric_strain .OR. hermite) THEN
+               CALL prepare_hermite_batch(context, lower, upper, symmetric_strain, cell, use_virial, &
+                                          primitive_density, hermite_virial)
+            END IF
+            batch_virial = use_virial .AND. .NOT. hermite
+            IF (batch_virial .AND. .NOT. virial_initialized) THEN
+               primitive_integrals_virial = 0.0_dp
+               virial_initialized = .TRUE.
+            END IF
             s_offset_a = 0
             DO la = la_min, la_max
                s_offset_b = 0
@@ -545,11 +589,11 @@ CONTAINS
                                                 contraction_a(la)%weights(:, ipgf), contraction_b(lb)%weights(:, jpgf), &
                                                 contraction_c(lc)%weights(:, kpgf), contraction_d(ld)%weights(:, lpgf), &
                                                 ede_work, ede_work2, ede_work_forces, &
-                                                ede_buffer1, ede_buffer2, use_virial, reconstruct_b, &
+                                                ede_buffer1, ede_buffer2, batch_virial, reconstruct_b, &
                                                 ede_work_virial, ede_work2_virial, &
                                                 primitive_integrals_virial, cell, tmp_max_virial)
                         cart_estimate = MAX(tmp_max, cart_estimate)
-                        IF (use_virial) cart_estimate_virial = MAX(tmp_max_virial, cart_estimate_virial)
+                        IF (batch_virial) cart_estimate_virial = MAX(tmp_max_virial, cart_estimate_virial)
                         s_offset_d = s_offset_d + nsod*nsgfld
                      END DO !ld
                      s_offset_c = s_offset_c + nsoc*nsgflc

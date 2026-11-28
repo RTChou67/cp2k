@@ -18,6 +18,7 @@ MODULE four_center_integral_interface
                                               pbc,&
                                               real_to_scaled
    USE four_center_integral_derivatives,ONLY: eri4_hermite_batch_type,&
+                                              eri4_hermite_density_type,&
                                               extract_hermite_derivatives,&
                                               prepare_hermite_derivatives
    USE four_center_integral_preparation,ONLY: min_image_gap_sq,&
@@ -48,7 +49,7 @@ MODULE four_center_integral_interface
    IMPLICIT NONE
    PRIVATE
    PUBLIC :: four_center_integral_init, four_center_integral_cleanup, &
-             prepare_four_center_batch, prepare_four_center_derivative_batch, evaluate_eri, &
+             prepare_four_center_batch, prepare_four_center_derivative_batch, prepare_hermite_batch, evaluate_eri, &
              evaluate_deriv_eri, &
              evaluate_eri_screen
 
@@ -243,15 +244,16 @@ CONTAINS
 !> \param neighbor_cells periodic image translations
 !> \param cell simulation cell
 !> \param potential_parameter physical radial operator
-!> \param lower minimum angular momentum at each center
 !> \param upper maximum angular momentum at each center
 !> \param do_periodic whether to enumerate periodic translations
 !> \param use_virial whether to compute the virial tensor
 !> \param symmetric_strain whether the shell quartet uses the lower strain triangle
+!> \param hermite whether the image batch can use the Hermite backend
 ! **************************************************************************************************
    SUBROUTINE prepare_four_center_derivative_batch(context, list1, list2, nproducts, &
                                                    log10_pmax, log10_eps_schwarz, neighbor_cells, &
-                                                 cell, potential_parameter, lower, upper, do_periodic, use_virial, symmetric_strain)
+                                                   cell, potential_parameter, upper, do_periodic, use_virial, &
+                                                   symmetric_strain, hermite)
       TYPE(four_center_integral_context_type), &
          INTENT(INOUT)                                   :: context
       TYPE(eri4_pgf_pair_type), INTENT(IN)               :: list1, list2
@@ -260,14 +262,14 @@ CONTAINS
       TYPE(eri4_cell_type), POINTER                      :: neighbor_cells(:)
       TYPE(cell_type), POINTER                           :: cell
       TYPE(coulomb_operator_type), INTENT(IN)            :: potential_parameter
-      INTEGER, INTENT(IN)                                :: lower(4), upper(4)
+      INTEGER, INTENT(IN)                                :: upper(4)
       LOGICAL, INTENT(IN)                                :: do_periodic, use_virial
-      LOGICAL, INTENT(OUT)                               :: symmetric_strain
+      LOGICAL, INTENT(OUT)                               :: symmetric_strain, hermite
 
       INTEGER, PARAMETER                                 :: min_images_per_group = 4
 
       INTEGER                                            :: group, ngroups
-      LOGICAL                                            :: hermite, radial_moments
+      LOGICAL                                            :: radial_moments
 
       radial_moments = potential_parameter%potential_type /= do_potential_id
       symmetric_strain = radial_moments .AND. ALL(upper == 0)
@@ -285,13 +287,35 @@ CONTAINS
          END DO
          hermite = nproducts/ngroups >= min_images_per_group
       END IF
-      IF (.NOT. (symmetric_strain .OR. hermite)) RETURN
+   END SUBROUTINE prepare_four_center_derivative_batch
+
+! **************************************************************************************************
+!> \brief Evaluate the prepared Hermite batch for the selected angular range.
+!> \param context prepared image quartets and output workspace
+!> \param lower minimum angular momentum for each center
+!> \param upper maximum angular momentum for each center
+!> \param symmetric_strain select the all-s specialization
+!> \param cell simulation cell
+!> \param use_virial whether to include cell derivatives
+!> \param density transformed primitive density and screening budget
+!> \param virial density-weighted cell derivative
+! **************************************************************************************************
+   SUBROUTINE prepare_hermite_batch(context, lower, upper, symmetric_strain, cell, use_virial, density, virial)
+      TYPE(four_center_integral_context_type), &
+         INTENT(INOUT)                                   :: context
+      INTEGER, INTENT(IN)                                :: lower(4), upper(4)
+      LOGICAL, INTENT(IN)                                :: symmetric_strain
+      TYPE(cell_type), POINTER                           :: cell
+      LOGICAL, INTENT(IN)                                :: use_virial
+      TYPE(eri4_hermite_density_type), INTENT(INOUT)     :: density
+      REAL(dp), INTENT(INOUT)                            :: virial(3, 3)
 
       IF (.NOT. ALLOCATED(context%hermite)) ALLOCATE (context%hermite)
-      CALL prepare_hermite_derivatives(context%hermite, context%products(:nproducts), context%image_groups, &
-                                       context%nimage_groups, lower, upper, symmetric_strain, cell, use_virial)
+      CALL prepare_hermite_derivatives(context%hermite, context%products(:context%nproducts), context%image_groups, &
+                                       context%nimage_groups, lower, upper, symmetric_strain, cell, &
+                                       use_virial, density, virial)
       context%hermite_ready = .TRUE.
-   END SUBROUTINE prepare_four_center_derivative_batch
+   END SUBROUTINE prepare_hermite_batch
 
 ! **************************************************************************************************
 !> \brief Initialize the four-center energy and first-derivative workspaces.

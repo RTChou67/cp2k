@@ -32,6 +32,7 @@ MODULE hfx_derivatives
                            dbcsr_p_type, &
                            dbcsr_type_antisymmetric
    USE four_center_integral_methods, ONLY: forces4
+   USE four_center_integral_types, ONLY: eri4_density_type
    USE hfx_communication, ONLY: get_full_density
    USE hfx_compression_methods, ONLY: hfx_add_mult_cache_elements, &
                                       hfx_add_single_cache_element, &
@@ -152,21 +153,21 @@ CONTAINS
       INTEGER, DIMENSION(:, :), POINTER, SAVE            :: shm_is_assoc_atomic_block
       INTEGER, DIMENSION(:, :, :, :), POINTER            :: shm_set_offset
       INTEGER, SAVE                                      :: shm_number_of_p_entries
-      LOGICAL :: bins_left, buffer_overflow, contract_forces, contract_virial, do_dynamic_load_balancing, do_it, do_periodic, &
+      LOGICAL :: bins_left, buffer_overflow, cached_forces, contract_forces, contract_virial, &
+                 do_dynamic_load_balancing, do_it, do_periodic, &
                  do_print_load_balance_info, is_anti_symmetric, my_resp_only, screen_pmat_forces, &
                  treat_forces_in_core, use_disk_storage, with_resp_density
       LOGICAL, DIMENSION(:, :), POINTER                  :: shm_atomic_pair_list
       REAL(dp) :: bintime_start, bintime_stop, cartesian_estimate, cartesian_estimate_virial, &
-                  compression_factor, eps_schwarz, eps_storage, fac, force_terms(12, 2), hf_fraction, ln_10, log10_eps_schwarz, &
+                  compression_factor, eps_schwarz, eps_storage, fac, force_terms(12, 2), hermite_virial(3, 3), &
+                  hf_fraction, ln_10, log10_eps_schwarz, &
                   log10_pmax, log_2, max_contraction_val, max_val1, max_val2, max_val2_set, &
                   my_adiabatic_rescale_factor, pmax_atom, pmax_blocks, pmax_entry, pmax_tmp, ra(3), rab2, &
                   rb(3), rc(3), rcd2, rd(3), spherical_estimate, spherical_estimate_virial, symm_fac, &
                   tmp_virial(3, 3), virial_terms(3, 3, 2)
-      REAL(dp), ALLOCATABLE, DIMENSION(:) :: ede_buffer1, ede_buffer2, &
-                                             ede_work, ede_work2, ede_work2_virial, ede_work_forces, &
-                                             ede_work_virial, pac_buf, pac_buf_beta, pac_buf_resp, pac_buf_resp_beta, pad_buf, &
-                                             pad_buf_beta, pad_buf_resp, pad_buf_resp_beta, pbc_buf, pbc_buf_beta, pbc_buf_resp, &
-                                             pbc_buf_resp_beta, pbd_buf, pbd_buf_beta, pbd_buf_resp, pbd_buf_resp_beta
+      REAL(dp), ALLOCATABLE, DIMENSION(:) :: ede_buffer1, ede_buffer2, ede_work, ede_work2, ede_work2_virial, &
+                                             ede_work_forces, ede_work_virial
+      TYPE(eri4_density_type)                            :: density
       REAL(dp), ALLOCATABLE, DIMENSION(:)                :: primitive_forces, primitive_forces_virial
       REAL(dp), DIMENSION(:), POINTER                    :: full_density_resp, &
                                                             full_density_resp_beta
@@ -321,12 +322,12 @@ CONTAINS
 !$OMP                                  nkimages,my_nspins,my_x_data)&
 !$OMP  PRIVATE(actual_x_data,atomic_kind_set,atomic_offset_ac,atomic_offset_ad,atomic_offset_bc,&
 !$OMP  atomic_offset_bd,atom_of_kind,basis_info,&
-!$OMP  basis_parameter,bin,bins_left,bintime_start,bintime_stop,bits_max_val,buffer_left,buffer_overflow,buffer_size,&
-!$OMP  buffer_start,cache_size,cartesian_estimate,cartesian_estimate_virial,center,contract_forces,contract_virial,&
+!$OMP  basis_parameter,bin,bins_left,bintime_start,bintime_stop,bits_max_val,buffer_left,buffer_overflow,cached_forces,buffer_size,&
+!$OMP  buffer_start,cache_size,cartesian_estimate,cartesian_estimate_virial,center,contract_forces,contract_virial,density,&
 !$OMP  coeffs_kind_max0,compression_factor,counter,current_counter,&
 !$OMP  direction,distribution_forces,do_dynamic_load_balancing,do_it,do_periodic,ede_buffer1,ede_buffer2,&
 !$OMP  ede_work,ede_work2,ede_work2_virial,ede_work_forces,ede_work_virial,eps_schwarz,eps_storage,estimate_to_store_int,&
-!$OMP  fac,first_sgfb,force_terms,forces_map,general_parameter,handle_bin,handle_getp,handle_load,&
+!$OMP  fac,first_sgfb,force_terms,hermite_virial,forces_map,general_parameter,handle_bin,handle_getp,handle_load,&
 !$OMP  handle_main,hf_fraction,i_atom,iatom_end,iatom_start,ikind,integral_caches,integral_containers,&
 !$OMP  i_set_list_ij_start,i_set_list_ij_stop,i_set_list_kl_start,i_set_list_kl_stop,i_thread,ispin,iw,j_atom,jatom_end,&
 !$OMP  jatom_start,jkind,katom,k_atom,katom_block,katom_end,katom_start,kind_kind_idx,&
@@ -340,9 +341,7 @@ CONTAINS
 !$OMP  neris_total,nimages,nints,nneighbors,npgfa,npgfb,npgfc,npgfd,&
 !$OMP  nprim_ints,n_processes,nseta,nsetb,nsgfa,nsgfb,nsgfc,nsgfd,&
 !$OMP  nsgf_max,offset_ac_set,offset_ad_set,&
-!$OMP  offset_bc_set,offset_bd_set,pac_buf,pac_buf_beta,pac_buf_resp,pac_buf_resp_beta,pad_buf,pad_buf_beta,pad_buf_resp,&
-!$OMP  pad_buf_resp_beta,particle_set,pbc_buf,pbc_buf_beta,pbc_buf_resp,pbc_buf_resp_beta,pbd_buf,pbd_buf_beta, &
-!$OMP  pbd_buf_resp, pbd_buf_resp_beta, pgf_list_ij,&
+!$OMP  offset_bc_set,offset_bd_set,particle_set,pgf_list_ij,&
 !$OMP  pgf_list_kl,pmax_atom,pmax_blocks,pmax_entry,pmax_tmp,potential_parameter,primitive_forces,&
 !$OMP  primitive_forces_virial,ptr_p_1,ptr_p_2,ptr_p_3,ptr_p_4,ra,rab2,&
 !$OMP  rb,rc,rcd2,rd,screening_parameter,screen_pmat_forces,set_list_ij,set_list_kl,&
@@ -471,7 +470,7 @@ CONTAINS
       shm_block_offset => actual_x_data%block_offset
 
       NULLIFY (full_density_alpha)
-      NULLIFY (full_density_beta)
+      NULLIFY (full_density_beta, full_density_resp, full_density_resp_beta)
       ALLOCATE (full_density_alpha(shm_block_offset(ncpu + 1), nkimages))
 
       !! Get the full density from all the processors
@@ -482,7 +481,6 @@ CONTAINS
                             antisymmetric=is_anti_symmetric)
       ! for now only closed shell case
       IF (with_resp_density) THEN
-         NULLIFY (full_density_resp)
          ALLOCATE (full_density_resp(shm_block_offset(ncpu + 1)))
          CALL get_full_density(para_env, full_density_resp, rho_ao_resp(1)%matrix, shm_number_of_p_entries, &
                                shm_block_offset, &
@@ -498,7 +496,6 @@ CONTAINS
                                antisymmetric=is_anti_symmetric)
          ! With resp density
          IF (with_resp_density) THEN
-            NULLIFY (full_density_resp_beta)
             ALLOCATE (full_density_resp_beta(shm_block_offset(ncpu + 1)))
             CALL get_full_density(para_env, full_density_resp_beta, rho_ao_resp(2)%matrix, shm_number_of_p_entries, &
                                   shm_block_offset, &
@@ -601,28 +598,9 @@ CONTAINS
          ALLOCATE (pgf_list_kl(i)%image_list(nneighbors))
       END DO
 
-      ALLOCATE (pbd_buf(nsgf_max**2))
-      ALLOCATE (pbc_buf(nsgf_max**2))
-      ALLOCATE (pad_buf(nsgf_max**2))
-      ALLOCATE (pac_buf(nsgf_max**2))
-      IF (with_resp_density) THEN
-         ALLOCATE (pbd_buf_resp(nsgf_max**2))
-         ALLOCATE (pbc_buf_resp(nsgf_max**2))
-         ALLOCATE (pad_buf_resp(nsgf_max**2))
-         ALLOCATE (pac_buf_resp(nsgf_max**2))
-      END IF
-      IF (my_nspins == 2) THEN
-         ALLOCATE (pbd_buf_beta(nsgf_max**2))
-         ALLOCATE (pbc_buf_beta(nsgf_max**2))
-         ALLOCATE (pad_buf_beta(nsgf_max**2))
-         ALLOCATE (pac_buf_beta(nsgf_max**2))
-         IF (with_resp_density) THEN
-            ALLOCATE (pbd_buf_resp_beta(nsgf_max**2))
-            ALLOCATE (pbc_buf_resp_beta(nsgf_max**2))
-            ALLOCATE (pad_buf_resp_beta(nsgf_max**2))
-            ALLOCATE (pac_buf_resp_beta(nsgf_max**2))
-         END IF
-      END IF
+      ALLOCATE (density%blocks(nsgf_max**2, 4, my_nspins*MERGE(2, 1, with_resp_density)))
+      density%nspins = my_nspins
+      density%response_only = my_resp_only
 
       ALLOCATE (ede_work(ncos_max**4*12))
       ALLOCATE (ede_work2(ncos_max**4*12))
@@ -1190,36 +1168,20 @@ CONTAINS
                            neris_onthefly = neris_onthefly + current_counter
                         END IF
 
-                        !! Get integrals from buffer and update Kohn-Sham matrix
-                        IF (.NOT. buffer_overflow .AND. .NOT. actual_x_data%memory_parameter%recalc_forces) THEN
-                           nints = current_counter
-                           CALL hfx_get_single_cache_element(estimate_to_store_int, 6, &
-                                                             maxval_cache, maxval_container, memory_parameter%actual_memory_usage, &
-                                                             use_disk_storage)
-                           spherical_estimate = SET_EXPONENT(1.0_dp, estimate_to_store_int + 1)
-!                           IF (spherical_estimate*pmax_entry < eps_schwarz) CYCLE
-                           IF (.NOT. use_virial) THEN
-                              IF (spherical_estimate*pmax_entry < eps_schwarz) CYCLE
-                           END IF
-                           nbits = EXPONENT(ANINT(spherical_estimate*pmax_entry/eps_storage)) + 1
-                           buffer_left = nints
-                           buffer_start = 1
-                           neris_incore = neris_incore + INT(nints, int_8)
-                           DO WHILE (buffer_left > 0)
-                              buffer_size = MIN(buffer_left, cache_size)
-                              CALL hfx_get_mult_cache_elements(primitive_forces(buffer_start), &
-                                                               buffer_size, nbits, &
-                                                               integral_caches(nbits), &
-                                                               integral_containers(nbits), &
-                                                               eps_storage, pmax_entry, &
-                                                               memory_parameter%actual_memory_usage, &
-                                                               use_disk_storage)
-                              buffer_left = buffer_left - buffer_size
-                              buffer_start = buffer_start + buffer_size
-                           END DO
+                        cached_forces = .NOT. buffer_overflow .AND. .NOT. actual_x_data%memory_parameter%recalc_forces
+                        spherical_estimate_virial = 0.0_dp
+                        cartesian_estimate_virial = 0.0_dp
+                        IF (use_virial) THEN
+                           CALL prefetch_quartet_density(density, &
+                                                         [nsgfa(iset), nsgfb(jset), nsgfc(kset), nsgfd(lset)], &
+                                                         [iatom, jatom, katom, latom], [iset, jset, kset, lset], &
+                                                         offset_bd_set, offset_bc_set, offset_ad_set, offset_ac_set, &
+                                                         [atomic_offset_bd, atomic_offset_bc, atomic_offset_ad, atomic_offset_ac], &
+                                                         full_density_alpha, full_density_beta, &
+                                                         full_density_resp, full_density_resp_beta, is_anti_symmetric)
                         END IF
-                        !! Calculate integrals if we run out of buffer or the geometry did change
-                        IF (actual_x_data%memory_parameter%recalc_forces .OR. buffer_overflow) THEN
+                        !! Stress depends on the current density and is not stored in the force cache.
+                        IF (.NOT. cached_forces .OR. use_virial) THEN
                            max_contraction_val = max_contraction(iset, iatom)* &
                                                  max_contraction(jset, jatom)* &
                                                  max_contraction(kset, katom)* &
@@ -1252,7 +1214,8 @@ CONTAINS
                                         ede_buffer1, ede_buffer2, &
                                         nimages, do_periodic, use_virial, ede_work_virial, ede_work2_virial, &
                                         primitive_forces_virial, &
-                                        cartesian_estimate_virial)
+                                        cartesian_estimate_virial, density, fac, hermite_virial)
+                           IF (use_virial) tmp_virial = tmp_virial - hermite_virial
 
                            nints = nsgfa(iset)*nsgfb(jset)*nsgfc(kset)*nsgfd(lset)*12
                            neris_total = neris_total + nints
@@ -1289,113 +1252,119 @@ CONTAINS
                               END DO
                            END IF
 
-                           IF (spherical_estimate == 0.0_dp) spherical_estimate = TINY(spherical_estimate)
-                           estimate_to_store_int = EXPONENT(spherical_estimate)
-                           estimate_to_store_int = MAX(estimate_to_store_int, -15_int_8)
-                           IF (.NOT. buffer_overflow .AND. actual_x_data%memory_parameter%recalc_forces) THEN
-                              CALL hfx_add_single_cache_element(estimate_to_store_int, 6, &
-                                                                maxval_cache, maxval_container, &
-                                                                memory_parameter%actual_memory_usage, &
-                                                                use_disk_storage, max_val_memory)
+                           IF (.NOT. cached_forces) THEN
+                              IF (spherical_estimate == 0.0_dp) spherical_estimate = TINY(spherical_estimate)
+                              estimate_to_store_int = EXPONENT(spherical_estimate)
+                              estimate_to_store_int = MAX(estimate_to_store_int, -15_int_8)
+                              IF (.NOT. buffer_overflow .AND. actual_x_data%memory_parameter%recalc_forces) THEN
+                                 CALL hfx_add_single_cache_element(estimate_to_store_int, 6, &
+                                                                   maxval_cache, maxval_container, &
+                                                                   memory_parameter%actual_memory_usage, &
+                                                                   use_disk_storage, max_val_memory)
+                              END IF
+                              spherical_estimate = SET_EXPONENT(1.0_dp, estimate_to_store_int + 1)
+                              IF (.NOT. use_virial) THEN
+                                 IF (spherical_estimate*pmax_entry < eps_schwarz) CYCLE
+                              END IF
+                              IF (.NOT. buffer_overflow) THEN
+                                 nbits = EXPONENT(ANINT(spherical_estimate*pmax_entry/eps_storage)) + 1
+                                 buffer_left = nints
+                                 buffer_start = 1
+                                 !                              neris_incore = neris_incore+nints
+                                 neris_incore = neris_incore + INT(nints, int_8)
+
+                                 DO WHILE (buffer_left > 0)
+                                    buffer_size = MIN(buffer_left, CACHE_SIZE)
+                                    CALL hfx_add_mult_cache_elements(primitive_forces(buffer_start), &
+                                                                     buffer_size, nbits, &
+                                                                     integral_caches(nbits), &
+                                                                     integral_containers(nbits), &
+                                                                     eps_storage, pmax_entry, &
+                                                                     memory_parameter%actual_memory_usage, &
+                                                                     use_disk_storage)
+                                    buffer_left = buffer_left - buffer_size
+                                    buffer_start = buffer_start + buffer_size
+                                 END DO
+                              ELSE
+                                 !! In order to be consistent with in-core part, round all the eris wrt. eps_schwarz
+                                 !! but only if we treat forces in-core
+                                 IF (treat_forces_in_core .AND. cartesian_estimate /= 0.0_dp) THEN
+                                    DO i = 1, nints
+                                       primitive_forces(i) = primitive_forces(i)*pmax_entry
+                                       IF (ABS(primitive_forces(i)) > eps_storage) THEN
+                                          primitive_forces(i) = ANINT(primitive_forces(i)/eps_storage, dp)*eps_storage/pmax_entry
+                                       ELSE
+                                          primitive_forces(i) = 0.0_dp
+                                       END IF
+                                    END DO
+                                 END IF
+                              END IF
                            END IF
+                           IF (.NOT. cached_forces .AND. cartesian_estimate == 0.0_dp .AND. &
+                               cartesian_estimate_virial == 0.0_dp) CYCLE
+                        END IF
+                        !! Load the cached forces after any stress evaluation.
+                        IF (cached_forces) THEN
+                           nints = current_counter
+                           CALL hfx_get_single_cache_element(estimate_to_store_int, 6, &
+                                                             maxval_cache, maxval_container, memory_parameter%actual_memory_usage, &
+                                                             use_disk_storage)
                            spherical_estimate = SET_EXPONENT(1.0_dp, estimate_to_store_int + 1)
+!                           IF (spherical_estimate*pmax_entry < eps_schwarz) CYCLE
                            IF (.NOT. use_virial) THEN
                               IF (spherical_estimate*pmax_entry < eps_schwarz) CYCLE
                            END IF
-                           IF (.NOT. buffer_overflow) THEN
-                              nbits = EXPONENT(ANINT(spherical_estimate*pmax_entry/eps_storage)) + 1
-                              buffer_left = nints
-                              buffer_start = 1
-!                              neris_incore = neris_incore+nints
-                              neris_incore = neris_incore + INT(nints, int_8)
-
-                              DO WHILE (buffer_left > 0)
-                                 buffer_size = MIN(buffer_left, CACHE_SIZE)
-                                 CALL hfx_add_mult_cache_elements(primitive_forces(buffer_start), &
-                                                                  buffer_size, nbits, &
-                                                                  integral_caches(nbits), &
-                                                                  integral_containers(nbits), &
-                                                                  eps_storage, pmax_entry, &
-                                                                  memory_parameter%actual_memory_usage, &
-                                                                  use_disk_storage)
-                                 buffer_left = buffer_left - buffer_size
-                                 buffer_start = buffer_start + buffer_size
-                              END DO
-                           ELSE
-                              !! In order to be consistent with in-core part, round all the eris wrt. eps_schwarz
-                              !! but only if we treat forces in-core
-                              IF (treat_forces_in_core .AND. cartesian_estimate /= 0.0_dp) THEN
-                                 DO i = 1, nints
-                                    primitive_forces(i) = primitive_forces(i)*pmax_entry
-                                    IF (ABS(primitive_forces(i)) > eps_storage) THEN
-                                       primitive_forces(i) = ANINT(primitive_forces(i)/eps_storage, dp)*eps_storage/pmax_entry
-                                    ELSE
-                                       primitive_forces(i) = 0.0_dp
-                                    END IF
-                                 END DO
-                              END IF
-                           END IF
-                           IF (cartesian_estimate == 0.0_dp .AND. &
-                               (.NOT. use_virial .OR. cartesian_estimate_virial == 0.0_dp)) CYCLE
+                           nbits = EXPONENT(ANINT(spherical_estimate*pmax_entry/eps_storage)) + 1
+                           buffer_left = nints
+                           buffer_start = 1
+                           neris_incore = neris_incore + INT(nints, int_8)
+                           DO WHILE (buffer_left > 0)
+                              buffer_size = MIN(buffer_left, cache_size)
+                              CALL hfx_get_mult_cache_elements(primitive_forces(buffer_start), &
+                                                               buffer_size, nbits, &
+                                                               integral_caches(nbits), &
+                                                               integral_containers(nbits), &
+                                                               eps_storage, pmax_entry, &
+                                                               memory_parameter%actual_memory_usage, &
+                                                               use_disk_storage)
+                              buffer_left = buffer_left - buffer_size
+                              buffer_start = buffer_start + buffer_size
+                           END DO
                         END IF
                         contract_forces = spherical_estimate*pmax_entry >= eps_schwarz
                         contract_virial = .FALSE.
-                        IF (use_virial) contract_virial = spherical_estimate_virial*pmax_entry >= eps_schwarz
+                        IF (use_virial .AND. cartesian_estimate_virial /= 0.0_dp) THEN
+                           contract_virial = spherical_estimate_virial*pmax_entry >= eps_schwarz
+                        END IF
                         IF (.NOT. (contract_forces .OR. contract_virial)) CYCLE
 
-                        CALL prefetch_density_matrix(nsgfa(iset), nsgfb(jset), nsgfc(kset), nsgfd(lset), &
-                                                     full_density_alpha(:, 1), pbd_buf, pbc_buf, pad_buf, pac_buf, &
-                                                     iatom, jatom, katom, latom, &
-                                                     iset, jset, kset, lset, offset_bd_set, offset_bc_set, &
-                                                     offset_ad_set, offset_ac_set, atomic_offset_bd, atomic_offset_bc, &
-                                                     atomic_offset_ad, atomic_offset_ac, is_anti_symmetric)
-                        IF (with_resp_density) THEN
-                           CALL prefetch_density_matrix(nsgfa(iset), nsgfb(jset), nsgfc(kset), nsgfd(lset), &
-                                                        full_density_resp, pbd_buf_resp, pbc_buf_resp, pad_buf_resp, pac_buf_resp, &
-                                                        iatom, jatom, katom, latom, &
-                                                        iset, jset, kset, lset, offset_bd_set, offset_bc_set, &
-                                                        offset_ad_set, offset_ac_set, atomic_offset_bd, atomic_offset_bc, &
-                                                        atomic_offset_ad, atomic_offset_ac, is_anti_symmetric)
-                           CALL contract_derivative_density(nsgfa(iset), nsgfb(jset), nsgfc(kset), nsgfd(lset), &
-                                                            pbd_buf, pbc_buf, pad_buf, pac_buf, fac, &
-                                                            primitive_forces, primitive_forces_virial, &
-                                                            contract_forces, contract_virial, force_terms(:, 1), &
-                                                            virial_terms(:, :, 1), pbd_buf_resp, pbc_buf_resp, &
-                                                            pad_buf_resp, pac_buf_resp, my_resp_only)
-                        ELSE
-                           CALL contract_derivative_density(nsgfa(iset), nsgfb(jset), nsgfc(kset), nsgfd(lset), &
-                                                            pbd_buf, pbc_buf, pad_buf, pac_buf, fac, &
-                                                            primitive_forces, primitive_forces_virial, &
-                                                            contract_forces, contract_virial, force_terms(:, 1), &
-                                                            virial_terms(:, :, 1))
+                        IF (.NOT. use_virial) THEN
+                           CALL prefetch_quartet_density(density, &
+                                                         [nsgfa(iset), nsgfb(jset), nsgfc(kset), nsgfd(lset)], &
+                                                         [iatom, jatom, katom, latom], [iset, jset, kset, lset], &
+                                                         offset_bd_set, offset_bc_set, offset_ad_set, offset_ac_set, &
+                                                         [atomic_offset_bd, atomic_offset_bc, atomic_offset_ad, atomic_offset_ac], &
+                                                         full_density_alpha, full_density_beta, &
+                                                         full_density_resp, full_density_resp_beta, is_anti_symmetric)
                         END IF
-                        IF (my_nspins == 2) THEN
-                           CALL prefetch_density_matrix(nsgfa(iset), nsgfb(jset), nsgfc(kset), nsgfd(lset), &
-                                                        full_density_beta(:, 1), pbd_buf_beta, pbc_buf_beta, &
-                                                        pad_buf_beta, pac_buf_beta, iatom, jatom, katom, latom, &
-                                                        iset, jset, kset, lset, offset_bd_set, offset_bc_set, &
-                                                        offset_ad_set, offset_ac_set, atomic_offset_bd, atomic_offset_bc, &
-                                                        atomic_offset_ad, atomic_offset_ac, is_anti_symmetric)
+                        DO ispin = 1, my_nspins
                            IF (with_resp_density) THEN
-                              CALL prefetch_density_matrix(nsgfa(iset), nsgfb(jset), nsgfc(kset), nsgfd(lset), &
-                                                           full_density_resp_beta, pbd_buf_resp_beta, pbc_buf_resp_beta, &
-                                                           pad_buf_resp_beta, pac_buf_resp_beta, iatom, jatom, katom, latom, &
-                                                           iset, jset, kset, lset, offset_bd_set, offset_bc_set, &
-                                                           offset_ad_set, offset_ac_set, atomic_offset_bd, atomic_offset_bc, &
-                                                           atomic_offset_ad, atomic_offset_ac, is_anti_symmetric)
+                              i = ispin + my_nspins
                               CALL contract_derivative_density(nsgfa(iset), nsgfb(jset), nsgfc(kset), nsgfd(lset), &
-                                                               pbd_buf_beta, pbc_buf_beta, pad_buf_beta, pac_buf_beta, fac, &
+                                                               density%blocks(:, 1, ispin), density%blocks(:, 2, ispin), &
+                                                               density%blocks(:, 3, ispin), density%blocks(:, 4, ispin), fac, &
                                                                primitive_forces, primitive_forces_virial, contract_forces, &
-                                                               contract_virial, force_terms(:, 2), virial_terms(:, :, 2), &
-                                                               pbd_buf_resp_beta, pbc_buf_resp_beta, pad_buf_resp_beta, &
-                                                               pac_buf_resp_beta, my_resp_only)
+                                                               contract_virial, force_terms(:, ispin), virial_terms(:, :, ispin), &
+                                                               density%blocks(:, 1, i), density%blocks(:, 2, i), &
+                                                               density%blocks(:, 3, i), density%blocks(:, 4, i), my_resp_only)
                            ELSE
                               CALL contract_derivative_density(nsgfa(iset), nsgfb(jset), nsgfc(kset), nsgfd(lset), &
-                                                               pbd_buf_beta, pbc_buf_beta, pad_buf_beta, pac_buf_beta, fac, &
+                                                               density%blocks(:, 1, ispin), density%blocks(:, 2, ispin), &
+                                                               density%blocks(:, 3, ispin), density%blocks(:, 4, ispin), fac, &
                                                                primitive_forces, primitive_forces_virial, contract_forces, &
-                                                               contract_virial, force_terms(:, 2), virial_terms(:, :, 2))
+                                                               contract_virial, force_terms(:, ispin), virial_terms(:, :, ispin))
                            END IF
-                        END IF
+                        END DO
 
                         IF (contract_forces) THEN
                            DO coord = 1, 12
@@ -1608,17 +1577,7 @@ CONTAINS
       DEALLOCATE (primitive_forces)
       DEALLOCATE (atom_of_kind, kind_of)
       DEALLOCATE (max_contraction)
-      DEALLOCATE (pbd_buf)
-      DEALLOCATE (pbc_buf)
-      DEALLOCATE (pad_buf)
-      DEALLOCATE (pac_buf)
-
-      IF (with_resp_density) THEN
-         DEALLOCATE (pbd_buf_resp)
-         DEALLOCATE (pbc_buf_resp)
-         DEALLOCATE (pad_buf_resp)
-         DEALLOCATE (pac_buf_resp)
-      END IF
+      DEALLOCATE (density%blocks)
 
       DO i = 1, max_pgf**2
          DEALLOCATE (pgf_list_ij(i)%image_list)
@@ -1637,16 +1596,6 @@ CONTAINS
       DEALLOCATE (ede_work_virial, ede_work2_virial)
 
       DEALLOCATE (nimages)
-
-      IF (my_nspins == 2) THEN
-         DEALLOCATE (pbd_buf_beta, pbc_buf_beta, pad_buf_beta, pac_buf_beta)
-         IF (with_resp_density) THEN
-            DEALLOCATE (pbd_buf_resp_beta)
-            DEALLOCATE (pbc_buf_resp_beta)
-            DEALLOCATE (pad_buf_resp_beta)
-            DEALLOCATE (pac_buf_resp_beta)
-         END IF
-      END IF
 
 !$OMP END PARALLEL
 
@@ -1678,6 +1627,57 @@ CONTAINS
       get_1D_idx = min_ij*N + MAX(i, j) - (min_ij - 1)*min_ij/2 - N
 
    END FUNCTION get_1D_idx
+
+! **************************************************************************************************
+!> \brief Fetch the four exchange blocks for each spin and response density.
+!> \param density packed exchange density
+!> \param ns shell-set sizes
+!> \param atoms quartet atom indices
+!> \param sets quartet shell-set indices
+!> \param bd BD set offsets
+!> \param bc BC set offsets
+!> \param ad AD set offsets
+!> \param ac AC set offsets
+!> \param offset atomic block offsets
+!> \param alpha first-spin density
+!> \param beta second-spin density
+!> \param alpha_resp first-spin response density
+!> \param beta_resp second-spin response density
+!> \param antisymmetric transpose convention for the density
+! **************************************************************************************************
+   SUBROUTINE prefetch_quartet_density(density, ns, atoms, sets, bd, bc, ad, ac, offset, &
+                                       alpha, beta, alpha_resp, beta_resp, antisymmetric)
+      TYPE(eri4_density_type), INTENT(INOUT)             :: density
+      INTEGER, INTENT(IN)                                :: ns(4), atoms(4), sets(4), offset(4)
+      INTEGER, DIMENSION(:, :), POINTER                  :: bd, bc, ad, ac
+      REAL(dp), DIMENSION(:, :), POINTER                 :: alpha, beta
+      REAL(dp), DIMENSION(:), POINTER                    :: alpha_resp, beta_resp
+      LOGICAL, INTENT(IN)                                :: antisymmetric
+
+      INTEGER                                            :: ch
+      REAL(dp), DIMENSION(:), POINTER                    :: source
+
+      DO ch = 1, SIZE(density%blocks, 3)
+         IF (ch <= density%nspins) THEN
+            IF (ch == 1) THEN
+               source => alpha(:, 1)
+            ELSE
+               source => beta(:, 1)
+            END IF
+         ELSE
+            IF (ch - density%nspins == 1) THEN
+               source => alpha_resp
+            ELSE
+               source => beta_resp
+            END IF
+         END IF
+         CALL prefetch_density_matrix(ns(1), ns(2), ns(3), ns(4), source, &
+                                      density%blocks(:, 1, ch), density%blocks(:, 2, ch), &
+                                      density%blocks(:, 3, ch), density%blocks(:, 4, ch), &
+                                      atoms(1), atoms(2), atoms(3), atoms(4), sets(1), sets(2), sets(3), sets(4), &
+                                      bd, bc, ad, ac, offset(1), offset(2), offset(3), offset(4), antisymmetric)
+      END DO
+   END SUBROUTINE prefetch_quartet_density
 
 ! **************************************************************************************************
 !> \brief This routine prefetches density matrix elements, i.e. reshuffles the

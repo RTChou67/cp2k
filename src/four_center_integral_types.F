@@ -15,7 +15,7 @@ MODULE four_center_integral_types
    PRIVATE
 
    PUBLIC :: eri4_cell_type, eri4_contraction_type, eri4_screen_coeff_type, eri4_pgf_image_type, &
-             eri4_pgf_pair_type, eri4_image_group_type
+             eri4_pgf_pair_type, eri4_image_group_type, eri4_density_type
 
 ! **************************************************************************************************
 !> \brief Contraction data for one angular momentum in a basis set.
@@ -23,6 +23,14 @@ MODULE four_center_integral_types
       REAL(dp), ALLOCATABLE :: angular(:, :) ! Cartesian by spherical component
       REAL(dp), ALLOCATABLE :: weights(:, :) ! contraction by primitive
    END TYPE eri4_contraction_type
+
+! **************************************************************************************************
+!> \brief AO exchange density blocks BD, BC, AD and AC, with response channels after the spin channels.
+   TYPE eri4_density_type
+      REAL(dp), ALLOCATABLE :: blocks(:, :, :)
+      INTEGER :: nspins = 0
+      LOGICAL :: response_only = .FALSE.
+   END TYPE eri4_density_type
 
 ! **************************************************************************************************
    TYPE eri4_cell_type
