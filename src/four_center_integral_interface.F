@@ -299,8 +299,9 @@ CONTAINS
 !> \param use_virial whether to include cell derivatives
 !> \param density transformed primitive density and screening budget
 !> \param virial density-weighted cell derivative
+!> \param all_s independent all-s force and strain derivatives
 ! **************************************************************************************************
-   SUBROUTINE prepare_hermite_batch(context, lower, upper, symmetric_strain, cell, use_virial, density, virial)
+   SUBROUTINE prepare_hermite_batch(context, lower, upper, symmetric_strain, cell, use_virial, density, virial, all_s)
       TYPE(four_center_integral_context_type), &
          INTENT(INOUT)                                   :: context
       INTEGER, INTENT(IN)                                :: lower(4), upper(4)
@@ -309,12 +310,12 @@ CONTAINS
       LOGICAL, INTENT(IN)                                :: use_virial
       TYPE(eri4_hermite_density_type), INTENT(INOUT)     :: density
       REAL(dp), INTENT(INOUT)                            :: virial(3, 3)
+      REAL(dp), INTENT(OUT)                              :: all_s(15)
 
-      IF (.NOT. ALLOCATED(context%hermite)) ALLOCATE (context%hermite)
       CALL prepare_hermite_derivatives(context%hermite, context%products(:context%nproducts), context%image_groups, &
                                        context%nimage_groups, lower, upper, symmetric_strain, cell, &
-                                       use_virial, density, virial)
-      context%hermite_ready = .TRUE.
+                                       use_virial, density, virial, all_s)
+      context%hermite_ready = .NOT. symmetric_strain
    END SUBROUTINE prepare_hermite_batch
 
 ! **************************************************************************************************
@@ -454,16 +455,13 @@ CONTAINS
       INTEGER                                            :: angular_momenta(4), group_index, i, j, &
                                                             k, m, mysize, next_group, &
                                                             permutation(4)
-      LOGICAL                                            :: symmetric_strain
       REAL(dp)                                           :: force_max, origin(3), relative(3, 3), &
                                                             stress_max
 
       mysize = ncoa*ncob*ncoc*ncod
-      symmetric_strain = .FALSE.
 
       IF (context%hermite_ready) THEN
-         CALL extract_hermite_derivatives(context%hermite, [n_a, n_b, n_c, n_d], cell, use_virial, &
-                                          work2, work2_virial, force_max, stress_max, symmetric_strain)
+         CALL extract_hermite_derivatives(context%hermite, [n_a, n_b, n_c, n_d], work2, force_max)
       ELSE
          work = 0.0_dp
 
@@ -550,7 +548,7 @@ CONTAINS
             CALL reorder_eri_block(work_virial, work2_virial, [ncoa, ncob, ncoc, ncod], permutation, 3, 3)
          END IF
          DO i = 1, 3
-            DO m = 1, MERGE(i, 3, symmetric_strain)
+            DO m = 1, 3
                CALL contract(ncoa, ncob, ncoc, ncod, nsoa, nsob, nsoc, nsod, &
                              n_a, n_b, n_c, n_d, nl_a, nl_b, nl_c, nl_d, work2_virial(1, i, m), &
                              angular_a, angular_b, angular_c, angular_d, &

@@ -26,7 +26,7 @@ MODULE four_center_integral_derivatives
    PRIVATE
 
    PUBLIC :: prepare_hermite_derivatives, extract_hermite_derivatives, expand_symmetric_virial, &
-             prepare_hermite_density, select_hermite_density
+             prepare_hermite_density, select_hermite_density, ssss_density_weight
 
    ! Polynomial degrees for a first derivative of (dd|dd) and its coordinate moment.
    INTEGER, PARAMETER :: max_order = 9, max_monomials = 286, max_hermites = 220, max_pair_hermites = 56
@@ -61,9 +61,6 @@ MODULE four_center_integral_derivatives
       PRIVATE
       TYPE(eri4_hermite_workspace_type), ALLOCATABLE :: workspace
       REAL(dp), ALLOCATABLE :: cartesian(:, :)
-      ! A, C, and D gradients followed by the lower triangle of the strain derivative.
-      REAL(dp) :: all_s(15) = 0.0_dp
-      LOGICAL :: symmetric_strain = .FALSE.
    END TYPE eri4_hermite_batch_type
 
 !> \brief Density for a shell quartet, transformed once and reused across primitive quartets.
@@ -71,12 +68,17 @@ MODULE four_center_integral_derivatives
       REAL(dp), ALLOCATABLE :: values(:, :, :), norms(:, :, :)
    END TYPE eri4_hermite_density_block
 
+   TYPE :: eri4_density_basis_type
+      REAL(dp), ALLOCATABLE :: values(:, :)
+      REAL(dp), CONTIGUOUS, POINTER :: radial(:, :) => NULL()
+   END TYPE eri4_density_basis_type
+
    TYPE, PUBLIC :: eri4_hermite_density_type
       PRIVATE
       TYPE(eri4_hermite_density_block) :: pair(4)
       INTEGER :: nterms = 0, lhs(6) = 0, rhs(6) = 0, offset(4) = 0
       REAL(dp) :: factor = 0.0_dp, norm = 0.0_dp, remaining = 0.0_dp
-      REAL(dp), ALLOCATABLE :: weight(:)
+      REAL(dp), ALLOCATABLE :: weight(:), ssss(:, :, :, :)
       LOGICAL :: weights_ready = .FALSE.
    END TYPE eri4_hermite_density_type
 
@@ -95,10 +97,12 @@ CONTAINS
 !> \param use_virial whether to include cell derivatives
 !> \param density primitive exchange density and screening budget
 !> \param virial density-weighted cell derivative accumulated by Hermite
+!> \param all_s independent all-s force and strain derivatives
 ! **************************************************************************************************
    SUBROUTINE prepare_hermite_derivatives(batch, records, groups, ngroups, lower, upper, symmetric_strain, &
-                                          cell, use_virial, density, virial)
-      TYPE(eri4_hermite_batch_type), INTENT(INOUT)       :: batch
+                                          cell, use_virial, density, virial, all_s)
+      TYPE(eri4_hermite_batch_type), ALLOCATABLE, &
+         INTENT(INOUT)                                   :: batch
       TYPE(eri_primitive_data_type), INTENT(IN)          :: records(:)
       TYPE(eri4_image_group_type), ALLOCATABLE, &
          INTENT(IN)                                      :: groups(:)
@@ -108,14 +112,15 @@ CONTAINS
       LOGICAL, INTENT(IN)                                :: use_virial
       TYPE(eri4_hermite_density_type), INTENT(INOUT)     :: density
       REAL(dp), INTENT(INOUT)                            :: virial(3, 3)
+      REAL(dp), INTENT(OUT)                              :: all_s(15)
 
       INTEGER                                            :: group, i, j, ncart
       REAL(dp)                                           :: abcd(3, 2)
 
-      batch%symmetric_strain = symmetric_strain
       IF (symmetric_strain) THEN
-         batch%all_s = 0.0_dp
+         all_s = 0.0_dp
       ELSE
+         IF (.NOT. ALLOCATED(batch)) ALLOCATE (batch)
          ncart = PRODUCT(ncoset(upper) - ncoset(lower - 1))
          IF (ALLOCATED(batch%cartesian)) THEN
             IF (SIZE(batch%cartesian, 1) < ncart) DEALLOCATE (batch%cartesian)
@@ -142,7 +147,7 @@ CONTAINS
             abcd(:, 2) = records(i)%centers(:, 3) - records(i)%centers(:, 4)
          END IF
          IF (symmetric_strain) THEN
-            CALL add_ssss_derivatives(records(i:j), abcd, use_virial, batch%all_s)
+            CALL add_ssss_derivatives(records(i:j), abcd, use_virial, all_s)
          ELSE
             CALL add_hermite_derivatives(batch%workspace, records(i:j), abcd, cell, batch%cartesian, &
                                          ncart, density, virial)
@@ -656,55 +661,18 @@ CONTAINS
 !> \brief Extract one angular block and its screening maxima from the group sums.
 !> \param batch the accumulated derivative blocks
 !> \param l angular momenta in original center order
-!> \param cell simulation cell
-!> \param virial whether virial components are present
 !> \param forces force block for the angular quartet
-!> \param stress virial block for the angular quartet
 !> \param force_max force maximum for Cartesian screening
-!> \param stress_max virial maximum for Cartesian screening
-!> \param symmetric_strain whether stress holds the lower triangle of strain derivatives
 ! **************************************************************************************************
-   SUBROUTINE extract_hermite_derivatives(batch, l, cell, virial, forces, stress, force_max, stress_max, symmetric_strain)
+   SUBROUTINE extract_hermite_derivatives(batch, l, forces, force_max)
       TYPE(eri4_hermite_batch_type), INTENT(IN)          :: batch
       INTEGER, INTENT(IN)                                :: l(4)
-      TYPE(cell_type), POINTER                           :: cell
-      LOGICAL, INTENT(IN)                                :: virial
-      REAL(dp), INTENT(OUT)                              :: forces(:, :), stress(:, :, :), &
-                                                            force_max, stress_max
-      LOGICAL, INTENT(OUT)                               :: symmetric_strain
+      REAL(dp), INTENT(OUT)                              :: forces(:, :), force_max
 
       INTEGER                                            :: i, k, ncart, start
-      REAL(dp)                                           :: cell_derivative(3, 3), cell_scale(3), &
-                                                            strain(6), value
+      REAL(dp)                                           :: value
 
-      symmetric_strain = batch%symmetric_strain
-      stress_max = 0.0_dp
-      IF (symmetric_strain) THEN
-         forces(1, 1:3) = batch%all_s(1:3)
-         forces(1, 7:12) = batch%all_s(4:9)
-         forces(1, 4:6) = -(forces(1, 1:3) + forces(1, 7:9) + forces(1, 10:12))
-         force_max = MAXVAL(ABS(forces(1, :)))
-         IF (virial) THEN
-            strain = batch%all_s(10:15)
-            stress(1, :, 1) = strain(1:3)
-            stress(1, 2:3, 2) = strain(4:5)
-            stress(1, 3, 3) = strain(6)
-            ! Screen the full cell derivative and contract only the strain lower triangle.
-            IF (cell%orthorhombic) THEN
-               cell_scale = ABS([cell%h_inv(1, 1), cell%h_inv(2, 2), cell%h_inv(3, 3)])
-               stress_max = MAXVAL(ABS(strain)*[cell_scale(1), MAX(cell_scale(1), cell_scale(2)), &
-                                                MAX(cell_scale(1), cell_scale(3)), cell_scale(2), &
-                                                MAX(cell_scale(2), cell_scale(3)), cell_scale(3)])
-            ELSE
-               cell_derivative(:, 1) = strain(1:3)
-               cell_derivative(2:3, 2) = strain(4:5)
-               cell_derivative(3, 3) = strain(6)
-               CALL expand_symmetric_virial(1, cell_derivative, cell)
-               stress_max = MAXVAL(ABS(cell_derivative))
-            END IF
-         END IF
-         RETURN
-      ELSE IF (ALL(l == 0)) THEN
+      IF (ALL(l == 0)) THEN
          forces(1, :) = batch%cartesian(1, :12)
          force_max = MAXVAL(ABS(forces))
          RETURN
@@ -742,25 +710,35 @@ CONTAINS
       TYPE(eri4_density_type), INTENT(IN)                :: ao
       REAL(dp), INTENT(IN)                               :: factor
       INTEGER, INTENT(IN)                                :: lower(4), upper(4), np(4), ns(4)
-      TYPE(eri4_contraction_type), INTENT(IN)            :: ca(0:), cb(0:), cc(0:), cd(0:)
+      TYPE(eri4_contraction_type), INTENT(IN), TARGET    :: ca(0:), cb(0:), cc(0:), cd(0:)
 
-      TYPE :: basis_matrix
-         REAL(dp), ALLOCATABLE :: values(:, :)
-      END TYPE basis_matrix
+      INTEGER, PARAMETER                                 :: left(4) = [2, 2, 1, 1], &
+                                                            right(4) = [4, 3, 4, 3]
 
-      INTEGER, PARAMETER :: left(4) = [2, 2, 1, 1], right(4) = [4, 3, 4, 3]
-      INTEGER :: nc(4), a, b, block, ip, jp, spin, t, ndens, nr, ncol
-      TYPE(basis_matrix)                                 :: basis(4)
+      INTEGER                                            :: a, b, block, ip, jp, nc(4), ncol, ndens, &
+                                                            nr, spin, t
+      LOGICAL                                            :: all_s
+      TYPE(eri4_density_basis_type)                      :: basis(4)
 
+      all_s = ALL(upper == 0)
       nc = ncoset(upper) - ncoset(lower - 1)
-      ALLOCATE (basis(1)%values(nc(1)*np(1), ns(1)), basis(2)%values(nc(2)*np(2), ns(2)), &
-                basis(3)%values(nc(3)*np(3), ns(3)), basis(4)%values(nc(4)*np(4), ns(4)))
-      CALL pack_hermite_basis(lower(1), upper(1), np(1), ca, basis(1)%values)
-      CALL pack_hermite_basis(lower(2), upper(2), np(2), cb, basis(2)%values)
-      CALL pack_hermite_basis(lower(3), upper(3), np(3), cc, basis(3)%values)
-      CALL pack_hermite_basis(lower(4), upper(4), np(4), cd, basis(4)%values)
-
       ndens = SIZE(ao%blocks, 3)
+      IF (all_s) THEN
+         ! The angular transform of a normalized s orbital is the identity.
+         basis(1)%radial => ca(0)%weights
+         basis(2)%radial => cb(0)%weights
+         basis(3)%radial => cc(0)%weights
+         basis(4)%radial => cd(0)%weights
+         ALLOCATE (density%ssss(MAXVAL(np), MAXVAL(np), 4, ndens))
+      ELSE
+         ALLOCATE (basis(1)%values(nc(1)*np(1), ns(1)), basis(2)%values(nc(2)*np(2), ns(2)), &
+                   basis(3)%values(nc(3)*np(3), ns(3)), basis(4)%values(nc(4)*np(4), ns(4)))
+         CALL pack_hermite_basis(lower(1), upper(1), np(1), ca, basis(1)%values)
+         CALL pack_hermite_basis(lower(2), upper(2), np(2), cb, basis(2)%values)
+         CALL pack_hermite_basis(lower(3), upper(3), np(3), cc, basis(3)%values)
+         CALL pack_hermite_basis(lower(4), upper(4), np(4), cd, basis(4)%values)
+      END IF
+
       density%factor = factor
       DO spin = 1, ao%nspins
          t = density%nterms
@@ -780,6 +758,13 @@ CONTAINS
       DO block = 1, 4
          a = left(block)
          b = right(block)
+         IF (all_s) THEN
+            DO t = 1, ndens
+               CALL backtransform_ssss_density(ns(a), ns(b), np(a), np(b), basis(a)%radial, basis(b)%radial, &
+                                               ao%blocks(:, block, t), density%ssss(:, :, block, t))
+            END DO
+            CYCLE
+         END IF
          nr = nc(a)*np(a)
          ncol = nc(b)*np(b)
          ASSOCIATE (pair => density%pair(block))
@@ -797,7 +782,7 @@ CONTAINS
             END DO
          END ASSOCIATE
       END DO
-      ALLOCATE (density%weight(PRODUCT(nc)))
+      IF (.NOT. all_s) ALLOCATE (density%weight(PRODUCT(nc)))
    END SUBROUTINE prepare_hermite_density
 
 ! **************************************************************************************************
@@ -900,5 +885,64 @@ CONTAINS
       END ASSOCIATE
       density%weights_ready = .TRUE.
    END SUBROUTINE form_hermite_weights
+
+! **************************************************************************************************
+!> \brief Backtransform a two-center s-shell density block using radial coefficients.
+!> \param na left AO count
+!> \param nb right AO count
+!> \param np left primitive count
+!> \param nq right primitive count
+!> \param wa left radial coefficients
+!> \param wb right radial coefficients
+!> \param ao AO density block
+!> \param primitive resulting primitive density block
+! **************************************************************************************************
+   SUBROUTINE backtransform_ssss_density(na, nb, np, nq, wa, wb, ao, primitive)
+      INTEGER, INTENT(IN)                                :: na, nb, np, nq
+      REAL(dp), INTENT(IN)                               :: wa(na, np), wb(nb, nq), ao(na, nb)
+      REAL(dp), INTENT(OUT)                              :: primitive(:, :)
+
+      INTEGER                                            :: a, b, i, j
+      REAL(dp)                                           :: intermediate(np, nb)
+
+      DO b = 1, nb
+         DO i = 1, np
+            intermediate(i, b) = DOT_PRODUCT(wa(:, i), ao(:, b))
+         END DO
+      END DO
+      DO j = 1, nq
+         primitive(:np, j) = intermediate(:, 1)*wb(1, j)
+         DO a = 2, nb
+            primitive(:np, j) = primitive(:np, j) + intermediate(:, a)*wb(a, j)
+         END DO
+      END DO
+   END SUBROUTINE backtransform_ssss_density
+
+! **************************************************************************************************
+!> \brief Exchange weight of a single all-s primitive quartet.
+!> \param density backtransformed shell-set density
+!> \param a primitive index at center A
+!> \param b primitive index at center B
+!> \param c primitive index at center C
+!> \param d primitive index at center D
+!> \return exchange weight including the exchange coefficient
+! **************************************************************************************************
+   PURE FUNCTION ssss_density_weight(density, a, b, c, d) RESULT(weight)
+      TYPE(eri4_hermite_density_type), INTENT(IN)        :: density
+      INTEGER, INTENT(IN)                                :: a, b, c, d
+      REAL(dp)                                           :: weight
+
+      INTEGER                                            :: r, s, t
+
+      weight = 0.0_dp
+      ASSOCIATE (p => density%ssss)
+         DO t = 1, density%nterms
+            r = density%lhs(t)
+            s = density%rhs(t)
+            weight = weight + p(a, c, 4, r)*p(b, d, 1, s) + p(a, d, 3, r)*p(b, c, 2, s)
+         END DO
+      END ASSOCIATE
+      weight = weight*density%factor
+   END FUNCTION ssss_density_weight
 
 END MODULE four_center_integral_derivatives

@@ -53,7 +53,8 @@ MODULE hfx_derivatives
       hfx_load_balance_type, hfx_memory_type, hfx_p_kind, hfx_pgf_list, &
       hfx_potential_type, hfx_screen_coeff_type, hfx_screening_type, hfx_task_list_type, &
       hfx_type, log_zero, pair_list_type, pair_set_list_type
-   USE input_constants, ONLY: do_potential_mix_cl_trunc, &
+   USE input_constants, ONLY: do_potential_id, &
+                              do_potential_mix_cl_trunc, &
                               do_potential_truncated, &
                               hfx_do_eval_forces
    USE input_section_types, ONLY: section_vals_type
@@ -126,7 +127,7 @@ CONTAINS
       CHARACTER(LEN=*), PARAMETER :: routineN = 'derivatives_four_center'
 
       INTEGER :: atomic_offset_ac, atomic_offset_ad, atomic_offset_bc, atomic_offset_bd, bin, &
-                 bits_max_val, buffer_left, buffer_size, buffer_start, cache_size, center, coord, current_counter, direction, &
+                 bits_max_val, buffer_left, buffer_size, buffer_start, cache_size, current_counter, &
                  forces_map(4, 2), handle, handle_bin, handle_getP, handle_load, handle_main, i, i_atom, &
                  i_list_ij, i_list_kl, i_set_list_ij, i_set_list_ij_start, i_set_list_ij_stop, &
                  i_set_list_kl, i_set_list_kl_start, i_set_list_kl_stop, i_thread, iatom, iatom_block, &
@@ -154,12 +155,12 @@ CONTAINS
       INTEGER, DIMENSION(:, :, :, :), POINTER            :: shm_set_offset
       INTEGER, SAVE                                      :: shm_number_of_p_entries
       LOGICAL :: bins_left, buffer_overflow, cached_forces, contract_forces, contract_virial, &
-                 do_dynamic_load_balancing, do_it, do_periodic, &
+                 direct_force, do_dynamic_load_balancing, do_it, do_periodic, &
                  do_print_load_balance_info, is_anti_symmetric, my_resp_only, screen_pmat_forces, &
                  treat_forces_in_core, use_disk_storage, with_resp_density
       LOGICAL, DIMENSION(:, :), POINTER                  :: shm_atomic_pair_list
       REAL(dp) :: bintime_start, bintime_stop, cartesian_estimate, cartesian_estimate_virial, &
-                  compression_factor, eps_schwarz, eps_storage, fac, force_terms(12, 2), hermite_virial(3, 3), &
+                  compression_factor, eps_schwarz, eps_storage, fac, force_terms(12, 2), density_virial(3, 3), &
                   hf_fraction, ln_10, log10_eps_schwarz, &
                   log10_pmax, log_2, max_contraction_val, max_val1, max_val2, max_val2_set, &
                   my_adiabatic_rescale_factor, pmax_atom, pmax_blocks, pmax_entry, pmax_tmp, ra(3), rab2, &
@@ -323,11 +324,11 @@ CONTAINS
 !$OMP  PRIVATE(actual_x_data,atomic_kind_set,atomic_offset_ac,atomic_offset_ad,atomic_offset_bc,&
 !$OMP  atomic_offset_bd,atom_of_kind,basis_info,&
 !$OMP  basis_parameter,bin,bins_left,bintime_start,bintime_stop,bits_max_val,buffer_left,buffer_overflow,cached_forces,buffer_size,&
-!$OMP  buffer_start,cache_size,cartesian_estimate,cartesian_estimate_virial,center,contract_forces,contract_virial,density,&
-!$OMP  coeffs_kind_max0,compression_factor,counter,current_counter,&
-!$OMP  direction,distribution_forces,do_dynamic_load_balancing,do_it,do_periodic,ede_buffer1,ede_buffer2,&
+!$OMP  buffer_start,cache_size,cartesian_estimate,cartesian_estimate_virial,contract_forces,contract_virial,density,&
+!$OMP  coeffs_kind_max0,compression_factor,counter,current_counter,direct_force,&
+!$OMP  distribution_forces,do_dynamic_load_balancing,do_it,do_periodic,ede_buffer1,ede_buffer2,&
 !$OMP  ede_work,ede_work2,ede_work2_virial,ede_work_forces,ede_work_virial,eps_schwarz,eps_storage,estimate_to_store_int,&
-!$OMP  fac,first_sgfb,force_terms,hermite_virial,forces_map,general_parameter,handle_bin,handle_getp,handle_load,&
+!$OMP  fac,first_sgfb,force_terms,density_virial,forces_map,general_parameter,handle_bin,handle_getp,handle_load,&
 !$OMP  handle_main,hf_fraction,i_atom,iatom_end,iatom_start,ikind,integral_caches,integral_containers,&
 !$OMP  i_set_list_ij_start,i_set_list_ij_stop,i_set_list_kl_start,i_set_list_kl_stop,i_thread,ispin,iw,j_atom,jatom_end,&
 !$OMP  jatom_start,jkind,katom,k_atom,katom_block,katom_end,katom_start,kind_kind_idx,&
@@ -1171,7 +1172,13 @@ CONTAINS
                         cached_forces = .NOT. buffer_overflow .AND. .NOT. actual_x_data%memory_parameter%recalc_forces
                         spherical_estimate_virial = 0.0_dp
                         cartesian_estimate_virial = 0.0_dp
-                        IF (use_virial) THEN
+                        ! The AO force estimate is rounded up to at least 2**(-15).
+                        ! Direct contraction is valid when that floor guarantees the AO screen passes.
+                        direct_force = .NOT. treat_forces_in_core .AND. &
+                                       SCALE(pmax_entry, -15) >= eps_schwarz .AND. &
+                                       la_max(iset) + lb_max(jset) + lc_max(kset) + ld_max(lset) == 0 .AND. &
+                                       potential_parameter%potential_type /= do_potential_id
+                        IF (use_virial .OR. direct_force) THEN
                            CALL prefetch_quartet_density(density, &
                                                          [nsgfa(iset), nsgfb(jset), nsgfc(kset), nsgfd(lset)], &
                                                          [iatom, jatom, katom, latom], [iset, jset, kset, lset], &
@@ -1214,12 +1221,16 @@ CONTAINS
                                         ede_buffer1, ede_buffer2, &
                                         nimages, do_periodic, use_virial, ede_work_virial, ede_work2_virial, &
                                         primitive_forces_virial, &
-                                        cartesian_estimate_virial, density, fac, hermite_virial)
-                           IF (use_virial) tmp_virial = tmp_virial - hermite_virial
+                                        cartesian_estimate_virial, density, fac, density_virial, direct_force, force_terms(:, 1))
+                           IF (use_virial) tmp_virial = tmp_virial - density_virial
 
                            nints = nsgfa(iset)*nsgfb(jset)*nsgfc(kset)*nsgfd(lset)*12
                            neris_total = neris_total + nints
                            nprim_ints = nprim_ints + neris_tmp
+                           IF (direct_force) THEN
+                              CALL add_four_center_forces(force, forces_map, force_terms(:, :1))
+                              CYCLE
+                           END IF
 !                           IF (cartesian_estimate == 0.0_dp) cartesian_estimate = TINY(cartesian_estimate)
 !                           estimate_to_store_int = EXPONENT(cartesian_estimate)
 !                           estimate_to_store_int = MAX(estimate_to_store_int, -15_int_8)
@@ -1366,18 +1377,7 @@ CONTAINS
                            END IF
                         END DO
 
-                        IF (contract_forces) THEN
-                           DO coord = 1, 12
-                              center = (coord - 1)/3 + 1
-                              direction = MOD(coord - 1, 3) + 1
-                              DO ispin = 1, my_nspins
-!$OMP ATOMIC
-                                 force(forces_map(center, 1))%fock_4c(direction, forces_map(center, 2)) = &
-                                    force(forces_map(center, 1))%fock_4c(direction, forces_map(center, 2)) - &
-                                    force_terms(coord, ispin)
-                              END DO
-                           END DO
-                        END IF
+                        IF (contract_forces) CALL add_four_center_forces(force, forces_map, force_terms(:, :my_nspins))
                         IF (contract_virial) THEN
                            DO ispin = 1, my_nspins
                               tmp_virial = tmp_virial - virial_terms(:, :, ispin)
@@ -1627,6 +1627,30 @@ CONTAINS
       get_1D_idx = min_ij*N + MAX(i, j) - (min_ij - 1)*min_ij/2 - N
 
    END FUNCTION get_1D_idx
+
+! **************************************************************************************************
+!> \brief Accumulate the exchange force on the quartet centers.
+!> \param force force array shared by the threads
+!> \param map kind and atom index for each center
+!> \param terms force contributions for the centers and density channels
+! **************************************************************************************************
+   SUBROUTINE add_four_center_forces(force, map, terms)
+      TYPE(qs_force_type), INTENT(INOUT)                 :: force(:)
+      INTEGER, INTENT(IN)                                :: map(4, 2)
+      REAL(dp), INTENT(IN)                               :: terms(:, :)
+
+      INTEGER                                            :: center, coord, direction, spin
+
+      DO coord = 1, 12
+         center = (coord - 1)/3 + 1
+         direction = MOD(coord - 1, 3) + 1
+         DO spin = 1, SIZE(terms, 2)
+!$OMP ATOMIC
+            force(map(center, 1))%fock_4c(direction, map(center, 2)) = &
+               force(map(center, 1))%fock_4c(direction, map(center, 2)) - terms(coord, spin)
+         END DO
+      END DO
+   END SUBROUTINE add_four_center_forces
 
 ! **************************************************************************************************
 !> \brief Fetch the four exchange blocks for each spin and response density.
