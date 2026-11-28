@@ -540,7 +540,7 @@ CONTAINS
 
             CALL prepare_four_center_derivative_batch(context, pgf_list_ij(list_ij), pgf_list_kl(list_kl), nproducts, &
                                                       log10_pmax, log10_eps_schwarz, neighbor_cells, cell, &
-                                                      potential_parameter, upper, do_periodic, use_virial, &
+                                                      potential_parameter, lower, upper, do_periodic, use_virial, &
                                                       symmetric_strain, hermite)
             reconstruct_b = reconstruct_b .OR. symmetric_strain
             IF (nproducts == 0) CYCLE

@@ -38,7 +38,7 @@ MODULE four_center_integral_derivatives
    TYPE :: eri4_hermite_workspace_type
       PRIVATE
       INTEGER :: lower(4) = -1, upper(4) = -1, order = 0, nherm = 0, nshift = 0, nradial = 0
-      LOGICAL :: virial = .FALSE.
+      LOGICAL :: virial = .FALSE., image_moments = .FALSE.
       INTEGER :: powers(3, max_monomials) = 0
       INTEGER :: parent(max_monomials) = 0, axis(max_monomials) = 0
       INTEGER :: monomial_start(0:max_order) = 0, radial_offset(0:max_order + 1) = 0
@@ -129,7 +129,8 @@ CONTAINS
          IF (.NOT. ALLOCATED(batch%cartesian)) ALLOCATE (batch%cartesian(ncart, 12))
          batch%cartesian(:ncart, :) = 0.0_dp
          IF (.NOT. ALLOCATED(batch%workspace)) ALLOCATE (batch%workspace)
-         CALL prepare_hermite_workspace(batch%workspace, lower, upper, use_virial)
+         CALL prepare_hermite_workspace(batch%workspace, lower, upper, use_virial, &
+                                        use_virial .AND. ngroups > 0)
       END IF
 
       i = 1
@@ -269,12 +270,13 @@ CONTAINS
 !> \param work context-owned workspace reused between primitive quartets
 !> \param lower minimum angular momentum per center
 !> \param upper maximum angular momentum per center
-!> \param virial whether to include the shifted radial moments
+!> \param virial whether to compute the virial
+!> \param image_moments whether any displacement group contains multiple images
 ! **************************************************************************************************
-   SUBROUTINE prepare_hermite_workspace(work, lower, upper, virial)
+   SUBROUTINE prepare_hermite_workspace(work, lower, upper, virial, image_moments)
       TYPE(eri4_hermite_workspace_type), INTENT(INOUT)   :: work
       INTEGER, INTENT(IN)                                :: lower(4), upper(4)
-      LOGICAL, INTENT(IN)                                :: virial
+      LOGICAL, INTENT(IN)                                :: virial, image_moments
 
       INTEGER :: a, aa, axis, b, bb, c, cc, d, dc, degree, dims(4), dst, h, i, j, k, l, &
          lookup(0:max_order + 1, 0:max_order + 1, 0:max_order + 1), m, max_degree, min_degree, nh, &
@@ -283,16 +285,20 @@ CONTAINS
       REAL(dp) :: coefficient(0:max_order + 1, 0:(max_order + 1)/2)
 
       IF (ALL(lower == work%lower) .AND. ALL(upper == work%upper)) THEN
-         IF (virial .EQV. work%virial) RETURN
+         IF (virial .EQV. work%virial) THEN
+            ! A workspace with image moments also covers single-image groups.
+            IF (work%image_moments .OR. .NOT. image_moments) RETURN
+         END IF
       END IF
       work%lower = lower
       work%upper = upper
       work%virial = virial
+      work%image_moments = image_moments
       work%order = SUM(upper) + 1
       ! Degrees of the ordinary radial derivatives and the shifted auxiliaries.
       l = work%order
       work%nherm = (l + 1)*(l + 2)*(l + 3)/6
-      nh = l + MERGE(1, 0, virial)
+      nh = l + MERGE(1, 0, image_moments)
       work%nshift = (nh + 1)*(nh + 2)*(nh + 3)/6
 
       i = 0
@@ -321,7 +327,7 @@ CONTAINS
       ! Each Cartesian derivative of a radial seed is a sum of monomials times radial orders.
       ! Store only the distinct (order, monomial) pairs accumulated inside the image loop.
       nterms = 0
-      DO k = 0, MERGE(1, 0, virial)
+      DO k = 0, MERGE(1, 0, image_moments)
          nt = MERGE(work%nshift, work%nherm, k == 1)
          DO i = k + 1, nt
             h = i + k*work%nherm
@@ -348,7 +354,7 @@ CONTAINS
          ! At radial order m, trace terms give all degrees from MAX(0, 2*m - order) to m.
          ! The shifted virial auxiliary also needs degree m + 1. Degrees are stored consecutively.
          min_degree = MAX(0, 2*m - work%order)
-         max_degree = m + MERGE(1, 0, virial)
+         max_degree = m + MERGE(1, 0, image_moments)
          work%monomial_start(m) = 1 + min_degree*(min_degree + 1)*(min_degree + 2)/6
          work%radial_offset(m) = nslot + 1
          nslot = nslot + (max_degree + 1)*(max_degree + 2)*(max_degree + 3)/6 - work%monomial_start(m) + 1
@@ -361,7 +367,7 @@ CONTAINS
          work%term_index(i) = work%radial_offset(m) + MOD(j, max_monomials) + 1 - work%monomial_start(m)
       END DO
 
-      IF (virial) THEN
+      IF (image_moments) THEN
          DO j = 1, work%nherm
             DO axis = 1, 3
                t = work%powers(:, j)
@@ -375,14 +381,14 @@ CONTAINS
 
       a = SUM(upper(1:2)) + 1
       b = SUM(upper(3:4)) + 1
-      IF (virial) work%moment_count(:work%nherm) = 0
+      IF (image_moments) work%moment_count(:work%nherm) = 0
       DO j = 1, (b + 1)*(b + 2)*(b + 3)/6
          work%ket_sign(j) = REAL((-1)**SUM(work%powers(:, j)), dp)
          DO i = 1, (a + 1)*(a + 2)*(a + 3)/6
             t = work%powers(:, i) + work%powers(:, j)
             IF (SUM(t) > work%order) CYCLE
             work%pair_index(i, j) = lookup(t(1), t(2), t(3))
-            IF (virial .AND. i <= a*(a + 1)*(a + 2)/6) THEN
+            IF (image_moments .AND. i <= a*(a + 1)*(a + 2)/6) THEN
                dst = work%pair_index(i, j)
                work%moment_count(dst) = work%moment_count(dst) + 1
             END IF
@@ -512,10 +518,14 @@ CONTAINS
 
       INTEGER                                            :: a, b, dha, dhb, dims(4), first, ha, hb, &
                                                             i, j, k, last, m, na, nb, offset, p, t
-      REAL(dp) :: bound, bra_norm, delta(3), f, f_a, f_d, f_norm(3, 2), ket_norm, moment_norm(3), &
-         moments(3, max_hermites), mono(max_monomials), projected(max_hermites), &
-         radial(max_radial_moments), ref_norm(3, 3), reference(3), relative(3, 2), &
-         rho_power(0:max_order), shifted(max_monomials), zero(max_hermites)
+      LOGICAL                                            :: singleton
+      REAL(dp) :: bound, bra_norm, c_minus_b(3), delta(3), f, f_a, f_d, f_ket, f_norm(3, 2), &
+         image_virial(3, 3), ket_norm, moment_norm(3), moments(3, max_hermites), &
+         mono(max_monomials), projected(max_hermites), radial(max_radial_moments), ref_norm(3, 3), &
+         reference(3), relative(3, 2), rho_power(0:max_order), shifted(max_monomials), &
+         zero(max_hermites)
+
+      singleton = SIZE(records) == 1
 
       radial(:work%nradial) = 0.0_dp
       rho_power(0) = 1.0_dp
@@ -545,7 +555,7 @@ CONTAINS
             zero(j) = zero(j) + work%term_factor(t)*radial(work%term_index(t))
          END DO
       END DO
-      IF (work%virial) THEN
+      IF (work%virial .AND. .NOT. singleton) THEN
          DO j = 2, work%nshift
             p = j + work%nherm
             shifted(j) = 0.0_dp
@@ -609,6 +619,26 @@ CONTAINS
       IF (.NOT. work%virial) RETURN
       IF (density%norm == 0.0_dp) RETURN
 
+      IF (singleton) THEN
+         ! The image coordinate is constant, so the virial is an outer product of the forces.
+         IF (.NOT. density%weights_ready) CALL form_hermite_weights(density, dims)
+         CALL real_to_scaled(relative(:, 1), abcd(:, 1), cell)
+         CALL real_to_scaled(relative(:, 2), -abcd(:, 2), cell)
+         CALL real_to_scaled(c_minus_b, records(1)%centers(:, 3) - records(1)%centers(:, 2), cell)
+         DO k = 1, 3
+            f_a = DOT_PRODUCT(density%weight(:nc), work%force(:nc, k))
+            f_d = DOT_PRODUCT(density%weight(:nc), work%force(:nc, k + 9))
+            f_ket = DOT_PRODUCT(density%weight(:nc), work%force(:nc, k + 6) + work%force(:nc, k + 9))
+            image_virial(k, :) = f_a*relative(:, 1) + f_d*relative(:, 2) + f_ket*c_minus_b
+         END DO
+         bound = MAXVAL(ABS(image_virial))*(1.0_dp + 1.0E-12_dp)
+         IF (bound <= density%remaining) THEN
+            density%remaining = density%remaining - bound
+         ELSE
+            virial = virial + image_virial
+         END IF
+         RETURN
+      END IF
       IF (density%remaining > 0.0_dp) THEN
          DO k = 1, 3
             f_norm(k, 1) = NORM2(work%force(:nc, k))

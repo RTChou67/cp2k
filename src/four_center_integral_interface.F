@@ -53,6 +53,40 @@ MODULE four_center_integral_interface
              evaluate_deriv_eri, &
              evaluate_eri_screen
 
+   ! Fit (Libint - Hermite) in ns per image and per displacement group from
+   ! batches with 2, 4 and 16 images per group. The third coefficient adjusts
+   ! the singleton cost. Rows give force then force-plus-stress coefficients.
+   ! Unmeasured mixed ranges retain the four-images-per-group crossover.
+!&<
+   INTEGER, PARAMETER :: derivative_cost_difference(3, 2, 0:24) = RESHAPE([ &
+               1,      -4,       0,       1,      -4,       0, & ! unmeasured
+               0,       0,       0,       0,       0,       0, & ! ssss
+             155,   -1655,     144,     326,   -3379,     495, & ! ssps
+             282,   -1937,    -465,     514,   -3901,    1094, & ! psps
+             272,   -2542,    -227,     650,   -4470,     485, & ! sspp
+             718,   -3191,     384,    1231,   -3123,    1585, & ! pspp
+            1979,    -355,     146,    3610,    4275,    1385, & ! pppp
+             272,   -2406,     229,     400,   -4166,     762, & ! ssds
+             467,   -2036,     -43,     814,   -3320,     793, & ! psds
+            1695,   -1104,     -11,    2625,     921,     549, & ! ppds
+            1352,   -2543,     680,    1597,    -847,     455, & ! dsds
+             474,   -6764,     248,     941,   -7858,    -159, & ! ssdp
+            1147,   -5549,     115,    2195,   -4716,    1946, & ! psdp
+            3375,     250,    -161,    6123,    9395,    4971, & ! ppdp
+            2934,   -3605,     947,    3986,    1414,    1269, & ! dsdp
+            8988,    3084,    1229,   16366,   30487,   -5093, & ! dpdp
+             898,  -18110,     488,    1777,  -22770,    4812, & ! ssdd
+            2219,  -16345,     687,    4267,  -13570,    2769, & ! psdd
+            6746,   -9907,     977,   14680,   15089,      48, & ! ppdd
+            5577,  -10464,   -3970,    8963,   -2576,    2822, & ! dsdd
+           14041,    -855,    1745,   27501,   48327,    -991, & ! dpdd
+           24181,   66731,  -24229,   86600,   75999,   16398, & ! dddd
+            6795,   19505,   -5373,   14539,   40666,    -498, & ! sp-sp
+           35036,   71715,  -25125,   74604,  217601,  -30004, & ! sp-spd
+          227348,  565690,   75173,  553154, 1052025,  164930], & ! spd-spd
+         [3, 2, 25])
+!&>
+
 !> \brief Context owning the energy and first-derivative backend workspaces.
 !> \note Each thread owns its context. Pass it directly without intrinsic copying.
    TYPE, PUBLIC :: four_center_integral_context_type
@@ -234,7 +268,7 @@ CONTAINS
    END SUBROUTINE prepare_four_center_batch
 
 ! **************************************************************************************************
-!> \brief Prepare a primitive quartet and its Cartesian derivatives when image sums can be reused.
+!> \brief Prepare a primitive quartet and choose its derivative backend.
 !> \param context owning per-thread geometry and derivative workspace
 !> \param list1 bra primitive pair
 !> \param list2 ket primitive pair
@@ -244,15 +278,16 @@ CONTAINS
 !> \param neighbor_cells periodic image translations
 !> \param cell simulation cell
 !> \param potential_parameter physical radial operator
+!> \param lower minimum angular momentum at each center
 !> \param upper maximum angular momentum at each center
 !> \param do_periodic whether to enumerate periodic translations
 !> \param use_virial whether to compute the virial tensor
 !> \param symmetric_strain whether the shell quartet uses the lower strain triangle
-!> \param hermite whether the image batch can use the Hermite backend
+!> \param hermite whether to use the Hermite backend
 ! **************************************************************************************************
    SUBROUTINE prepare_four_center_derivative_batch(context, list1, list2, nproducts, &
                                                    log10_pmax, log10_eps_schwarz, neighbor_cells, &
-                                                   cell, potential_parameter, upper, do_periodic, use_virial, &
+                                                   cell, potential_parameter, lower, upper, do_periodic, use_virial, &
                                                    symmetric_strain, hermite)
       TYPE(four_center_integral_context_type), &
          INTENT(INOUT)                                   :: context
@@ -262,18 +297,16 @@ CONTAINS
       TYPE(eri4_cell_type), POINTER                      :: neighbor_cells(:)
       TYPE(cell_type), POINTER                           :: cell
       TYPE(coulomb_operator_type), INTENT(IN)            :: potential_parameter
-      INTEGER, INTENT(IN)                                :: upper(4)
+      INTEGER, INTENT(IN)                                :: lower(4), upper(4)
       LOGICAL, INTENT(IN)                                :: do_periodic, use_virial
       LOGICAL, INTENT(OUT)                               :: symmetric_strain, hermite
-
-      INTEGER, PARAMETER                                 :: min_images_per_group = 4
 
       INTEGER                                            :: group, ngroups
       LOGICAL                                            :: radial_moments
 
       radial_moments = potential_parameter%potential_type /= do_potential_id
       symmetric_strain = radial_moments .AND. ALL(upper == 0)
-      hermite = radial_moments .AND. do_periodic .AND. ALL(upper <= 2) .AND. .NOT. symmetric_strain
+      hermite = radial_moments .AND. ALL(upper <= 2) .AND. .NOT. symmetric_strain
       ! Libint's grouped kernels omit per-image coordinates needed for the virial.
       CALL prepare_four_center_batch(context, list1, list2, nproducts, log10_pmax, log10_eps_schwarz, neighbor_cells, &
                                      cell, potential_parameter, SUM(upper) + 1, do_periodic, &
@@ -285,9 +318,51 @@ CONTAINS
          DO group = 1, context%nimage_groups
             ngroups = ngroups - (context%image_groups(group)%last - context%image_groups(group)%first)
          END DO
-         hermite = nproducts/ngroups >= min_images_per_group
+         hermite = prefer_hermite_derivatives(lower, upper, nproducts, ngroups, &
+                                              ngroups - context%nimage_groups, use_virial)
       END IF
    END SUBROUTINE prepare_four_center_derivative_batch
+
+! **************************************************************************************************
+!> \brief Compare the fitted costs of the derivative backends for a prepared batch.
+!> \param lower minimum angular momentum at each center
+!> \param upper maximum angular momentum at each center
+!> \param nproducts number of retained image quartets
+!> \param ngroups number of nonempty displacement groups
+!> \param nsingle number of groups containing a single image
+!> \param use_virial whether to include stress
+!> \return whether the fitted Hermite cost is no greater than the Libint cost
+! **************************************************************************************************
+   PURE FUNCTION prefer_hermite_derivatives(lower, upper, nproducts, ngroups, nsingle, use_virial) RESULT(hermite)
+      INTEGER, INTENT(IN)                                :: lower(4), upper(4), nproducts, ngroups, &
+                                                            nsingle
+      LOGICAL, INTENT(IN)                                :: use_virial
+      LOGICAL                                            :: hermite
+
+      INTEGER                                            :: bra, ket, shape, task
+
+      shape = 0
+      IF (ALL(lower == upper)) THEN
+         ! Sort within each pair and exchange the two pairs for the lookup.
+         bra = MAXVAL(upper(1:2))
+         bra = bra*(bra + 1)/2 + MINVAL(upper(1:2))
+         ket = MAXVAL(upper(3:4))
+         ket = ket*(ket + 1)/2 + MINVAL(upper(3:4))
+         shape = MAX(bra, ket)*(MAX(bra, ket) + 1)/2 + MIN(bra, ket) + 1
+      ELSE IF (ALL(lower == 0)) THEN
+         IF (ALL(upper == 1)) THEN
+            shape = 22
+         ELSE IF (ALL(upper == 2)) THEN
+            shape = 24
+         ELSE IF (upper(1) == upper(2) .AND. upper(3) == upper(4) .AND. MINVAL(upper) == 1) THEN
+            shape = 23
+         END IF
+      END IF
+
+      task = MERGE(2, 1, use_virial)
+      hermite = DOT_PRODUCT(INT(derivative_cost_difference(:, task, shape), int_8), &
+                            INT([nproducts, ngroups, nsingle], int_8)) >= 0_int_8
+   END FUNCTION prefer_hermite_derivatives
 
 ! **************************************************************************************************
 !> \brief Evaluate the prepared Hermite batch for the selected angular range.
