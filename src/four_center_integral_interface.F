@@ -554,6 +554,8 @@ CONTAINS
             CALL reorder_eri_block(work, work2, [ncoa, ncob, ncoc, ncod], permutation, 12, 1)
          END IF
          DO i = 1, 12
+            ! For non-s blocks, forces4 recovers center B after contraction from A, C, and D.
+            IF (mysize > 1 .AND. i >= 4 .AND. i <= 6) CYCLE
             CALL contract(ncoa, ncob, ncoc, ncod, nsoa, nsob, nsoc, nsod, &
                           n_a, n_b, n_c, n_d, nl_a, nl_b, nl_c, nl_d, work2(1, i), &
                           angular_a, angular_b, angular_c, angular_d, &

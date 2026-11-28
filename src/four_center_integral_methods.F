@@ -556,6 +556,12 @@ CONTAINS
          END DO
       END DO
 
+      ! Translation invariance survives the common basis and radial contractions.
+      IF (cart_estimate >= eps_schwarz .AND. la_max + lb_max + lc_max + ld_max > 0) THEN
+         primitive_integrals(:, :, :, :, 4:6) = -(primitive_integrals(:, :, :, :, 1:3) + &
+                                                  primitive_integrals(:, :, :, :, 7:9) + &
+                                                  primitive_integrals(:, :, :, :, 10:12))
+      END IF
    END SUBROUTINE forces4
 
 END MODULE four_center_integral_methods
