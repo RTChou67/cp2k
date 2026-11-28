@@ -78,7 +78,7 @@ MODULE four_center_integral_derivatives
       PRIVATE
       TYPE(eri4_hermite_density_block) :: pair(4)
       INTEGER :: nterms = 0, lhs(6) = 0, rhs(6) = 0, offset(4) = 0
-      REAL(dp) :: factor = 0.0_dp, norm = 0.0_dp, remaining = 0.0_dp
+      REAL(dp) :: factor = 0.0_dp, norm = 0.0_dp, force_remaining = 0.0_dp, virial_remaining = 0.0_dp
       REAL(dp), ALLOCATABLE :: weight(:), ssss(:, :, :, :)
       LOGICAL :: weights_ready = .FALSE.
    END TYPE eri4_hermite_density_type
@@ -99,9 +99,11 @@ CONTAINS
 !> \param density primitive exchange density and screening budget
 !> \param virial density-weighted cell derivative accumulated by Hermite
 !> \param all_s independent all-s force and strain derivatives
+!> \param direct_force contract Hermite forces with the density
+!> \param density_force accumulated density-weighted forces
 ! **************************************************************************************************
    SUBROUTINE prepare_hermite_derivatives(batch, records, groups, ngroups, lower, upper, symmetric_strain, &
-                                          cell, use_virial, density, virial, all_s)
+                                          cell, use_virial, density, virial, all_s, direct_force, density_force)
       TYPE(eri4_hermite_batch_type), ALLOCATABLE, &
          INTENT(INOUT)                                   :: batch
       TYPE(eri_primitive_data_type), INTENT(IN)          :: records(:)
@@ -114,6 +116,8 @@ CONTAINS
       TYPE(eri4_hermite_density_type), INTENT(INOUT)     :: density
       REAL(dp), INTENT(INOUT)                            :: virial(3, 3)
       REAL(dp), INTENT(OUT)                              :: all_s(15)
+      LOGICAL, INTENT(IN)                                :: direct_force
+      REAL(dp), INTENT(INOUT)                            :: density_force(12)
 
       INTEGER                                            :: group, i, j, ncart
       REAL(dp)                                           :: abcd(3, 2)
@@ -123,11 +127,13 @@ CONTAINS
       ELSE
          IF (.NOT. ALLOCATED(batch)) ALLOCATE (batch)
          ncart = PRODUCT(ncoset(upper) - ncoset(lower - 1))
-         IF (ALLOCATED(batch%cartesian)) THEN
-            IF (SIZE(batch%cartesian, 1) < ncart) DEALLOCATE (batch%cartesian)
+         IF (.NOT. direct_force) THEN
+            IF (ALLOCATED(batch%cartesian)) THEN
+               IF (SIZE(batch%cartesian, 1) < ncart) DEALLOCATE (batch%cartesian)
+            END IF
+            IF (.NOT. ALLOCATED(batch%cartesian)) ALLOCATE (batch%cartesian(ncart, 12))
+            batch%cartesian(:ncart, :) = 0.0_dp
          END IF
-         IF (.NOT. ALLOCATED(batch%cartesian)) ALLOCATE (batch%cartesian(ncart, 12))
-         batch%cartesian(:ncart, :) = 0.0_dp
          IF (.NOT. ALLOCATED(batch%workspace)) ALLOCATE (batch%workspace)
          CALL prepare_hermite_workspace(batch%workspace, lower, upper, use_virial, &
                                         use_virial .AND. ngroups > 0)
@@ -152,7 +158,7 @@ CONTAINS
             CALL add_ssss_derivatives(records(i:j), abcd, use_virial, all_s)
          ELSE
             CALL add_hermite_derivatives(batch%workspace, records(i:j), abcd, cell, batch%cartesian, &
-                                         ncart, density, virial)
+                                         ncart, density, virial, direct_force, density_force)
          END IF
          i = j + 1
       END DO
@@ -505,26 +511,31 @@ CONTAINS
 !> \param nc active rows in the reusable derivatives buffer
 !> \param density primitive exchange density and screening budget
 !> \param virial accumulated density-weighted cell derivative
+!> \param direct_force contract Hermite forces with the density
+!> \param density_force accumulated density-weighted forces
 ! **************************************************************************************************
-   SUBROUTINE add_hermite_derivatives(work, records, abcd, cell, derivatives, nc, density, virial)
+   SUBROUTINE add_hermite_derivatives(work, records, abcd, cell, derivatives, nc, density, virial, direct_force, density_force)
       TYPE(eri4_hermite_workspace_type), INTENT(INOUT)   :: work
       TYPE(eri_primitive_data_type), INTENT(IN)          :: records(:)
       REAL(dp), INTENT(IN)                               :: abcd(3, 2)
       TYPE(cell_type), POINTER                           :: cell
-      REAL(dp), CONTIGUOUS, INTENT(INOUT)                :: derivatives(:, :)
+      REAL(dp), ALLOCATABLE, INTENT(INOUT)               :: derivatives(:, :)
       INTEGER, INTENT(IN)                                :: nc
       TYPE(eri4_hermite_density_type), INTENT(INOUT)     :: density
       REAL(dp), INTENT(INOUT)                            :: virial(3, 3)
+      LOGICAL, INTENT(IN)                                :: direct_force
+      REAL(dp), INTENT(INOUT)                            :: density_force(12)
 
       INTEGER                                            :: a, b, dha, dhb, dims(4), first, ha, hb, &
                                                             i, j, k, last, m, na, nb, offset, p, t
       LOGICAL                                            :: singleton
-      REAL(dp) :: bound, bra_norm, c_minus_b(3), delta(3), f, f_a, f_d, f_ket, f_norm(3, 2), &
-         image_virial(3, 3), ket_norm, moment_norm(3), moments(3, max_hermites), &
+      REAL(dp) :: bound, bra_norm, c_minus_b(3), delta(3), f, f_norm(3, 2), force(3, 3), &
+         image_virial(3, 3), ket_force(3), ket_norm, moment_norm(3), moments(3, max_hermites), &
          mono(max_monomials), projected(max_hermites), radial(max_radial_moments), ref_norm(3, 3), &
          reference(3), relative(3, 2), rho_power(0:max_order), shifted(max_monomials), &
          zero(max_hermites)
 
+      IF (direct_force .AND. density%norm == 0.0_dp) RETURN
       singleton = SIZE(records) == 1
 
       radial(:work%nradial) = 0.0_dp
@@ -588,112 +599,178 @@ CONTAINS
       na = dims(1)*dims(2)
       nb = dims(3)*dims(4)
 
-      DO j = 1, hb
-         DO i = 1, dha
-            work%auxiliary(i, j) = work%ket_sign(j)*zero(work%pair_index(i, j))
+      IF (direct_force) THEN
+         IF (.NOT. density%weights_ready) CALL form_hermite_weights(density, dims)
+         CALL contract_hermite_forces(work, zero, density%weight, ha, hb, dha, dhb, na, nb, force)
+         ! Bound all four centers, including B reconstructed by translation invariance.
+         bound = MAX(MAXVAL(ABS(force)), MAXVAL(ABS(SUM(force, DIM=2))))*(1.0_dp + 1.0E-12_dp)
+         IF (bound <= density%force_remaining) THEN
+            density%force_remaining = density%force_remaining - bound
+         ELSE
+            density_force(1:3) = density_force(1:3) + force(:, 1)
+            density_force(7:9) = density_force(7:9) + force(:, 2)
+            density_force(10:12) = density_force(10:12) + force(:, 3)
+         END IF
+         IF (.NOT. work%virial) RETURN
+         IF (singleton) ket_force = force(:, 2) + force(:, 3)
+      ELSE
+         DO j = 1, hb
+            DO i = 1, dha
+               work%auxiliary(i, j) = work%ket_sign(j)*zero(work%pair_index(i, j))
+            END DO
          END DO
-      END DO
-      CALL DGEMM('N', 'N', dha, nb, hb, 1.0_dp, work%auxiliary, max_pair_hermites, work%ket(1, 1, 0), &
-                 max_pair_hermites, 0.0_dp, work%intermediate, dha)
-      DO k = 1, 3
-         CALL DGEMM('T', 'N', na, nb, dha, 1.0_dp, work%bra(1, 1, k), max_pair_hermites, work%intermediate, &
-                    dha, 0.0_dp, work%force(1, k), na)
-      END DO
-
-      DO j = 1, dhb
-         DO i = 1, ha
-            work%auxiliary(i, j) = work%ket_sign(j)*zero(work%pair_index(i, j))
+         CALL DGEMM('N', 'N', dha, nb, hb, 1.0_dp, work%auxiliary, max_pair_hermites, work%ket(1, 1, 0), &
+                    max_pair_hermites, 0.0_dp, work%intermediate, dha)
+         DO k = 1, 3
+            CALL DGEMM('T', 'N', na, nb, dha, 1.0_dp, work%bra(1, 1, k), max_pair_hermites, work%intermediate, &
+                       dha, 0.0_dp, work%force(1, k), na)
          END DO
-      END DO
-      CALL DGEMM('T', 'N', na, dhb, ha, 1.0_dp, work%bra(1, 1, 0), max_pair_hermites, work%auxiliary, &
-                 max_pair_hermites, 0.0_dp, work%intermediate, na)
-      DO k = 1, 6
-         CALL DGEMM('N', 'N', na, nb, dhb, 1.0_dp, work%intermediate, na, work%ket(1, 1, k), &
-                    max_pair_hermites, 0.0_dp, work%force(1, 6 + k), na)
-      END DO
-      DO k = 1, 3
-         work%force(:nc, k + 3) = -(work%force(:nc, k) + work%force(:nc, k + 6) + work%force(:nc, k + 9))
-      END DO
-      derivatives(:nc, :12) = derivatives(:nc, :12) + work%force(:nc, :)
 
-      IF (.NOT. work%virial) RETURN
-      IF (density%norm == 0.0_dp) RETURN
+         DO j = 1, dhb
+            DO i = 1, ha
+               work%auxiliary(i, j) = work%ket_sign(j)*zero(work%pair_index(i, j))
+            END DO
+         END DO
+         CALL DGEMM('T', 'N', na, dhb, ha, 1.0_dp, work%bra(1, 1, 0), max_pair_hermites, work%auxiliary, &
+                    max_pair_hermites, 0.0_dp, work%intermediate, na)
+         DO k = 1, 6
+            CALL DGEMM('N', 'N', na, nb, dhb, 1.0_dp, work%intermediate, na, work%ket(1, 1, k), &
+                       max_pair_hermites, 0.0_dp, work%force(1, 6 + k), na)
+         END DO
+         DO k = 1, 3
+            work%force(:nc, k + 3) = -(work%force(:nc, k) + work%force(:nc, k + 6) + work%force(:nc, k + 9))
+         END DO
+         derivatives(:nc, :12) = derivatives(:nc, :12) + work%force(:nc, :)
+
+         IF (.NOT. work%virial .OR. density%norm == 0.0_dp) RETURN
+
+         IF (.NOT. singleton .AND. density%virial_remaining > 0.0_dp) THEN
+            DO k = 1, 3
+               f_norm(k, 1) = NORM2(work%force(:nc, k))
+               f_norm(k, 2) = NORM2(work%force(:nc, k + 9))
+            END DO
+            ref_norm = MATMUL(f_norm, TRANSPOSE(ABS(relative)))
+            moment_norm = 0.0_dp
+            DO j = 1, work%nherm
+               moment_norm = moment_norm + work%moment_count(j)*moments(:, j)**2
+            END DO
+            moment_norm = SQRT(moment_norm)
+            bra_norm = NORM2(work%bra(:ha, :na, 0))
+            ! A translation shifts the ket expansion into distinct rows and preserves its norm.
+            ket_norm = NORM2(work%ket(:hb, :nb, 0))
+            DO m = 1, 3
+               ref_norm(:, m) = ref_norm(:, m) + (bra_norm*ket_norm)*moment_norm(m)
+            END DO
+            bound = MAXVAL(ref_norm)
+            ! Include roundoff in the componentwise bound before charging it to the budget.
+            bound = bound*density%norm*(1.0_dp + 1.0E-12_dp)
+            IF (bound <= density%virial_remaining) THEN
+               density%virial_remaining = density%virial_remaining - bound
+               RETURN
+            END IF
+         END IF
+         IF (.NOT. density%weights_ready) CALL form_hermite_weights(density, dims)
+         DO k = 1, 3
+            force(k, 1) = DOT_PRODUCT(density%weight(:nc), work%force(:nc, k))
+            force(k, 3) = DOT_PRODUCT(density%weight(:nc), work%force(:nc, k + 9))
+            IF (singleton) THEN
+               ket_force(k) = DOT_PRODUCT(density%weight(:nc), work%force(:nc, k + 6) + work%force(:nc, k + 9))
+            END IF
+         END DO
+      END IF
 
       IF (singleton) THEN
-         ! The image coordinate is constant, so the virial is an outer product of the forces.
-         IF (.NOT. density%weights_ready) CALL form_hermite_weights(density, dims)
          CALL real_to_scaled(relative(:, 1), abcd(:, 1), cell)
          CALL real_to_scaled(relative(:, 2), -abcd(:, 2), cell)
          CALL real_to_scaled(c_minus_b, records(1)%centers(:, 3) - records(1)%centers(:, 2), cell)
-         DO k = 1, 3
-            f_a = DOT_PRODUCT(density%weight(:nc), work%force(:nc, k))
-            f_d = DOT_PRODUCT(density%weight(:nc), work%force(:nc, k + 9))
-            f_ket = DOT_PRODUCT(density%weight(:nc), work%force(:nc, k + 6) + work%force(:nc, k + 9))
-            image_virial(k, :) = f_a*relative(:, 1) + f_d*relative(:, 2) + f_ket*c_minus_b
-         END DO
-         bound = MAXVAL(ABS(image_virial))*(1.0_dp + 1.0E-12_dp)
-         IF (bound <= density%remaining) THEN
-            density%remaining = density%remaining - bound
-         ELSE
-            virial = virial + image_virial
-         END IF
-         RETURN
       END IF
-      IF (density%remaining > 0.0_dp) THEN
+      DO k = 1, 3
+         image_virial(k, :) = force(k, 1)*relative(:, 1) + force(k, 3)*relative(:, 2)
+         IF (singleton) image_virial(k, :) = image_virial(k, :) + ket_force(k)*c_minus_b
+      END DO
+
+      IF (.NOT. singleton) THEN
+         ! Both ket centers translate together, so the ket derivative is an index shift.
+         IF (.NOT. direct_force) THEN
+            CALL DGEMM('N', 'N', ha, nb, na, 1.0_dp, work%bra(1, 1, 0), max_pair_hermites, &
+                       density%weight, na, 0.0_dp, work%intermediate, ha)
+         END IF
+         CALL DGEMM('N', 'T', ha, hb, nb, 1.0_dp, work%intermediate, ha, work%ket(1, 1, 0), &
+                    max_pair_hermites, 0.0_dp, work%auxiliary, max_pair_hermites)
+
+         ! All entries with the same total Hermite index use the same translated moment.
+         ! Raising the ket index flips its parity.
+         p = work%order*(work%order + 1)*(work%order + 2)/6
+         projected(:p) = 0.0_dp
+         DO j = 1, hb
+            DO i = 1, ha
+               t = work%pair_index(i, j)
+               projected(t) = projected(t) - work%ket_sign(j)*work%auxiliary(i, j)
+            END DO
+         END DO
          DO k = 1, 3
-            f_norm(k, 1) = NORM2(work%force(:nc, k))
-            f_norm(k, 2) = NORM2(work%force(:nc, k + 9))
+            DO j = 1, p
+               image_virial(k, :) = image_virial(k, :) + projected(j)*moments(:, work%upper_index(k, j))
+            END DO
          END DO
-         ref_norm = MATMUL(f_norm, TRANSPOSE(ABS(relative)))
-         moment_norm = 0.0_dp
-         DO j = 1, work%nherm
-            moment_norm = moment_norm + work%moment_count(j)*moments(:, j)**2
-         END DO
-         moment_norm = SQRT(moment_norm)
-         bra_norm = NORM2(work%bra(:ha, :na, 0))
-         ! A translation shifts the ket expansion into distinct rows and preserves its norm.
-         ket_norm = NORM2(work%ket(:hb, :nb, 0))
-         DO m = 1, 3
-            ref_norm(:, m) = ref_norm(:, m) + (bra_norm*ket_norm)*moment_norm(m)
-         END DO
-         bound = MAXVAL(ref_norm)
-         ! Include roundoff in the componentwise bound before charging it to the budget.
-         bound = bound*density%norm*(1.0_dp + 1.0E-12_dp)
-         IF (bound <= density%remaining) THEN
-            density%remaining = density%remaining - bound
+      END IF
+      IF (direct_force .OR. singleton) THEN
+         bound = MAXVAL(ABS(image_virial))*(1.0_dp + 1.0E-12_dp)
+         IF (bound <= density%virial_remaining) THEN
+            density%virial_remaining = density%virial_remaining - bound
             RETURN
          END IF
       END IF
-      IF (.NOT. density%weights_ready) CALL form_hermite_weights(density, dims)
-
-      DO k = 1, 3
-         f_a = DOT_PRODUCT(density%weight(:nc), work%force(:nc, k))
-         f_d = DOT_PRODUCT(density%weight(:nc), work%force(:nc, k + 9))
-         virial(k, :) = virial(k, :) + relative(:, 1)*f_a + relative(:, 2)*f_d
-      END DO
-
-      ! Both ket centers translate together, so the ket derivative is an index shift.
-      CALL DGEMM('N', 'N', ha, nb, na, 1.0_dp, work%bra(1, 1, 0), max_pair_hermites, &
-                 density%weight, na, 0.0_dp, work%intermediate, ha)
-      CALL DGEMM('N', 'T', ha, hb, nb, 1.0_dp, work%intermediate, ha, work%ket(1, 1, 0), &
-                 max_pair_hermites, 0.0_dp, work%auxiliary, max_pair_hermites)
-
-      ! All entries with the same total Hermite index use the same translated moment.
-      ! Raising the ket index flips its parity.
-      p = work%order*(work%order + 1)*(work%order + 2)/6
-      projected(:p) = 0.0_dp
-      DO j = 1, hb
-         DO i = 1, ha
-            t = work%pair_index(i, j)
-            projected(t) = projected(t) - work%ket_sign(j)*work%auxiliary(i, j)
-         END DO
-      END DO
-      DO k = 1, 3
-         DO j = 1, p
-            virial(k, :) = virial(k, :) + projected(j)*moments(:, work%upper_index(k, j))
-         END DO
-      END DO
+      virial = virial + image_virial
    END SUBROUTINE add_hermite_derivatives
+
+! **************************************************************************************************
+!> \brief Apply the exchange density before expanding the center derivatives.
+!> \param work pair expansions and contraction workspace
+!> \param radial image-summed Hermite radial derivatives
+!> \param weight Cartesian exchange density for this primitive quartet
+!> \param ha ordinary bra Hermite dimension
+!> \param hb ordinary ket Hermite dimension
+!> \param dha first-derivative bra Hermite dimension
+!> \param dhb first-derivative ket Hermite dimension
+!> \param na Cartesian bra pair dimension
+!> \param nb Cartesian ket pair dimension
+!> \param force density-weighted derivatives on centers A, C and D
+! **************************************************************************************************
+   SUBROUTINE contract_hermite_forces(work, radial, weight, ha, hb, dha, dhb, na, nb, force)
+      TYPE(eri4_hermite_workspace_type), INTENT(INOUT)   :: work
+      REAL(dp), INTENT(IN)                               :: radial(max_hermites), weight(*)
+      INTEGER, INTENT(IN)                                :: ha, hb, dha, dhb, na, nb
+      REAL(dp), INTENT(OUT)                              :: force(3, 3)
+
+      INTEGER                                            :: i, j, k
+      REAL(dp) :: projection(max_pair_hermites, max_pair_cartesian)
+
+      DO j = 1, dhb
+         DO i = 1, MERGE(dha, ha, j <= hb)
+            work%auxiliary(i, j) = work%ket_sign(j)*radial(work%pair_index(i, j))
+         END DO
+      END DO
+
+      ! Move W to the ket expansion, then contract the bra derivative against R C W^T.
+      CALL DGEMM('N', 'T', hb, na, nb, 1.0_dp, work%ket(1, 1, 0), max_pair_hermites, &
+                 weight, na, 0.0_dp, work%intermediate, hb)
+      CALL DGEMM('N', 'N', dha, na, hb, 1.0_dp, work%auxiliary, max_pair_hermites, &
+                 work%intermediate, hb, 0.0_dp, projection, max_pair_hermites)
+      DO k = 1, 3
+         force(k, 1) = SUM(work%bra(:dha, :na, k)*projection(:dha, :na))
+      END DO
+
+      ! Move W to the bra expansion and keep B W available for the virial.
+      CALL DGEMM('N', 'N', ha, nb, na, 1.0_dp, work%bra(1, 1, 0), max_pair_hermites, &
+                 weight, na, 0.0_dp, work%intermediate, ha)
+      CALL DGEMM('T', 'N', dhb, nb, ha, 1.0_dp, work%auxiliary, max_pair_hermites, &
+                 work%intermediate, ha, 0.0_dp, projection, max_pair_hermites)
+      DO k = 1, 3
+         force(k, 2) = SUM(work%ket(:dhb, :nb, k)*projection(:dhb, :nb))
+         force(k, 3) = SUM(work%ket(:dhb, :nb, k + 3)*projection(:dhb, :nb))
+      END DO
+   END SUBROUTINE contract_hermite_forces
 
 ! **************************************************************************************************
 !> \brief Extract one angular block and its screening maxima from the group sums.
@@ -861,12 +938,13 @@ CONTAINS
 !> \param density prepared shell-set density
 !> \param primitive indices of the four primitives
 !> \param ncart Cartesian size of each primitive
-!> \param budget maximum omitted cell derivative from this primitive quartet
+!> \param force_budget maximum omitted force from this primitive quartet
+!> \param virial_budget maximum omitted cell derivative from this primitive quartet
 ! **************************************************************************************************
-   SUBROUTINE select_hermite_density(density, primitive, ncart, budget)
+   SUBROUTINE select_hermite_density(density, primitive, ncart, force_budget, virial_budget)
       TYPE(eri4_hermite_density_type), INTENT(INOUT)     :: density
       INTEGER, INTENT(IN)                                :: primitive(4), ncart(4)
-      REAL(dp), INTENT(IN)                               :: budget
+      REAL(dp), INTENT(IN)                               :: force_budget, virial_budget
 
       INTEGER                                            :: a, b, c, d, r, s, t
 
@@ -875,7 +953,8 @@ CONTAINS
       c = primitive(3)
       d = primitive(4)
       density%offset = (primitive - 1)*ncart
-      density%remaining = budget
+      density%force_remaining = force_budget
+      density%virial_remaining = virial_budget
       density%weights_ready = .FALSE.
       density%norm = 0.0_dp
       DO t = 1, density%nterms

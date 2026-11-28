@@ -1176,7 +1176,7 @@ CONTAINS
                         ! Direct contraction is valid when that floor guarantees the AO screen passes.
                         direct_force = .NOT. treat_forces_in_core .AND. &
                                        SCALE(pmax_entry, -15) >= eps_schwarz .AND. &
-                                       la_max(iset) + lb_max(jset) + lc_max(kset) + ld_max(lset) == 0 .AND. &
+                                       MAX(la_max(iset), lb_max(jset), lc_max(kset), ld_max(lset)) <= 2 .AND. &
                                        potential_parameter%potential_type /= do_potential_id
                         IF (use_virial .OR. direct_force) THEN
                            CALL prefetch_quartet_density(density, &
@@ -1229,7 +1229,8 @@ CONTAINS
                            nprim_ints = nprim_ints + neris_tmp
                            IF (direct_force) THEN
                               CALL add_four_center_forces(force, forces_map, force_terms(:, :1))
-                              CYCLE
+                              ! Libint contributions can still require AO contraction.
+                              IF (cartesian_estimate == 0.0_dp .AND. cartesian_estimate_virial == 0.0_dp) CYCLE
                            END IF
 !                           IF (cartesian_estimate == 0.0_dp) cartesian_estimate = TINY(cartesian_estimate)
 !                           estimate_to_store_int = EXPONENT(cartesian_estimate)
@@ -1349,7 +1350,7 @@ CONTAINS
                         END IF
                         IF (.NOT. (contract_forces .OR. contract_virial)) CYCLE
 
-                        IF (.NOT. use_virial) THEN
+                        IF (.NOT. (use_virial .OR. direct_force)) THEN
                            CALL prefetch_quartet_density(density, &
                                                          [nsgfa(iset), nsgfb(jset), nsgfc(kset), nsgfd(lset)], &
                                                          [iatom, jatom, katom, latom], [iset, jset, kset, lset], &

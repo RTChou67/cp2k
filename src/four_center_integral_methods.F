@@ -423,8 +423,8 @@ CONTAINS
 !> \param density AO exchange density
 !> \param exchange_factor exchange and quartet symmetry coefficient
 !> \param density_virial cell derivative already contracted with the exchange density
-!> \param direct_force use the density contraction for all-s forces when AO force storage is unnecessary
-!> \param density_force all-s force already contracted with the exchange density
+!> \param direct_force contract Hermite forces with the density when AO force storage is unnecessary
+!> \param density_force force already contracted with the exchange density
 ! **************************************************************************************************
    SUBROUTINE forces4(context, ra, rb, rc, rd, npgfa, npgfb, npgfc, npgfd, &
                       la_min, la_max, lb_min, lb_max, &
@@ -487,18 +487,17 @@ CONTAINS
          lpgf, ncart(4), ncoa, ncob, ncoc, ncod, nelements_ij, nelements_kl, nproducts, nsgfla, &
          nsgflb, nsgflc, nsgfld, nsoa, nsob, nsoc, nsod, s_offset_a, s_offset_b, s_offset_c, &
          s_offset_d, upper(4)
-      LOGICAL                                            :: batch_virial, density_ready, hermite, &
-                                                            reconstruct_b, symmetric_strain, &
-                                                            virial_initialized
-      REAL(dp)                                           :: all_s(15), ssss_budget, strain(1, 3, 3), &
-                                                            tmp_max, tmp_max_virial, &
-                                                            virial_budget, wbcd, wcd, weight
+      LOGICAL :: batch_virial, density_ready, force_integrals_ready, hermite, reconstruct_b, &
+         symmetric_strain, virial_initialized
+      REAL(dp) :: all_s(15), force_budget, primitive_budget, strain(1, 3, 3), tmp_max, &
+         tmp_max_virial, virial_budget, wbcd, wcd, weight
       TYPE(eri4_hermite_density_type)                    :: primitive_density
 
       density_virial = 0.0_dp
       density_force = 0.0_dp
       strain = 0.0_dp
       density_ready = .FALSE.
+      force_integrals_ready = .NOT. direct_force
       virial_initialized = .FALSE.
       lower = [la_min, lb_min, lc_min, ld_min]
       upper = [la_max, lb_max, lc_max, ld_max]
@@ -506,7 +505,7 @@ CONTAINS
       reconstruct_b = la_max + lb_max + lc_max + ld_max > 0
       symmetric_strain = .FALSE.
       cart_estimate = 0.0_dp
-      IF (.NOT. direct_force) primitive_integrals = 0.0_dp
+      IF (force_integrals_ready) primitive_integrals = 0.0_dp
       IF (use_virial) cart_estimate_virial = 0.0_dp
       neris_tmp = 0_int_8
 
@@ -523,11 +522,11 @@ CONTAINS
 
       ! Share the shell-quartet error budget among all candidate primitive quartets.
       ! The cell matrix factor bounds conversion from cell derivatives to virial components.
-      ssss_budget = 0.0_dp
+      primitive_budget = MAX(0.0_dp, eps_schwarz)/(REAL(nelements_ij, dp)*REAL(nelements_kl, dp))
+      force_budget = MERGE(primitive_budget, 0.0_dp, direct_force)
       virial_budget = 0.0_dp
       IF (use_virial) THEN
-         ssss_budget = MAX(0.0_dp, eps_schwarz)/(REAL(nelements_ij, dp)*REAL(nelements_kl, dp))
-         virial_budget = ssss_budget/MAXVAL(SUM(ABS(cell%hmat), DIM=2))
+         virial_budget = primitive_budget/MAXVAL(SUM(ABS(cell%hmat), DIM=2))
       END IF
 
       DO list_ij = 1, nelements_ij
@@ -544,25 +543,27 @@ CONTAINS
                                                       symmetric_strain, hermite)
             reconstruct_b = reconstruct_b .OR. symmetric_strain
             IF (nproducts == 0) CYCLE
-            IF ((use_virial .AND. (hermite .OR. symmetric_strain)) .OR. direct_force) THEN
+            IF ((use_virial .OR. direct_force) .AND. (hermite .OR. symmetric_strain)) THEN
                IF (.NOT. density_ready) THEN
                   CALL prepare_hermite_density(primitive_density, density, exchange_factor, lower, upper, &
                                                [npgfa, npgfb, npgfc, npgfd], [nsgfa, nsgfb, nsgfc, nsgfd], &
                                                contraction_a, contraction_b, contraction_c, contraction_d)
                   density_ready = .TRUE.
                END IF
-               IF (hermite) CALL select_hermite_density(primitive_density, [ipgf, jpgf, kpgf, lpgf], ncart, virial_budget)
+               IF (hermite) THEN
+                  CALL select_hermite_density(primitive_density, [ipgf, jpgf, kpgf, lpgf], ncart, force_budget, virial_budget)
+               END IF
             END IF
             IF (symmetric_strain .OR. hermite) THEN
                CALL prepare_hermite_batch(context, lower, upper, symmetric_strain, cell, use_virial, &
-                                          primitive_density, density_virial, all_s)
+                                          primitive_density, density_virial, all_s, direct_force, density_force)
             END IF
             IF (symmetric_strain) THEN
                neris_tmp = neris_tmp + 12_int_8*nproducts
                IF (use_virial .OR. direct_force) weight = ssss_density_weight(primitive_density, ipgf, jpgf, kpgf, lpgf)
                IF (use_virial) THEN
                   ! For all-s, the strain derivative already bounds the final virial.
-                  IF (ABS(weight)*MAXVAL(ABS(all_s(10:15))) > ssss_budget) THEN
+                  IF (ABS(weight)*MAXVAL(ABS(all_s(10:15))) > primitive_budget) THEN
                      strain(1, :, 1) = strain(1, :, 1) + weight*all_s(10:12)
                      strain(1, 2:3, 2) = strain(1, 2:3, 2) + weight*all_s(13:14)
                      strain(1, 3, 3) = strain(1, 3, 3) + weight*all_s(15)
@@ -570,7 +571,7 @@ CONTAINS
                END IF
                tmp_max = max_contraction_val*MAX(MAXVAL(ABS(all_s(:9))), &
                                                  MAXVAL(ABS(all_s(1:3) + all_s(4:6) + all_s(7:9))))
-               cart_estimate = MAX(cart_estimate, tmp_max)
+               IF (.NOT. direct_force) cart_estimate = MAX(cart_estimate, tmp_max)
                IF (tmp_max < eps_schwarz) CYCLE
                IF (direct_force) THEN
                   density_force(1:3) = density_force(1:3) + weight*all_s(1:3)
@@ -594,6 +595,14 @@ CONTAINS
                   END DO
                END IF
                CYCLE
+            END IF
+            IF (hermite .AND. direct_force) THEN
+               neris_tmp = neris_tmp + 12_int_8*nproducts*PRODUCT(ncart)
+               CYCLE
+            END IF
+            IF (.NOT. force_integrals_ready) THEN
+               primitive_integrals = 0.0_dp
+               force_integrals_ready = .TRUE.
             END IF
             batch_virial = use_virial .AND. .NOT. hermite
             IF (batch_virial .AND. .NOT. virial_initialized) THEN
@@ -657,7 +666,8 @@ CONTAINS
       ! Translation invariance survives the common basis and radial contractions.
       IF (direct_force) THEN
          density_force(4:6) = -(density_force(1:3) + density_force(7:9) + density_force(10:12))
-      ELSE IF (cart_estimate >= eps_schwarz .AND. reconstruct_b) THEN
+      END IF
+      IF (force_integrals_ready .AND. cart_estimate >= eps_schwarz .AND. reconstruct_b) THEN
          primitive_integrals(:, :, :, :, 4:6) = -(primitive_integrals(:, :, :, :, 1:3) + &
                                                   primitive_integrals(:, :, :, :, 7:9) + &
                                                   primitive_integrals(:, :, :, :, 10:12))

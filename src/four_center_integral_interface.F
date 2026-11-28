@@ -375,8 +375,11 @@ CONTAINS
 !> \param density transformed primitive density and screening budget
 !> \param virial density-weighted cell derivative
 !> \param all_s independent all-s force and strain derivatives
+!> \param direct_force contract Hermite forces with the density
+!> \param density_force accumulated density-weighted forces
 ! **************************************************************************************************
-   SUBROUTINE prepare_hermite_batch(context, lower, upper, symmetric_strain, cell, use_virial, density, virial, all_s)
+   SUBROUTINE prepare_hermite_batch(context, lower, upper, symmetric_strain, cell, use_virial, density, virial, all_s, &
+                                    direct_force, density_force)
       TYPE(four_center_integral_context_type), &
          INTENT(INOUT)                                   :: context
       INTEGER, INTENT(IN)                                :: lower(4), upper(4)
@@ -386,11 +389,13 @@ CONTAINS
       TYPE(eri4_hermite_density_type), INTENT(INOUT)     :: density
       REAL(dp), INTENT(INOUT)                            :: virial(3, 3)
       REAL(dp), INTENT(OUT)                              :: all_s(15)
+      LOGICAL, INTENT(IN)                                :: direct_force
+      REAL(dp), INTENT(INOUT)                            :: density_force(12)
 
       CALL prepare_hermite_derivatives(context%hermite, context%products(:context%nproducts), context%image_groups, &
                                        context%nimage_groups, lower, upper, symmetric_strain, cell, &
-                                       use_virial, density, virial, all_s)
-      context%hermite_ready = .NOT. symmetric_strain
+                                       use_virial, density, virial, all_s, direct_force, density_force)
+      context%hermite_ready = .NOT. (symmetric_strain .OR. direct_force)
    END SUBROUTINE prepare_hermite_batch
 
 ! **************************************************************************************************
